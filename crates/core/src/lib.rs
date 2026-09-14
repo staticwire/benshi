@@ -10,14 +10,16 @@
 //! written.
 
 pub mod clock;
+pub mod encoding;
+pub mod path;
 pub mod policy;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Timestamp;
+use crate::path::RawPath;
 
 /// Provisional error placeholder.
 ///
@@ -91,8 +93,8 @@ pub struct AppName(pub String);
 /// Provisional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaRef {
-    /// A local file the source opened.
-    LocalFile(PathBuf),
+    /// A local file the source opened, as the platform spelled its path.
+    LocalFile(RawPath),
     /// A title string with no underlying file, as published by a browser.
     Title(String),
 }
@@ -142,6 +144,7 @@ pub struct SessionState {
 mod tests {
     use super::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
     use crate::clock::Timestamp;
+    use crate::path::RawPath;
     use std::time::Duration;
 
     #[test]
@@ -155,7 +158,9 @@ mod tests {
     fn a_snapshot_round_trips_through_json_exactly() {
         let snapshot = PlayerSnapshot {
             player: PlayerId("mpv".to_owned()),
-            media: MediaRef::LocalFile("/anime/[Group] Show - 03.mkv".into()),
+            media: MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/[Group] Show - 03.mkv".to_vec(),
+            )),
             state: PlayState::Playing,
             position: Known::Value(Duration::from_micros(93_456_789)),
             duration: Known::NotReported,
@@ -166,6 +171,32 @@ mod tests {
         let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
 
         assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn a_snapshot_with_a_non_utf8_path_round_trips() {
+        // A filename from a Japanese archive unpacked with the wrong encoding
+        // is not valid UTF-8, and this is exactly the snapshot a trace has to
+        // carry. Refusing it, or replacing the bytes it cannot read, would make
+        // the file unrecognisable and the trace a lie.
+        let broken = b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e.mkv".to_vec();
+        let snapshot = PlayerSnapshot {
+            player: PlayerId("mpv".to_owned()),
+            media: MediaRef::LocalFile(RawPath::from_bytes(broken.clone())),
+            state: PlayState::Playing,
+            position: Known::Value(Duration::from_micros(93_456_789)),
+            duration: Known::NotReported,
+            observed_at: Timestamp::epoch(),
+        };
+
+        let text = serde_json::to_string(&snapshot).expect("serialise");
+        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
+
+        assert_eq!(snapshot, back);
+        match back.media {
+            MediaRef::LocalFile(path) => assert_eq!(path.as_bytes(), broken.as_slice()),
+            MediaRef::Title(title) => panic!("expected a file, got the title {title:?}"),
+        }
     }
 
     #[test]

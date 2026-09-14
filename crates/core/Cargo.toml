@@ -12,6 +12,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+chardetng = "1.0.0"
+encoding_rs = "0.8.41"
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
