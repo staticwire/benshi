@@ -10,6 +10,10 @@ repository.workspace = true
 
 [dependencies]
 benshi-core = { path = "../core" }
+thiserror = "2.0.20"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "time", "macros"] }
