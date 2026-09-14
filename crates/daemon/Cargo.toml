@@ -1,0 +1,19 @@
+[package]
+name = "benshi-daemon"
+description = "Wiring, supervision, the event bus, the IPC server and configuration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+benshi-core = { path = "../core" }
+benshi-detect = { path = "../detect" }
+benshi-sinks = { path = "../sinks" }
+benshi-store = { path = "../store" }
+benshi-sync = { path = "../sync" }
+
+[lints]
+workspace = true

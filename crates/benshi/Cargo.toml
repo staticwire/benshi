@@ -1,0 +1,21 @@
+[package]
+name = "benshi"
+description = "A passive scrobbler: watches the player you already have open."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "benshi"
+path = "src/main.rs"
+
+[dependencies]
+benshi-cli = { path = "../cli" }
+benshi-daemon = { path = "../daemon" }
+benshi-tray = { path = "../tray" }
+
+[lints]
+workspace = true

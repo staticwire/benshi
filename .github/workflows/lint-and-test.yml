@@ -1,0 +1,39 @@
+name: Lint and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit rather than a tag: a tag can be moved to point at
+      # different code, a commit cannot.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins the version; `rustup show` installs it.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Plain `cargo test` on purpose: `--all-targets` silently skips doctests,
+      # and rustdoc examples are executable tests here.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

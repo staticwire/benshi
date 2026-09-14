@@ -1,0 +1,18 @@
+# Cargo build output
+/target/
+debug/
+**/*.rs.bk
+
+# MSVC debugging information
+*.pdb
+
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+
+# dev
+/traces/
+/logs/
+/.worktrees/
+

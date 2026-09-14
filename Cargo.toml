@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+authors = ["staticwire"]
+repository = "https://github.com/staticwire/benshi"
+
+# Dependencies are added with `cargo add` as each crate needs them, so that the
+# recorded version is the one actually resolved rather than one written from
+# memory. This section stays empty until the first real dependency lands.
+[workspace.dependencies]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+# `deny`, not `forbid`: the Windows SMTC adapter will need `unsafe` blocks, and
+# `forbid` cannot be lifted locally. A crate that needs it opts out explicitly
+# with a justification comment.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Discarding a Result must be caught by a lint rather than by review.
+let_underscore_must_use = "deny"

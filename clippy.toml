@@ -1,0 +1,8 @@
+# Cargo.toml's [workspace.lints.clippy] sets lint *levels*; thresholds and other
+# tool configuration must live here instead.
+msrv = "1.98"
+
+# Product, service and protocol names that clippy::doc_markdown mistakes for
+# code because of their internal capitals. They are prose, not identifiers, so
+# backticking them would be wrong. ".." keeps clippy's own default list.
+doc-valid-idents = ["AniList", "MyAnimeList", "SQLite", "MPRIS", "SMTC", "WinRT", ".."]

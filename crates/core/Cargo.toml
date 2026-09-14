@@ -1,0 +1,12 @@
+[package]
+name = "benshi-core"
+description = "Domain types and pure logic for benshi. No I/O, no platform code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
