@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 pub struct Timestamp(Duration);
 
 impl Timestamp {
+    /// The epoch of a clock: the timestamp every clock starts from.
+    #[must_use]
+    pub const fn epoch() -> Self {
+        Self(Duration::ZERO)
+    }
+
     /// How much time separates this timestamp from an earlier one.
     ///
     /// Saturates at zero when `earlier` is in fact later, because a monotonic
