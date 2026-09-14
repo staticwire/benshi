@@ -9,8 +9,17 @@
 //! shape; they are expected to change once the logic that consumes them is
 //! written.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+pub mod clock;
+pub mod encoding;
+pub mod path;
+pub mod policy;
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::clock::Timestamp;
+use crate::path::RawPath;
 
 /// Provisional error placeholder.
 ///
@@ -26,7 +35,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// facts that lead to different behaviour: the first may be retried or shown as
 /// unknown, the second means the capability is absent and the user should be
 /// told so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Known<T> {
     /// The source reported this value.
     Value(T),
@@ -45,7 +54,7 @@ pub enum Known<T> {
 // introduce an enum. That advice is wrong here: these are independent
 // capabilities that occur in any combination, not states of one variable.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// Playback position within the current media.
     pub position: bool,
@@ -62,22 +71,36 @@ pub struct Capabilities {
 /// The MPRIS bus suffix on Linux, the `AppUserModelId` under SMTC on Windows,
 /// the bundle identifier on macOS. Never a process name matched by a regular
 /// expression.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlayerId(pub String);
+
+/// The application a source belongs to, as the platform names it.
+///
+/// Distinct from [`PlayerId`], and the distinction is not academic. A live
+/// session bus carries both `org.mpris.MediaPlayer2.Feishin` and
+/// `org.mpris.MediaPlayer2.chromium.instance30062`: two windows of one player
+/// are two identities but one application. The identity exists to tell them
+/// apart; policy and the source listing are keyed on the application.
+///
+/// The adapter declares both. This crate never derives one from the other,
+/// because the rule that relates them - an `.instance` suffix here, something
+/// else under SMTC - is platform knowledge and has no place in `core`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AppName(pub String);
 
 /// What a media source currently has open.
 ///
 /// Provisional.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaRef {
-    /// A local file the source opened.
-    LocalFile(PathBuf),
+    /// A local file the source opened, as the platform spelled its path.
+    LocalFile(RawPath),
     /// A title string with no underlying file, as published by a browser.
     Title(String),
 }
 
 /// Coarse playback state of a media source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlayState {
     /// Media is advancing.
     Playing,
@@ -91,7 +114,7 @@ pub enum PlayState {
 ///
 /// Adapters emit snapshots and this crate computes differences between them. An
 /// event model would lose state across a reconnect; a snapshot does not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     /// Which source produced this reading.
     pub player: PlayerId,
@@ -103,15 +126,15 @@ pub struct PlayerSnapshot {
     pub position: Known<Duration>,
     /// How long the media is, as reported. Advisory: players lie about it.
     pub duration: Known<Duration>,
-    /// When the reading was taken.
-    pub observed_at: Instant,
+    /// When the reading was taken, on the clock the watcher was given.
+    pub observed_at: Timestamp,
 }
 
 /// The state a sink renders.
 ///
 /// Provisional. Derived from playback, never from whether a sync to a list
 /// backend succeeded: what a presence card shows depends on what is playing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     /// The reading the session was last advanced by.
     pub snapshot: PlayerSnapshot,
@@ -119,12 +142,73 @@ pub struct SessionState {
 
 #[cfg(test)]
 mod tests {
-    use super::Known;
+    use super::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
+    use crate::clock::Timestamp;
+    use crate::path::RawPath;
+    use std::time::Duration;
 
     #[test]
     fn known_distinguishes_absence_from_incapability() {
         let not_reported: Known<u8> = Known::NotReported;
         let unsupported: Known<u8> = Known::Unsupported;
         assert_ne!(not_reported, unsupported);
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_through_json_exactly() {
+        let snapshot = PlayerSnapshot {
+            player: PlayerId("mpv".to_owned()),
+            media: MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/[Group] Show - 03.mkv".to_vec(),
+            )),
+            state: PlayState::Playing,
+            position: Known::Value(Duration::from_micros(93_456_789)),
+            duration: Known::NotReported,
+            observed_at: Timestamp::epoch(),
+        };
+
+        let text = serde_json::to_string(&snapshot).expect("serialise");
+        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
+
+        assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn a_snapshot_with_a_non_utf8_path_round_trips() {
+        // A filename from a Japanese archive unpacked with the wrong encoding
+        // is not valid UTF-8, and this is exactly the snapshot a trace has to
+        // carry. Refusing it, or replacing the bytes it cannot read, would make
+        // the file unrecognisable and the trace a lie.
+        let broken = b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e.mkv".to_vec();
+        let snapshot = PlayerSnapshot {
+            player: PlayerId("mpv".to_owned()),
+            media: MediaRef::LocalFile(RawPath::from_bytes(broken.clone())),
+            state: PlayState::Playing,
+            position: Known::Value(Duration::from_micros(93_456_789)),
+            duration: Known::NotReported,
+            observed_at: Timestamp::epoch(),
+        };
+
+        let text = serde_json::to_string(&snapshot).expect("serialise");
+        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
+
+        assert_eq!(snapshot, back);
+        match back.media {
+            MediaRef::LocalFile(path) => assert_eq!(path.as_bytes(), broken.as_slice()),
+            MediaRef::Title(title) => panic!("expected a file, got the title {title:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_and_not_reported_stay_distinct_through_json() {
+        // A "simplification" to Option would collapse these two into one, and
+        // that collapse is the specific bug Known exists to prevent.
+        let unsupported: Known<Duration> = Known::Unsupported;
+        let not_reported: Known<Duration> = Known::NotReported;
+
+        let a = serde_json::to_string(&unsupported).expect("serialise");
+        let b = serde_json::to_string(&not_reported).expect("serialise");
+
+        assert_ne!(a, b);
     }
 }
