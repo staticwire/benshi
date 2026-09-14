@@ -9,6 +9,8 @@
 //! shape; they are expected to change once the logic that consumes them is
 //! written.
 
+pub mod clock;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
