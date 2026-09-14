@@ -10,6 +10,7 @@
 //! written.
 
 pub mod clock;
+pub mod policy;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -70,6 +71,20 @@ pub struct Capabilities {
 /// expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlayerId(pub String);
+
+/// The application a source belongs to, as the platform names it.
+///
+/// Distinct from [`PlayerId`], and the distinction is not academic. A live
+/// session bus carries both `org.mpris.MediaPlayer2.Feishin` and
+/// `org.mpris.MediaPlayer2.chromium.instance30062`: two windows of one player
+/// are two identities but one application. The identity exists to tell them
+/// apart; policy and the source listing are keyed on the application.
+///
+/// The adapter declares both. This crate never derives one from the other,
+/// because the rule that relates them - an `.instance` suffix here, something
+/// else under SMTC - is platform knowledge and has no place in `core`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AppName(pub String);
 
 /// What a media source currently has open.
 ///
