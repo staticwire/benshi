@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             can(source.capabilities.position, "position"),
             can(source.capabilities.duration, "duration"),
             can(source.capabilities.paused, "paused"),
-            can(source.capabilities.file_path, "path"),
+            can(source.capabilities.location, "location"),
         );
     }
 

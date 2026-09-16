@@ -62,8 +62,13 @@ pub struct Capabilities {
     pub duration: bool,
     /// Whether playback is paused.
     pub paused: bool,
-    /// A file path, not merely a window title.
-    pub file_path: bool,
+    /// A location for what is open: a path or an address, not only a title.
+    ///
+    /// Answers whether this source names what it opened, which is what
+    /// recognition needs. Whether that name turns out to be a local file is a
+    /// fact about the media rather than about the source, so it belongs to
+    /// [`MediaRef`] and not here.
+    pub location: bool,
 }
 
 /// Stable identity of a media source, as provided by the platform.
@@ -90,12 +95,20 @@ pub struct AppName(pub String);
 
 /// What a media source currently has open.
 ///
+/// Three cases and not two. A source that names what it opened and a source
+/// that can only describe it are different things: mpv playing a stream knows
+/// the address, a browser knows only what the page calls itself. Collapsing the
+/// first into the second throws away an identifier that recognition can work
+/// from, and leaves an adapter no way to report what it actually has.
+///
 /// Provisional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaRef {
     /// A local file the source opened, as the platform spelled its path.
     LocalFile(RawPath),
-    /// A title string with no underlying file, as published by a browser.
+    /// An address the source opened, naming no file on this machine.
+    Remote(String),
+    /// A title with nothing underneath it, as published by a browser.
     Title(String),
 }
 
@@ -195,8 +208,25 @@ mod tests {
         assert_eq!(snapshot, back);
         match back.media {
             MediaRef::LocalFile(path) => assert_eq!(path.as_bytes(), broken.as_slice()),
-            MediaRef::Title(title) => panic!("expected a file, got the title {title:?}"),
+            other => panic!("expected a file, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_remote_reference_stays_distinct_from_a_title() {
+        // A player streaming over HTTP knows the address it opened; a browser
+        // knows only what the page calls itself. Carrying both as a title would
+        // lose that difference, and an adapter would have to report an address
+        // it holds as though it were a description.
+        let address = "https://example.invalid/stream.m3u8".to_owned();
+        let remote = MediaRef::Remote(address.clone());
+        let title = MediaRef::Title(address);
+
+        assert_ne!(remote, title);
+        assert_ne!(
+            serde_json::to_string(&remote).expect("serialise"),
+            serde_json::to_string(&title).expect("serialise")
+        );
     }
 
     #[test]
