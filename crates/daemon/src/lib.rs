@@ -15,3 +15,5 @@
 //! escape past is not a limiter.
 
 pub mod bus;
+
+pub mod supervisor;
