@@ -598,6 +598,31 @@ mod tests {
     }
 
     #[test]
+    fn a_component_that_is_only_the_word_instance_qualifies_nothing() {
+        // A qualifier carries a unique identifier after its prefix, so a
+        // component that is exactly the prefix distinguishes no instance from
+        // any other and is part of the name. This is the branch the length
+        // check exists for, and nothing else reaches it.
+        assert_eq!(
+            app_from_identity(&id("mpv.instance")),
+            AppName("mpv.instance".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_instance_qualifier_need_not_be_a_number() {
+        // Observed on 2026-09-16 by opening a second mpv: it took the name
+        // org.mpris.MediaPlayer2.mpv.instance-mZlVuXZe. The specification's
+        // example is a process id, so a rule demanding digits looks right and
+        // would have made this source's application `mpv.instance-mZlVuXZe`,
+        // which no denylist entry can match.
+        assert_eq!(
+            app_from_identity(&id("mpv.instance-mZlVuXZe")),
+            AppName("mpv".to_owned())
+        );
+    }
+
+    #[test]
     fn a_source_without_a_qualifier_is_its_own_application() {
         assert_eq!(
             app_from_identity(&id("Feishin")),
