@@ -1,7 +1,7 @@
 //! The MPRIS adapter against the shared contract.
 //!
 //! The suite is written without naming a platform so that it can be run against
-//! one. This is that run: the same thirteen clauses, the same code, a real
+//! one. This is that run: the same fifteen clauses, the same code, a real
 //! session bus instead of a fake.
 
 // The adapter under test exists only on Linux, so on any other target this
@@ -10,6 +10,9 @@
 
 mod contract;
 
+use std::collections::BTreeSet;
+
+use benshi_core::PlayerId;
 use benshi_core::clock::SystemClock;
 use benshi_detect::PlayerWatcher;
 use benshi_detect::mpris::{MprisWatcher, SOURCE_DEADLINE};
@@ -58,6 +61,37 @@ async fn the_mpris_adapter_satisfies_the_contract() {
         outcome.failures.len(),
         outcome.failures
     );
+
+    // A source with nothing open produces no reading and must still be
+    // described, or a player that merely stopped would look to the daemon like
+    // a player that closed. The contract checks that every reading was
+    // described; the reverse it cannot check, because a player that closed
+    // between the listing and the round would fail a correct implementation.
+    // That risk is taken here instead, where a re-run settles it.
+    //
+    // Exercising this needs a player sitting idle: with every player busy,
+    // every listed source produces a reading and this passes without proving
+    // anything.
+    let described: BTreeSet<&PlayerId> = outcome
+        .sources
+        .iter()
+        .map(|source| &source.player)
+        .collect();
+    let failed: BTreeSet<&PlayerId> = outcome
+        .failures
+        .iter()
+        .map(|(player, _reason)| player)
+        .collect();
+
+    for source in &sources {
+        assert!(
+            described.contains(&source.player) || failed.contains(&source.player),
+            "{:?} was listed, and the round that followed neither described nor \
+             failed it. A player closing between the two calls does this too, \
+             so re-run before believing it.",
+            source.player
+        );
+    }
 
     contract::verify(contract::Subject {
         watcher,

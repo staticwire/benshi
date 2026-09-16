@@ -61,8 +61,21 @@ pub struct SourceInfo {
 }
 
 /// The result of one polling round.
+///
+/// A round describes what it read as well as reading it, and both halves come
+/// out of one observation of each source. That is what lets a consumer tell
+/// whose reading it is holding: a reading names an identity, policy is keyed on
+/// the application, and the rule relating the two is platform knowledge that
+/// lives only in the adapter. Asking a second time would answer about a second
+/// moment.
 #[derive(Debug)]
 pub struct PollOutcome {
+    /// Every source that answered this round, whether or not it had something
+    /// open.
+    ///
+    /// Together with [`PollOutcome::failures`] this accounts for every source
+    /// the round found: one answered or it did not.
+    pub sources: Vec<SourceInfo>,
     /// One reading per source that had something open and answered in time.
     pub snapshots: Vec<PlayerSnapshot>,
     /// Sources that failed this round, with the reason.
@@ -92,12 +105,16 @@ pub trait PlayerWatcher {
     /// than failing it.
     async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError>;
 
-    /// Take one reading from every source, concurrently.
+    /// Take one reading from every source, concurrently, and describe each
+    /// source from the same observation.
     ///
     /// Each source carries its own deadline, so one that accepts a call and
     /// never answers delays no other source. A source with nothing open
     /// contributes no snapshot, rather than a snapshot with an empty media
-    /// reference.
+    /// reference, but it is still described in [`PollOutcome::sources`].
+    ///
+    /// [`PlayerWatcher::sources`] answers what is there without taking
+    /// readings; this answers it for every source that answered.
     ///
     /// # Errors
     ///
