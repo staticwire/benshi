@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use benshi_core::{AppName, Capabilities, PlayState, PlayerId};
+use benshi_core::clock::{Clock, Timestamp};
+use benshi_core::path::RawPath;
+use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
 use futures_util::future::join_all;
 use tokio::time::timeout;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
@@ -23,7 +25,7 @@ use zbus::names::InterfaceName;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
 
-use crate::{SourceInfo, WatchError};
+use crate::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 
 /// The prefix every MPRIS bus name carries, including its trailing dot.
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -43,6 +45,9 @@ const PLAYER_OBJECT: &str = "/org/mpris/MediaPlayer2";
 /// test below holds the literal to the rule instead.
 const PLAYER_INTERFACE: InterfaceName<'static> =
     InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
+
+/// The scheme a `xesam:url` carries when it names a file on this machine.
+const LOCAL_FILE_SCHEME: &str = "file://";
 
 /// The properties one `GetAll` returns, keyed as the bus spelled them.
 type Properties = HashMap<String, OwnedValue>;
@@ -148,7 +153,124 @@ fn declare_capabilities(player: &Properties, metadata: &Properties) -> Capabilit
         // A key holding an empty string names nothing, so it is not a location.
         // Declaring one would promise a reading that cannot arrive: the
         // contract requires a reported path or address to be non-empty.
-        location: text(metadata, "xesam:url").is_some_and(|url| !url.is_empty()),
+        location: non_empty_text(metadata, "xesam:url").is_some(),
+    }
+}
+
+/// How far into the media playback has reached.
+///
+/// Zero is the start of a file rather than an absence, so only a negative value
+/// is treated as one. A player paused at the beginning reports zero, and
+/// discarding it would leave the first seconds of every file unobserved.
+fn position_of(player: &Properties, declared: bool) -> Known<Duration> {
+    if !declared {
+        return Known::Unsupported;
+    }
+
+    match micros(player, "Position") {
+        Some(value) if value >= 0 => Known::Value(Duration::from_micros(value.unsigned_abs())),
+        _ => Known::NotReported,
+    }
+}
+
+/// How long the media is, as reported.
+///
+/// Advisory, and guarded twice. A length that is zero or negative is absent
+/// rather than a value. A length shorter than the position it arrives with is a
+/// lie that nothing downstream can tell from a genuinely short file.
+fn duration_of(
+    metadata: &Properties,
+    position: Known<Duration>,
+    declared: bool,
+) -> Known<Duration> {
+    if !declared {
+        return Known::Unsupported;
+    }
+
+    let Some(length) = micros(metadata, "mpris:length").filter(|&value| value > 0) else {
+        return Known::NotReported;
+    };
+    let length = Duration::from_micros(length.unsigned_abs());
+
+    match position {
+        Known::Value(position) if length < position => Known::NotReported,
+        _ => Known::Value(length),
+    }
+}
+
+/// A microsecond count, absent when missing or not the type MPRIS specifies.
+fn micros(properties: &Properties, key: &str) -> Option<i64> {
+    properties
+        .get(key)
+        .and_then(|value| i64::try_from(value).ok())
+}
+
+/// What the source has open, or nothing when it has nothing open.
+///
+/// `xesam:url` is preferred over `xesam:title`, and not merely tried first. A
+/// player holding a filename that is not valid UTF-8 percent-encodes those
+/// bytes into the URL, where they survive exactly; by the time the same name
+/// reaches `xesam:title` it has been through a lossy conversion and is
+/// destroyed. Observed on mpv 0.41.0 with a Shift-JIS filename.
+fn media_from(metadata: &Properties) -> Option<MediaRef> {
+    if let Some(url) = non_empty_text(metadata, "xesam:url") {
+        return Some(match url.strip_prefix(LOCAL_FILE_SCHEME) {
+            // A remainder that does not begin with a slash carries an
+            // authority, so the path it names is on another machine.
+            Some(path) if path.starts_with('/') => {
+                MediaRef::LocalFile(RawPath::from_bytes(percent_decode(path)))
+            }
+            _ => MediaRef::Remote(url.to_owned()),
+        });
+    }
+
+    non_empty_text(metadata, "xesam:title").map(|title| MediaRef::Title(title.to_owned()))
+}
+
+/// Decode percent escapes into bytes.
+///
+/// Into bytes and never into a `String`: a D-Bus string must be valid UTF-8, so
+/// a player holding a filename that is not has no choice but to escape those
+/// bytes, and decoding into text would fail or replace exactly the names this
+/// program exists to read.
+///
+/// Anything that is not a complete escape is carried through unchanged. A
+/// player that emits a stray `%` is reporting a filename with a `%` in it, and
+/// refusing the whole reading over one character would lose the file.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+
+    while let [first, tail @ ..] = rest {
+        // An escape consumes three bytes and yields one; anything else, an
+        // incomplete escape included, carries its first byte through.
+        let (byte, remaining) = leading_escape(rest).unwrap_or((*first, tail));
+        decoded.push(byte);
+        rest = remaining;
+    }
+
+    decoded
+}
+
+/// The byte an escape at the front of `bytes` stands for, with what follows it.
+///
+/// Absent when `bytes` does not begin with a complete escape, which is what
+/// carries a stray `%` through [`percent_decode`] unchanged.
+fn leading_escape(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let [b'%', high, low, rest @ ..] = bytes else {
+        return None;
+    };
+
+    Some((hex_value(*high)? << 4 | hex_value(*low)?, rest))
+}
+
+/// The value of one hexadecimal digit.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -167,6 +289,16 @@ fn text<'a>(properties: &'a Properties, key: &str) -> Option<&'a str> {
         .and_then(|value| <&str>::try_from(value).ok())
 }
 
+/// A string property that names something, absent also when it holds nothing.
+///
+/// The contract requires a reported path, address or title to be non-empty, and
+/// the same rule decides whether a source is declared able to name what it
+/// opened, so a declaration and the reading it governs cannot disagree about
+/// what counts as a name.
+fn non_empty_text<'a>(properties: &'a Properties, key: &str) -> Option<&'a str> {
+    text(properties, key).filter(|value| !value.is_empty())
+}
+
 /// The metadata dictionary nested inside a player's properties.
 ///
 /// A player with nothing open publishes no metadata, and one that publishes
@@ -179,60 +311,80 @@ fn metadata_of(player: &Properties) -> Properties {
         .unwrap_or_default()
 }
 
+/// One reading, or nothing when the source has nothing open.
+///
+/// Capabilities are derived from the same properties the reading comes from, so
+/// a declaration and the reading it governs cannot disagree within a round.
+fn translate(identity: &PlayerId, player: &Properties, at: Timestamp) -> Option<PlayerSnapshot> {
+    let metadata = metadata_of(player);
+    let media = media_from(&metadata)?;
+    let capabilities = declare_capabilities(player, &metadata);
+    let position = position_of(player, capabilities.position);
+
+    Some(PlayerSnapshot {
+        player: identity.clone(),
+        media,
+        state: play_state(text(player, "PlaybackStatus")),
+        position,
+        duration: duration_of(&metadata, position, capabilities.duration),
+        observed_at: at,
+    })
+}
+
 /// Every MPRIS player on the session bus.
 #[derive(Debug)]
-pub struct MprisWatcher {
+pub struct MprisWatcher<C> {
     connection: zbus::Connection,
+    clock: C,
     deadline: Duration,
 }
 
-impl MprisWatcher {
+impl<C: Clock> MprisWatcher<C> {
     /// Open a connection to the session bus.
     ///
-    /// The deadline applies to this call and to every later call on one source.
+    /// The clock is taken rather than read, so a test can move twenty seconds
+    /// of playback in no time at all. The deadline applies to this call and to
+    /// every later call on one source.
     ///
     /// # Errors
     ///
     /// Returns [`WatchError::Transport`] when there is no session bus to reach,
     /// or when it does not answer within `deadline`.
-    pub async fn connect(deadline: Duration) -> Result<Self, WatchError> {
+    pub async fn connect(clock: C, deadline: Duration) -> Result<Self, WatchError> {
         let connection = bus_call(deadline, zbus::Connection::session()).await?;
 
         Ok(Self {
             connection,
+            clock,
             deadline,
         })
     }
 
-    /// Every source the session bus currently carries.
-    ///
-    /// Sources are queried together rather than in turn, so one player that
-    /// accepts a call and never answers costs one deadline and not one each.
-    /// Such a player is omitted from the listing: `sources` has no channel for
-    /// a per-source failure, and a listing that fails wholesale because one
-    /// player hung would blind the daemon to every other.
-    ///
-    /// The listing is sorted by identity so that two calls with nothing changed
-    /// return the same thing in the same order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WatchError::Transport`] when the bus itself cannot be listed.
-    pub async fn sources(&self) -> Result<Vec<SourceInfo>, WatchError> {
+    /// Every MPRIS identity the bus currently carries.
+    async fn identities(&self) -> Result<Vec<PlayerId>, WatchError> {
         let bus = DBusProxy::new(&self.connection).await.map_err(transport)?;
-
         let names = bus_call(self.deadline, bus.list_names()).await?;
 
-        let described = names
+        Ok(names
             .iter()
             .filter_map(|name| identity_from_bus_name(name))
-            .map(|identity| self.describe(identity));
+            .collect())
+    }
 
-        let mut sources: Vec<SourceInfo> =
-            join_all(described).await.into_iter().flatten().collect();
-        sources.sort_by(|left, right| left.player.cmp(&right.player));
+    /// Take one reading, keeping the identity so that a failure can name it.
+    ///
+    /// The identity returned here is the one a [`WatchError`] was built from,
+    /// so the two halves of a reported failure cannot name different players.
+    async fn read(
+        &self,
+        identity: PlayerId,
+    ) -> (PlayerId, Result<Option<PlayerSnapshot>, WatchError>) {
+        let reading = self
+            .player_properties(&identity)
+            .await
+            .map(|player| translate(&identity, &player, self.clock.now()));
 
-        Ok(sources)
+        (identity, reading)
     }
 
     /// Describe one source, or nothing if it did not answer.
@@ -274,13 +426,70 @@ impl MprisWatcher {
     }
 }
 
+impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
+    /// Sources are queried together rather than in turn, so one player that
+    /// accepts a call and never answers costs one deadline and not one each.
+    /// Such a player is omitted: a listing has no channel for a per-source
+    /// failure, and failing it wholesale because one player hung would blind
+    /// the daemon to every other.
+    ///
+    /// Sorted by identity, so two calls with nothing changed return the same
+    /// listing in the same order.
+    async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
+        let described = self
+            .identities()
+            .await?
+            .into_iter()
+            .map(|identity| self.describe(identity));
+
+        let mut sources: Vec<SourceInfo> =
+            join_all(described).await.into_iter().flatten().collect();
+        sources.sort_by(|left, right| left.player.cmp(&right.player));
+
+        Ok(sources)
+    }
+
+    /// Every source is read in the same round and under its own deadline. A
+    /// source with nothing open contributes no snapshot rather than one whose
+    /// media reference is empty, and a source that failed is reported in
+    /// [`PollOutcome::failures`] rather than failing the round.
+    async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
+        let readings = self
+            .identities()
+            .await?
+            .into_iter()
+            .map(|identity| self.read(identity));
+
+        let mut snapshots = Vec::new();
+        let mut failures = Vec::new();
+
+        for (identity, reading) in join_all(readings).await {
+            match reading {
+                Ok(Some(snapshot)) => snapshots.push(snapshot),
+                Ok(None) => (),
+                Err(error) => failures.push((identity, error)),
+            }
+        }
+
+        snapshots.sort_by(|left, right| left.player.cmp(&right.player));
+
+        Ok(PollOutcome {
+            snapshots,
+            failures,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
-        identity_from_bus_name, play_state,
+        PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities, duration_of,
+        identity_from_bus_name, media_from, percent_decode, play_state, position_of, translate,
     };
-    use benshi_core::{AppName, PlayState, PlayerId};
+    use benshi_core::clock::{Clock, TestClock, Timestamp};
+    use benshi_core::path::RawPath;
+    use benshi_core::{AppName, Known, MediaRef, PlayState, PlayerId};
+    use std::time::Duration;
     use zbus::names::InterfaceName;
     use zbus::zvariant::{OwnedValue, Value};
 
@@ -442,6 +651,251 @@ mod tests {
 
         let absent = properties(vec![("xesam:title", a_string("Some Streaming Site"))]);
         assert!(!declare_capabilities(&Properties::new(), &absent).location);
+    }
+
+    /// A player's properties with the given metadata nested inside, as one
+    /// `GetAll` on the Player interface returns them.
+    fn a_player(pairs: Vec<(&str, OwnedValue)>, metadata: Vec<(&str, OwnedValue)>) -> Properties {
+        let mut player = properties(pairs);
+        player.insert(
+            "Metadata".to_owned(),
+            OwnedValue::from(properties(metadata)),
+        );
+        player
+    }
+
+    #[test]
+    fn a_reading_is_timed_by_the_clock_the_watcher_was_given() {
+        // The clock is a dependency so that twenty seconds of playback cost no
+        // time in a test. This is the seam: nothing in the translation reads a
+        // real clock, so the moment a reading carries is the one handed to it.
+        let player = a_player(
+            vec![("Position", OwnedValue::from(0_i64))],
+            vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
+        );
+        let clock = TestClock::new();
+        clock.advance(Duration::from_secs(20));
+
+        let snapshot = translate(&id("mpv"), &player, clock.now()).expect("a reading");
+
+        assert_eq!(snapshot.observed_at, clock.now());
+        assert_eq!(
+            snapshot.observed_at.since(Timestamp::epoch()),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn a_length_is_checked_against_the_position_the_reading_publishes() {
+        // The two guards are wired together here and nowhere else: a length is
+        // discarded for contradicting the position that this snapshot carries,
+        // not some other reading of the same map.
+        let player = a_player(
+            vec![("Position", OwnedValue::from(30_000_000_i64))],
+            vec![
+                ("xesam:url", a_string("file:///anime/ep.mkv")),
+                ("mpris:length", OwnedValue::from(10_000_000_i64)),
+            ],
+        );
+
+        let snapshot = translate(&id("mpv"), &player, Timestamp::epoch()).expect("a reading");
+
+        assert_eq!(snapshot.position, Known::Value(Duration::from_secs(30)));
+        assert_eq!(snapshot.duration, Known::NotReported);
+    }
+
+    #[test]
+    fn a_source_with_nothing_open_produces_no_reading() {
+        // Chromium idle publishes properties but no metadata. A source with
+        // nothing open contributes no snapshot rather than one naming nothing.
+        let player = a_player(vec![("Position", OwnedValue::from(0_i64))], vec![]);
+
+        assert_eq!(
+            translate(&id("chromium"), &player, Timestamp::epoch()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_position_of_zero_is_the_start_of_a_file_and_not_an_absence() {
+        // Observed on mpv 0.41.0 paused at the beginning: Position is x 0. Zero
+        // is a reading. Treating it as absence would leave the opening of every
+        // file unobserved, and it is why position and length are guarded
+        // differently rather than by one rule.
+        let player = properties(vec![("Position", OwnedValue::from(0_i64))]);
+
+        assert_eq!(position_of(&player, true), Known::Value(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_negative_position_is_not_reported() {
+        let player = properties(vec![("Position", OwnedValue::from(-1_i64))]);
+
+        assert_eq!(position_of(&player, true), Known::NotReported);
+    }
+
+    #[test]
+    fn a_position_from_a_source_that_cannot_report_one_is_unsupported() {
+        let player = properties(vec![("Position", OwnedValue::from(5_000_000_i64))]);
+
+        assert_eq!(position_of(&player, false), Known::Unsupported);
+    }
+
+    #[test]
+    fn a_zero_length_is_absent_rather_than_zero() {
+        let metadata = properties(vec![("mpris:length", OwnedValue::from(0_i64))]);
+
+        assert_eq!(
+            duration_of(&metadata, Known::NotReported, true),
+            Known::NotReported
+        );
+    }
+
+    #[test]
+    fn a_negative_length_is_absent() {
+        let metadata = properties(vec![("mpris:length", OwnedValue::from(-1_i64))]);
+
+        assert_eq!(
+            duration_of(&metadata, Known::NotReported, true),
+            Known::NotReported
+        );
+    }
+
+    #[test]
+    fn a_length_below_the_reported_position_is_discarded() {
+        // Players lie about length. A file cannot be shorter than how far into
+        // it playback has reached, and nothing downstream could tell such a
+        // reading from a genuinely short file.
+        let metadata = properties(vec![("mpris:length", OwnedValue::from(10_000_000_i64))]);
+        let position = Known::Value(Duration::from_secs(30));
+
+        assert_eq!(duration_of(&metadata, position, true), Known::NotReported);
+    }
+
+    #[test]
+    fn a_length_equal_to_the_position_is_kept() {
+        // The last microsecond of a file is a legitimate reading, so the guard
+        // discards a length below the position and not one that equals it.
+        let metadata = properties(vec![("mpris:length", OwnedValue::from(30_000_000_i64))]);
+        let position = Known::Value(Duration::from_secs(30));
+
+        assert_eq!(
+            duration_of(&metadata, position, true),
+            Known::Value(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn a_missing_length_from_a_capable_source_is_not_reported() {
+        // The player did not say. That is a different fact from the method
+        // being unable to carry a length, and the two must stay distinguishable.
+        assert_eq!(
+            duration_of(&Properties::new(), Known::NotReported, true),
+            Known::NotReported
+        );
+    }
+
+    #[test]
+    fn a_length_from_an_incapable_source_is_unsupported() {
+        let metadata = properties(vec![("mpris:length", OwnedValue::from(23_000_000_i64))]);
+
+        assert_eq!(
+            duration_of(&metadata, Known::NotReported, false),
+            Known::Unsupported
+        );
+    }
+
+    #[test]
+    fn a_shift_jis_filename_survives_percent_decoding_byte_for_byte() {
+        // Taken from mpv 0.41.0 on 2026-09-16, which published this URL for a
+        // file whose name is not valid UTF-8. The same name in xesam:title came
+        // back as U+FFFD replacement characters.
+        let decoded = percent_decode("/anime/%83%5C%83%8C%83b%83%5E%20-%2003.oga");
+
+        assert_eq!(
+            decoded,
+            b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e - 03.oga".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_windows_1251_filename_survives_percent_decoding_byte_for_byte() {
+        let decoded = percent_decode("/anime/%CF%F0%E8%EA%EB%FE%F7%E5%ED%E8%FF.mkv");
+
+        assert_eq!(
+            decoded,
+            b"/anime/\xcf\xf0\xe8\xea\xeb\xfe\xf7\xe5\xed\xe8\xff.mkv".to_vec()
+        );
+    }
+
+    #[test]
+    fn an_incomplete_escape_is_carried_through_rather_than_failing() {
+        // A player emitting a bare percent is naming a file with a percent in
+        // it. Refusing the reading over one character would lose the file.
+        assert_eq!(percent_decode("/50%/a%2"), b"/50%/a%2".to_vec());
+        assert_eq!(percent_decode("/a%zz"), b"/a%zz".to_vec());
+    }
+
+    #[test]
+    fn a_file_url_becomes_a_local_path() {
+        let metadata = properties(vec![("xesam:url", a_string("file:///anime/ep%2003.mkv"))]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/ep 03.mkv".to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_url_of_another_scheme_becomes_a_remote_reference() {
+        // Observed on mpv 0.41.0 opened on an HTTP address. The address is what
+        // recognition would work from, so it is carried rather than discarded.
+        let address = "http://127.0.0.1:34715/remote-episode.oga";
+        let metadata = properties(vec![("xesam:url", a_string(address))]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::Remote(address.to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_file_url_naming_a_host_is_not_a_local_path() {
+        // A remainder that does not begin with a slash carries an authority, so
+        // the path is on another machine. No observed player emits one, and
+        // guessing that it is local would produce a path that opens nothing.
+        let metadata = properties(vec![("xesam:url", a_string("file://server/share/ep.mkv"))]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::Remote("file://server/share/ep.mkv".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_source_with_no_url_falls_back_to_its_title() {
+        let metadata = properties(vec![("xesam:title", a_string("Episode 3 - Some Site"))]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::Title("Episode 3 - Some Site".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_source_with_nothing_open_reports_no_media() {
+        // Chromium with nothing playing publishes no metadata at all. A source
+        // with nothing open contributes no reading, rather than a reading whose
+        // media reference is empty.
+        assert_eq!(media_from(&Properties::new()), None);
+
+        let blank = properties(vec![
+            ("xesam:url", a_string("")),
+            ("xesam:title", a_string("")),
+        ]);
+        assert_eq!(media_from(&blank), None);
     }
 
     #[test]
