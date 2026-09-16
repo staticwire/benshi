@@ -1,15 +1,21 @@
 //! The detection task: what the platform reports, filtered by policy, on the
 //! bus.
 //!
-//! This is where the adapter, the policy table and the event bus meet, and it
-//! is the only place any of them do. The adapter decides nothing and does not
-//! know policy exists; the policy table is pure logic in `benshi-core` and
-//! knows nothing about a bus; the filter between them is here.
+//! This is where the adapter, the policy table and the event bus meet, and the
+//! only place the adapter meets either of the others. The adapter decides
+//! nothing and does not know policy exists; the policy table is pure logic in
+//! `benshi-core` and knows nothing about a bus; the filter between them is
+//! here.
 //!
 //! Policy is applied to **readings** and never to discovery. A denied source is
 //! published in the membership exactly as an admitted one is, because a source
 //! nobody can see is a source nobody can diagnose, and "why is my player being
 //! ignored" has to have somewhere to look.
+//!
+//! A round also leaves behind what it saw, in [`Seen`], which is what a client
+//! asking for a listing is answered from. The same question again: a listing
+//! shows what the daemon is acting on, and a second look at the platform would
+//! be free to disagree with it.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
@@ -32,6 +38,55 @@ const UNDESCRIBED: &str = "read but not described in the same round, so no polic
 
 /// What is said when the policy table cannot be trusted.
 const POISONED: &str = "the policy table was poisoned by a panic in another task";
+
+/// What is said when the record of what was seen cannot be trusted.
+const POISONED_SEEN: &str = "what was last seen was poisoned by a panic in another task";
+
+/// Every source the last round was able to describe.
+///
+/// Written by the detection task at the end of each round that reached the
+/// platform, and read by a client asking for a listing, so that `benshi
+/// sources` shows what the daemon is acting on. Looking at the platform a
+/// second time would be fresher and could disagree with what detection is
+/// publishing, and for a command whose whole job is to explain the daemon,
+/// agreeing matters more than being current.
+///
+/// A source that did not answer is not here, because there is nothing to
+/// describe. It stays in the membership the bus publishes, which is where a
+/// player that has gone quiet shows up.
+///
+/// Cloning shares the record rather than copying it.
+#[derive(Debug, Clone, Default)]
+pub struct Seen(Arc<RwLock<Vec<SourceInfo>>>);
+
+impl Seen {
+    /// A record of nothing, which is what is true before the first round.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the record with what this round found.
+    ///
+    /// # Panics
+    ///
+    /// If a panic elsewhere poisoned the record. A listing assembled from what
+    /// a panicking task left behind is one nobody can reason about, and the
+    /// supervisor records the panic and restarts.
+    pub fn record(&self, sources: Vec<SourceInfo>) {
+        *self.0.write().expect(POISONED_SEEN) = sources;
+    }
+
+    /// The sources of the last round, and none before the first has run.
+    ///
+    /// # Panics
+    ///
+    /// If a panic elsewhere poisoned the record, for the same reason.
+    #[must_use]
+    pub fn sources(&self) -> Vec<SourceInfo> {
+        self.0.read().expect(POISONED_SEEN).clone()
+    }
+}
 
 /// Which class a failed round belongs to.
 ///
@@ -59,6 +114,7 @@ pub struct Detection<W> {
     watcher: W,
     bus: Arc<EventBus>,
     policy: Arc<RwLock<PolicyTable>>,
+    seen: Seen,
     period: Duration,
     listed: BTreeSet<PlayerId>,
 }
@@ -66,19 +122,22 @@ pub struct Detection<W> {
 impl<W: PlayerWatcher> Detection<W> {
     /// Detection over one platform, reading one policy table.
     ///
-    /// The table is shared rather than copied, so that setting a policy over
-    /// IPC changes what a running loop publishes without restarting it.
+    /// The table is shared rather than copied, so that setting a policy changes
+    /// what a running loop publishes without restarting it. `seen` is the other
+    /// direction: what each round found, left where a client can read it.
     #[must_use]
     pub fn new(
         watcher: W,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
+        seen: Seen,
         period: Duration,
     ) -> Self {
         Self {
             watcher,
             bus,
             policy,
+            seen,
             period,
             listed: BTreeSet::new(),
         }
@@ -153,6 +212,8 @@ impl<W: PlayerWatcher> Detection<W> {
             }
         }
 
+        self.seen.record(sources);
+
         Ok(())
     }
 
@@ -199,7 +260,7 @@ impl<W: PlayerWatcher> Detection<W> {
 // the whole point of a fake.
 #[allow(clippy::unused_async_trait_impl)]
 mod tests {
-    use super::Detection;
+    use super::{Detection, Seen};
     use crate::bus::{BusEvent, EventBus};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
@@ -348,7 +409,8 @@ mod tests {
             a_source("mpv.instance1701", "mpv"),
             a_source("vlc", "vlc"),
         ]))]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("a round");
 
@@ -370,7 +432,8 @@ mod tests {
             a_source("firefox.instance30062", "firefox"),
             a_source("mpv", "mpv"),
         ]))]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -405,7 +468,8 @@ mod tests {
             "chromium.instance16481",
             "chromium",
         )]))]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("a round");
 
@@ -426,7 +490,8 @@ mod tests {
             snapshots: vec![a_reading(&stranger)],
             failures: Vec::new(),
         })]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -460,7 +525,8 @@ mod tests {
                 },
             )],
         })]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -510,7 +576,8 @@ mod tests {
                 failures: vec![silent()],
             }),
         ]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round it went quiet in");
@@ -519,6 +586,65 @@ mod tests {
             listings_in(&drain(&mut events)),
             vec![vec![id("mpv"), id("vlc")]],
             "a source that did not answer was reported as gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_round_leaves_what_it_saw_where_a_client_can_read_it() {
+        // A listing command shows what the daemon is acting on rather than a
+        // second look at the platform, so the round leaves its sources behind
+        // and the next round replaces them.
+        let bus = Arc::new(EventBus::new());
+        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let seen = Seen::new();
+        let watcher = ScriptedWatcher::of(vec![
+            Ok(a_round(vec![
+                a_source("mpv", "mpv"),
+                a_source("vlc", "vlc"),
+            ])),
+            Ok(a_round(vec![a_source("vlc", "vlc")])),
+        ]);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, seen.clone(), INTERVAL);
+
+        assert!(
+            seen.sources().is_empty(),
+            "something was recorded before the first round ran"
+        );
+
+        detection.round().await.expect("the first round");
+        assert_eq!(
+            seen.sources(),
+            vec![a_source("mpv", "mpv"), a_source("vlc", "vlc")]
+        );
+
+        detection.round().await.expect("the second round");
+        assert_eq!(
+            seen.sources(),
+            vec![a_source("vlc", "vlc")],
+            "the record grew instead of being replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_source_is_recorded_so_a_listing_can_explain_it() {
+        // The listing is where "why is my player being ignored" is answered, so
+        // a denied source has to be in the record even though none of its
+        // readings ever reach the bus.
+        let bus = Arc::new(EventBus::new());
+        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let seen = Seen::new();
+        let watcher = ScriptedWatcher::of(vec![Ok(a_round(vec![a_source(
+            "firefox.instance30062",
+            "firefox",
+        )]))]);
+        let mut detection = Detection::new(watcher, bus, policy, seen.clone(), INTERVAL);
+
+        detection.round().await.expect("a round");
+
+        assert_eq!(
+            seen.sources(),
+            vec![a_source("firefox.instance30062", "firefox")]
         );
     }
 
@@ -537,7 +663,8 @@ mod tests {
             ])),
             Ok(a_round(vec![a_source("mpv", "mpv")])),
         ]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round after vlc closed");
@@ -559,7 +686,8 @@ mod tests {
             Ok(a_round(vec![a_source("mpv", "mpv")])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
         ]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -578,7 +706,8 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -599,7 +728,7 @@ mod tests {
         let watcher = ScriptedWatcher::of(vec![Err(WatchError::Transport(Box::new(
             std::io::Error::other("the session bus is gone"),
         )))]);
-        let mut detection = Detection::new(watcher, bus, policy, INTERVAL);
+        let mut detection = Detection::new(watcher, bus, policy, Seen::new(), INTERVAL);
 
         let failure = detection.round().await.expect_err("the round fails");
 
@@ -618,8 +747,13 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), Arc::clone(&policy), INTERVAL);
+        let mut detection = Detection::new(
+            watcher,
+            Arc::clone(&bus),
+            Arc::clone(&policy),
+            Seen::new(),
+            INTERVAL,
+        );
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL / 2).await;
@@ -652,7 +786,8 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = Detection::new(watcher, Arc::clone(&bus), policy, INTERVAL);
+        let mut detection =
+            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL * 3 + INTERVAL / 2).await;
@@ -682,7 +817,7 @@ mod tests {
         assert!(panicked.is_err(), "the thread did not panic");
 
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = Detection::new(watcher, bus, policy, INTERVAL);
+        let mut detection = Detection::new(watcher, bus, policy, Seen::new(), INTERVAL);
 
         let read = tokio::spawn(async move { detection.round().await });
 

@@ -11,7 +11,7 @@
 //! happened.
 
 use benshi_core::{PlayerId, PlayerSnapshot, SessionState};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// How many events the bus keeps for a subscriber that has fallen behind.
@@ -27,11 +27,11 @@ pub const CAPACITY: usize = 256;
 
 /// Something the daemon did or saw.
 ///
-/// Serialisable so that `benshi watch` can carry these over the socket exactly
-/// as they are published, rather than through a second representation free to
-/// drift from this one. Nothing reads the other end yet, so only `Serialize` is
-/// derived; the client adds `Deserialize` and the round trip that proves it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Carried over the socket exactly as it is published, rather than through a
+/// second representation free to drift from this one. `benshi watch` reads back
+/// what the daemon wrote, and `protocol` holds the round trip that proves the
+/// two halves agree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BusEvent {
     /// A reading was taken from a source.
     Snapshot(PlayerSnapshot),
@@ -91,6 +91,18 @@ impl EventBus {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<BusEvent> {
         self.sender.subscribe()
+    }
+
+    /// How many subscribers the bus has.
+    ///
+    /// Every subscriber that still exists, whether or not it is keeping up: one
+    /// that has stopped reading is counted until it is dropped. Publishing does
+    /// not depend on this and must not, because the daemon publishes whether or
+    /// not anyone is watching. It answers "is anything listening", which is the
+    /// first question when a stream looks empty.
+    #[must_use]
+    pub fn subscribers(&self) -> usize {
+        self.sender.receiver_count()
     }
 
     /// Publish one event to every subscriber.
@@ -166,7 +178,21 @@ mod tests {
         // watching is the ordinary case.
         let bus = EventBus::new();
 
+        assert_eq!(bus.subscribers(), 0);
         bus.publish(a_listing(0));
+    }
+
+    #[test]
+    fn a_subscriber_that_went_away_is_no_longer_counted() {
+        // The count answers "is anything listening", so a receiver that has
+        // been dropped must not still be counted as one.
+        let bus = EventBus::new();
+        let watching = bus.subscribe();
+        assert_eq!(bus.subscribers(), 1);
+
+        drop(watching);
+
+        assert_eq!(bus.subscribers(), 0);
     }
 
     #[test]
