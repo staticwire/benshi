@@ -1,3 +1,9 @@
+# Dependencies are added with `cargo add` in the crate that needs them, and in
+# the task that needs them, so that a recorded version is one that actually
+# resolved rather than one written from memory. There is deliberately no
+# `[workspace.dependencies]` section: nothing is yet shared by enough crates to
+# earn one, and an empty one is removed by `cargo add` without saying so, taking
+# any comment on it along.
 [workspace]
 resolver = "3"
 members = ["crates/*"]
@@ -9,11 +15,6 @@ rust-version = "1.98"
 license = "MIT"
 authors = ["staticwire"]
 repository = "https://github.com/staticwire/benshi"
-
-# Dependencies are added with `cargo add` as each crate needs them, so that the
-# recorded version is the one actually resolved rather than one written from
-# memory. This section stays empty until the first real dependency lands.
-[workspace.dependencies]
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -13,3 +13,5 @@
 //! The supervisor **owns each task's handle and observes its exit**. That is
 //! what makes it impossible to bypass: a restart limiter that an exception can
 //! escape past is not a limiter.
+
+pub mod bus;
