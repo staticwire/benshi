@@ -44,9 +44,6 @@ const PLAYER_OBJECT: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_INTERFACE: InterfaceName<'static> =
     InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
 
-/// The scheme a `xesam:url` carries when it names a file on this machine.
-const LOCAL_FILE_SCHEME: &str = "file://";
-
 /// The properties one `GetAll` returns, keyed as the bus spelled them.
 type Properties = HashMap<String, OwnedValue>;
 
@@ -134,12 +131,12 @@ fn play_state(status: Option<&str>) -> PlayState {
 
 /// What this source is able to report.
 ///
-/// Three of the four are stable facts about the source. `file_path` is not, and
-/// cannot be: MPRIS offers no way for a player to declare that it will name a
-/// file, so the declaration is re-derived from what the source has open at each
-/// listing. A player that switches between a local file and a stream therefore
-/// changes this capability, which is the one place this adapter reports a fact
-/// about the moment rather than about the source.
+/// Each of the four describes the source rather than the track it happens to
+/// hold. `location` is whether the source publishes `xesam:url` at all, which
+/// is a property of the player: mpv publishes one for everything it opens, and
+/// a browser publishes none. Whether that address turns out to name a local
+/// file changes with the track, so it is carried by `MediaRef` in the reading
+/// and decides nothing here.
 fn declare_capabilities(player: &Properties, metadata: &Properties) -> Capabilities {
     Capabilities {
         position: player.contains_key("Position"),
@@ -148,8 +145,10 @@ fn declare_capabilities(player: &Properties, metadata: &Properties) -> Capabilit
         // rather than Unsupported, which is the distinction `Known` exists for.
         duration: true,
         paused: boolean(player, "CanPause"),
-        file_path: text(metadata, "xesam:url")
-            .is_some_and(|url| url.starts_with(LOCAL_FILE_SCHEME)),
+        // A key holding an empty string names nothing, so it is not a location.
+        // Declaring one would promise a reading that cannot arrive: the
+        // contract requires a reported path or address to be non-empty.
+        location: text(metadata, "xesam:url").is_some_and(|url| !url.is_empty()),
     }
 }
 
@@ -424,24 +423,35 @@ mod tests {
     }
 
     #[test]
-    fn a_path_is_declared_only_where_the_source_names_a_local_file() {
-        // Observed live: mpv publishes xesam:url for a local file, chromium and
-        // Feishin publish no xesam:url at all. A player streaming over HTTP
-        // publishes one that names no file, and declaring a path for it would
-        // promise a filename that never arrives.
+    fn a_location_is_declared_by_publishing_one_at_all() {
+        // Observed live: mpv publishes xesam:url for everything it opens, and
+        // Chromium and Feishin publish none. A remote address is a location as
+        // much as a path is, so both declare the capability. Reading the scheme
+        // here instead would make the declaration change with the track.
         let local = properties(vec![(
             "xesam:url",
             a_string("file:///anime/show%20-%2003.mkv"),
         )]);
-        assert!(declare_capabilities(&Properties::new(), &local).file_path);
+        assert!(declare_capabilities(&Properties::new(), &local).location);
 
         let remote = properties(vec![(
             "xesam:url",
             a_string("https://example.invalid/s.m3u8"),
         )]);
-        assert!(!declare_capabilities(&Properties::new(), &remote).file_path);
+        assert!(declare_capabilities(&Properties::new(), &remote).location);
 
         let absent = properties(vec![("xesam:title", a_string("Some Streaming Site"))]);
-        assert!(!declare_capabilities(&Properties::new(), &absent).file_path);
+        assert!(!declare_capabilities(&Properties::new(), &absent).location);
+    }
+
+    #[test]
+    fn a_url_of_no_characters_is_not_a_location() {
+        // The contract requires a reported path or address to be non-empty, so
+        // a source publishing the key with nothing in it must not be declared
+        // able to name what it opened. Testing the key alone would promise a
+        // reading that cannot arrive.
+        let empty = properties(vec![("xesam:url", a_string(""))]);
+
+        assert!(!declare_capabilities(&Properties::new(), &empty).location);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Sources and readings only. No watcher lives here, because the two test
 //! binaries that use these need very different ones: one that satisfies every
-//! clause and eleven that each break one.
+//! clause and thirteen that each break one.
 
 use std::time::Duration;
 
@@ -23,18 +23,39 @@ pub const DEADLINE: Duration = Duration::from_millis(500);
 /// real file out of a Japanese archive takes.
 pub const SHIFT_JIS_NAME: &[u8] = b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e - 03.mkv";
 
-/// A source that reports everything, as a local player does.
+/// The address the streaming fake reports.
+pub const STREAM_ADDRESS: &str = "https://example.invalid/episode-3.m3u8";
+
+/// The identity of the source that opens a local file.
+const LOCAL_PLAYER: &str = "mpv.instance1701";
+
+/// The identity of the source that opens a remote address.
+const STREAMING_PLAYER: &str = "mpv.instance1702";
+
+/// A source that reports everything and opens a local file.
 pub fn a_full_player() -> SourceInfo {
     SourceInfo {
-        player: PlayerId("mpv.instance1701".to_owned()),
+        player: PlayerId(LOCAL_PLAYER.to_owned()),
         app: AppName("mpv".to_owned()),
         capabilities: Capabilities {
             position: true,
             duration: true,
             paused: true,
-            file_path: true,
+            location: true,
         },
         state: PlayState::Playing,
+    }
+}
+
+/// A second window of that player, open on a stream rather than a file.
+///
+/// Declares the same capabilities as the first, because naming what is open is
+/// a property of the player and not of what it happens to hold. The reading is
+/// what differs, and the contract has to accept both.
+pub fn a_streaming_player() -> SourceInfo {
+    SourceInfo {
+        player: PlayerId(STREAMING_PLAYER.to_owned()),
+        ..a_full_player()
     }
 }
 
@@ -47,7 +68,7 @@ pub fn a_title_only_player() -> SourceInfo {
             position: false,
             duration: false,
             paused: true,
-            file_path: false,
+            location: false,
         },
         state: PlayState::Playing,
     }
@@ -56,8 +77,10 @@ pub fn a_title_only_player() -> SourceInfo {
 /// Build the reading a source of these capabilities would produce.
 ///
 /// Every field follows the declaration: a source that cannot report a position
-/// reports `Unsupported` rather than zero, and one that can report a path
-/// reports a path.
+/// reports `Unsupported` rather than zero, and one that declares a location
+/// names what it opened. Which kind of name it gives is fixture data, because
+/// the declaration deliberately does not say: that is the distinction between
+/// a capability and a reading.
 pub fn reading(source: &SourceInfo, round: u32, at: Timestamp) -> PlayerSnapshot {
     let position = if source.capabilities.position {
         Known::Value(TICK * round)
@@ -71,10 +94,10 @@ pub fn reading(source: &SourceInfo, round: u32, at: Timestamp) -> PlayerSnapshot
         Known::Unsupported
     };
 
-    let media = if source.capabilities.file_path {
-        MediaRef::LocalFile(RawPath::from_bytes(SHIFT_JIS_NAME.to_vec()))
-    } else {
-        MediaRef::Title("Episode 3 - Some Streaming Site".to_owned())
+    let media = match source.player.0.as_str() {
+        LOCAL_PLAYER => MediaRef::LocalFile(RawPath::from_bytes(SHIFT_JIS_NAME.to_vec())),
+        STREAMING_PLAYER => MediaRef::Remote(STREAM_ADDRESS.to_owned()),
+        _ => MediaRef::Title("Episode 3 - Some Streaming Site".to_owned()),
     };
 
     PlayerSnapshot {

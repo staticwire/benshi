@@ -23,7 +23,7 @@ use benshi_core::path::RawPath;
 use benshi_core::{AppName, Known, MediaRef, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 
-use fakes::{DEADLINE, TICK, a_full_player, a_title_only_player, reading};
+use fakes::{DEADLINE, TICK, a_full_player, a_streaming_player, a_title_only_player, reading};
 
 /// The outcome of a poll that found nothing open.
 fn no_readings() -> PollOutcome {
@@ -150,13 +150,13 @@ impl PlayerWatcher for UnlistedSnapshot {
     }
 }
 
-/// Declares it can report a path and reports a window title.
+/// Declares it can name what it opened and reports a window title.
 #[derive(Default)]
-struct TitleForADeclaredPath {
+struct TitleForADeclaredLocation {
     clock: TestClock,
 }
 
-impl PlayerWatcher for TitleForADeclaredPath {
+impl PlayerWatcher for TitleForADeclaredLocation {
     async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
         Ok(vec![a_full_player()])
     }
@@ -171,11 +171,11 @@ impl PlayerWatcher for TitleForADeclaredPath {
 
 /// Reports a path of no bytes, which names no file.
 #[derive(Default)]
-struct EmptyPathForADeclaredPath {
+struct EmptyPathForADeclaredLocation {
     clock: TestClock,
 }
 
-impl PlayerWatcher for EmptyPathForADeclaredPath {
+impl PlayerWatcher for EmptyPathForADeclaredLocation {
     async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
         Ok(vec![a_full_player()])
     }
@@ -184,6 +184,25 @@ impl PlayerWatcher for EmptyPathForADeclaredPath {
         self.clock.advance(TICK);
         let mut snapshot = reading(&a_full_player(), 1, self.clock.now());
         snapshot.media = MediaRef::LocalFile(RawPath::from_bytes(Vec::new()));
+        Ok(one_reading(snapshot))
+    }
+}
+
+/// Reports an address of no characters, which names nothing.
+#[derive(Default)]
+struct EmptyAddressForADeclaredLocation {
+    clock: TestClock,
+}
+
+impl PlayerWatcher for EmptyAddressForADeclaredLocation {
+    async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
+        Ok(vec![a_streaming_player()])
+    }
+
+    async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
+        self.clock.advance(TICK);
+        let mut snapshot = reading(&a_streaming_player(), 1, self.clock.now());
+        snapshot.media = MediaRef::Remote(String::new());
         Ok(one_reading(snapshot))
     }
 }
@@ -326,10 +345,10 @@ async fn a_reading_from_nowhere_fails_the_contract() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "a declared path arrives as a path")]
-async fn a_title_where_a_path_was_promised_fails_the_contract() {
+#[should_panic(expected = "a declared location arrives as a location")]
+async fn a_title_where_a_location_was_promised_fails_the_contract() {
     contract::verify(contract::Subject {
-        watcher: TitleForADeclaredPath::default(),
+        watcher: TitleForADeclaredLocation::default(),
         deadline: DEADLINE,
     })
     .await;
@@ -339,7 +358,17 @@ async fn a_title_where_a_path_was_promised_fails_the_contract() {
 #[should_panic(expected = "a reported path is not empty")]
 async fn an_empty_path_fails_the_contract() {
     contract::verify(contract::Subject {
-        watcher: EmptyPathForADeclaredPath::default(),
+        watcher: EmptyPathForADeclaredLocation::default(),
+        deadline: DEADLINE,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "a reported address is not empty")]
+async fn an_empty_address_fails_the_contract() {
+    contract::verify(contract::Subject {
+        watcher: EmptyAddressForADeclaredLocation::default(),
         deadline: DEADLINE,
     })
     .await;

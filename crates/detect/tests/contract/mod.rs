@@ -41,7 +41,7 @@ pub async fn verify<W: PlayerWatcher>(mut subject: Subject<W>) {
 
     for outcome in [&earlier, &later] {
         snapshots_come_only_from_listed_sources(&first, outcome);
-        a_declared_path_arrives_as_a_path(&first, outcome);
+        a_declared_location_arrives_as_a_location(&first, outcome);
         an_absent_position_is_absent_not_zero(&first, outcome);
         a_duration_is_never_shorter_than_its_position(outcome);
     }
@@ -198,18 +198,23 @@ fn snapshots_come_only_from_listed_sources(sources: &[SourceInfo], outcome: &Pol
     }
 }
 
-/// A source that declares it can report a path reports one.
+/// A source that declares it can name what it opened names it.
 ///
 /// Declaring the capability and then emitting a window title makes the
 /// declaration worthless, and a consumer has no way to notice.
-fn a_declared_path_arrives_as_a_path(sources: &[SourceInfo], outcome: &PollOutcome) {
+///
+/// The clause is about naming, not about where the media lives. A player
+/// streaming over HTTP names an address rather than a path, and that is a
+/// location; requiring a path here would force such a player to be reported as
+/// though it knew nothing but a title.
+fn a_declared_location_arrives_as_a_location(sources: &[SourceInfo], outcome: &PollOutcome) {
     let declared = declarations(sources);
 
     for snapshot in &outcome.snapshots {
         let Some(capabilities) = declared.get(&snapshot.player) else {
             continue;
         };
-        if !capabilities.file_path {
+        if !capabilities.location {
             continue;
         }
 
@@ -220,9 +225,16 @@ fn a_declared_path_arrives_as_a_path(sources: &[SourceInfo], outcome: &PollOutco
                  of no bytes, which names no file.",
                 snapshot.player
             ),
+            MediaRef::Remote(address) => assert!(
+                !address.is_empty(),
+                "contract: a reported address is not empty. {:?} reported an \
+                 address of no characters, which names nothing.",
+                snapshot.player
+            ),
             MediaRef::Title(title) => panic!(
-                "contract: a declared path arrives as a path. {:?} declared it \
-                 can report a path and reported the title {title:?}.",
+                "contract: a declared location arrives as a location. {:?} \
+                 declared it can name what it opened and reported the title \
+                 {title:?}.",
                 snapshot.player
             ),
         }

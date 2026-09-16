@@ -15,7 +15,7 @@ mod fakes;
 use benshi_core::clock::{Clock, TestClock};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 
-use fakes::{DEADLINE, TICK, a_full_player, a_title_only_player, reading};
+use fakes::{DEADLINE, TICK, a_full_player, a_streaming_player, a_title_only_player, reading};
 
 /// A watcher that satisfies every clause of the contract.
 struct CorrectWatcher {
@@ -27,7 +27,7 @@ struct CorrectWatcher {
 impl CorrectWatcher {
     fn new() -> Self {
         Self {
-            listing: vec![a_full_player(), a_title_only_player()],
+            listing: vec![a_full_player(), a_streaming_player(), a_title_only_player()],
             clock: TestClock::new(),
             round: 0,
         }
