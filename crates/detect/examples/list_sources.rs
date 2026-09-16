@@ -1,4 +1,4 @@
-//! Print every media source the platform currently reports.
+//! Print every media source the platform reports, and one reading from each.
 //!
 //! The smallest program that observes the real world, kept because every later
 //! question about an adapter starts with "what does it actually see?".
@@ -6,10 +6,13 @@
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use benshi_core::clock::SystemClock;
+    use benshi_core::{MediaRef, encoding};
+    use benshi_detect::PlayerWatcher;
     use benshi_detect::mpris::MprisWatcher;
     use std::time::Duration;
 
-    let watcher = MprisWatcher::connect(Duration::from_secs(2)).await?;
+    let mut watcher = MprisWatcher::connect(SystemClock::new(), Duration::from_secs(2)).await?;
     let sources = watcher.sources().await?;
 
     if sources.is_empty() {
@@ -19,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let can = |declared, name| if declared { name } else { "-" };
 
-    for source in sources {
+    for source in &sources {
         println!(
             "{:<28} app={:<16} {:<8} {} {} {} {}",
             source.player.0,
@@ -30,6 +33,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             can(source.capabilities.paused, "paused"),
             can(source.capabilities.location, "location"),
         );
+    }
+
+    println!();
+    let outcome = watcher.poll().await?;
+
+    for snapshot in &outcome.snapshots {
+        // A filename is bytes, so it is decoded for display here and nowhere
+        // else: what a byte string says is a decision, and an adapter takes
+        // none. The encoding and how it was arrived at are printed with it.
+        let open = match &snapshot.media {
+            MediaRef::LocalFile(path) => {
+                let name = encoding::decode(path.file_name());
+                format!("{} [{} {:?}]", name.text, name.encoding, name.confidence)
+            }
+            MediaRef::Remote(address) => address.clone(),
+            MediaRef::Title(title) => title.clone(),
+        };
+
+        println!(
+            "{:<28} {:?} / {:?}  {open}",
+            snapshot.player.0, snapshot.position, snapshot.duration
+        );
+    }
+
+    for (player, error) in &outcome.failures {
+        println!("{:<28} failed: {error}", player.0);
     }
 
     Ok(())
