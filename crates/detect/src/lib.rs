@@ -9,6 +9,9 @@
 //! inferred by the consumer. Every platform call carries a deadline, because a
 //! source that accepts a message and never replies must not hang the poll.
 
+#[cfg(target_os = "linux")]
+pub mod mpris;
+
 use std::time::Duration;
 
 use benshi_core::{AppName, BoxError, Capabilities, PlayState, PlayerId, PlayerSnapshot};

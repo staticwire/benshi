@@ -12,6 +12,14 @@ repository.workspace = true
 benshi-core = { path = "../core" }
 thiserror = "2.0.20"
 
+# MPRIS exists only on Linux and zbus is needed only to speak to it, so the
+# dependency is gated rather than carried into a Windows build that will reach
+# the same sources through SMTC instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", features = ["time"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+
 [lints]
 workspace = true
 
