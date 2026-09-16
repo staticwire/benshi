@@ -86,6 +86,7 @@ dependencies = [
  "benshi-sync",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
