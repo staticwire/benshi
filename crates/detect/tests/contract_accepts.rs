@@ -45,6 +45,7 @@ impl PlayerWatcher for CorrectWatcher {
         let now = self.clock.now();
 
         Ok(PollOutcome {
+            sources: self.listing.clone(),
             snapshots: self
                 .listing
                 .iter()

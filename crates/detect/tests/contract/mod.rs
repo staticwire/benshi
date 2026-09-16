@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use benshi_core::clock::Timestamp;
-use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayerId};
+use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo};
 
 /// What a suite run needs from the caller.
@@ -40,6 +40,7 @@ pub async fn verify<W: PlayerWatcher>(mut subject: Subject<W>) {
     let later = poll_within_deadline(&mut subject).await;
 
     for outcome in [&earlier, &later] {
+        a_round_describes_the_sources_it_read(outcome);
         snapshots_come_only_from_listed_sources(&first, outcome);
         a_declared_location_arrives_as_a_location(&first, outcome);
         an_absent_position_is_absent_not_zero(&first, outcome);
@@ -180,6 +181,42 @@ fn an_identity_keeps_its_application(first: &[SourceInfo], second: &[SourceInfo]
             "contract: an identity keeps its application. {:?} changed \
              application between two consecutive listings.",
             source.player
+        );
+    }
+}
+
+/// A round accounts for every source whose reading it carries.
+///
+/// A reading names an identity and policy is keyed on the application, and only
+/// the adapter knows the rule relating the two. So a round describes what it
+/// read, and a consumer never has to ask the platform a second question to find
+/// out whose reading it is holding.
+///
+/// The description and the reading must come from one observation. An
+/// implementation that describes its sources in one round and reads them in
+/// another fails here as soon as a player changes state between the two.
+fn a_round_describes_the_sources_it_read(outcome: &PollOutcome) {
+    let described: BTreeMap<&PlayerId, PlayState> = outcome
+        .sources
+        .iter()
+        .map(|source| (&source.player, source.state))
+        .collect();
+
+    for snapshot in &outcome.snapshots {
+        let Some(state) = described.get(&snapshot.player) else {
+            panic!(
+                "contract: a round describes every source it read. {:?} \
+                 produced a reading and the same round did not describe it.",
+                snapshot.player
+            );
+        };
+
+        assert_eq!(
+            *state, snapshot.state,
+            "contract: a round reads the sources it describes. {:?} was \
+             described as {:?} and read as {:?} in one round, so the two came \
+             from two observations rather than one.",
+            snapshot.player, state, snapshot.state
         );
     }
 }

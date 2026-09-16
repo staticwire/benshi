@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use benshi_core::clock::{Clock, TestClock, Timestamp};
 use benshi_core::path::RawPath;
-use benshi_core::{AppName, Known, MediaRef, PlayerSnapshot};
+use benshi_core::{AppName, Known, MediaRef, PlayState, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 
 use fakes::{DEADLINE, TICK, a_full_player, a_streaming_player, a_title_only_player, reading};
@@ -28,14 +28,20 @@ use fakes::{DEADLINE, TICK, a_full_player, a_streaming_player, a_title_only_play
 /// The outcome of a poll that found nothing open.
 fn no_readings() -> PollOutcome {
     PollOutcome {
+        sources: Vec::new(),
         snapshots: Vec::new(),
         failures: Vec::new(),
     }
 }
 
-/// The outcome of a poll that produced one reading and no failure.
-fn one_reading(snapshot: PlayerSnapshot) -> PollOutcome {
+/// The outcome of a poll that described one source, read it, and reported no
+/// failure.
+///
+/// The source is passed rather than derived from the snapshot, because a fake
+/// here may want the two halves to disagree.
+fn one_reading(source: SourceInfo, snapshot: PlayerSnapshot) -> PollOutcome {
     PollOutcome {
+        sources: vec![source],
         snapshots: vec![snapshot],
         failures: Vec::new(),
     }
@@ -132,6 +138,51 @@ impl PlayerWatcher for WanderingApplication {
     }
 }
 
+/// Carries a reading from a source the same round did not describe.
+#[derive(Default)]
+struct UndescribedReading {
+    clock: TestClock,
+}
+
+impl PlayerWatcher for UndescribedReading {
+    async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
+        Ok(vec![a_full_player()])
+    }
+
+    async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
+        self.clock.advance(TICK);
+        Ok(PollOutcome {
+            sources: Vec::new(),
+            snapshots: vec![reading(&a_full_player(), 1, self.clock.now())],
+            failures: Vec::new(),
+        })
+    }
+}
+
+/// Describes a source as one thing and reads it as another in the same round.
+///
+/// This is what answering the two questions in two rounds looks like from
+/// outside: the player was playing when it was described and had been paused by
+/// the time it was read.
+#[derive(Default)]
+struct DisagreeingRound {
+    clock: TestClock,
+}
+
+impl PlayerWatcher for DisagreeingRound {
+    async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError> {
+        Ok(vec![a_full_player()])
+    }
+
+    async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
+        self.clock.advance(TICK);
+        let source = a_full_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
+        snapshot.state = PlayState::Paused;
+        Ok(one_reading(source, snapshot))
+    }
+}
+
 /// Emits a reading for a source it never listed.
 #[derive(Default)]
 struct UnlistedSnapshot {
@@ -145,8 +196,9 @@ impl PlayerWatcher for UnlistedSnapshot {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let snapshot = reading(&a_title_only_player(), 1, self.clock.now());
-        Ok(one_reading(snapshot))
+        let source = a_title_only_player();
+        let snapshot = reading(&source, 1, self.clock.now());
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -163,9 +215,10 @@ impl PlayerWatcher for TitleForADeclaredLocation {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let mut snapshot = reading(&a_full_player(), 1, self.clock.now());
+        let source = a_full_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
         snapshot.media = MediaRef::Title("mpv".to_owned());
-        Ok(one_reading(snapshot))
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -182,9 +235,10 @@ impl PlayerWatcher for EmptyPathForADeclaredLocation {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let mut snapshot = reading(&a_full_player(), 1, self.clock.now());
+        let source = a_full_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
         snapshot.media = MediaRef::LocalFile(RawPath::from_bytes(Vec::new()));
-        Ok(one_reading(snapshot))
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -201,9 +255,10 @@ impl PlayerWatcher for EmptyAddressForADeclaredLocation {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let mut snapshot = reading(&a_streaming_player(), 1, self.clock.now());
+        let source = a_streaming_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
         snapshot.media = MediaRef::Remote(String::new());
-        Ok(one_reading(snapshot))
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -220,9 +275,10 @@ impl PlayerWatcher for ZeroForAnAbsentPosition {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let mut snapshot = reading(&a_title_only_player(), 1, self.clock.now());
+        let source = a_title_only_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
         snapshot.position = Known::Value(Duration::ZERO);
-        Ok(one_reading(snapshot))
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -239,10 +295,11 @@ impl PlayerWatcher for DurationBelowPosition {
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         self.clock.advance(TICK);
-        let mut snapshot = reading(&a_full_player(), 1, self.clock.now());
+        let source = a_full_player();
+        let mut snapshot = reading(&source, 1, self.clock.now());
         snapshot.position = Known::Value(Duration::from_mins(15));
         snapshot.duration = Known::Value(Duration::from_mins(1));
-        Ok(one_reading(snapshot))
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -266,7 +323,9 @@ impl PlayerWatcher for BackwardsClock {
         } else {
             Timestamp::epoch()
         };
-        Ok(one_reading(reading(&a_full_player(), 1, at)))
+        let source = a_full_player();
+        let snapshot = reading(&source, 1, at);
+        Ok(one_reading(source, snapshot))
     }
 }
 
@@ -329,6 +388,26 @@ async fn a_source_without_an_application_fails_the_contract() {
 async fn an_application_that_changes_fails_the_contract() {
     contract::verify(contract::Subject {
         watcher: WanderingApplication::default(),
+        deadline: DEADLINE,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "a round describes every source it read")]
+async fn a_reading_the_round_did_not_describe_fails_the_contract() {
+    contract::verify(contract::Subject {
+        watcher: UndescribedReading::default(),
+        deadline: DEADLINE,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "a round reads the sources it describes")]
+async fn a_listing_and_a_reading_from_two_moments_fail_the_contract() {
+    contract::verify(contract::Subject {
+        watcher: DisagreeingRound::default(),
         deadline: DEADLINE,
     })
     .await;

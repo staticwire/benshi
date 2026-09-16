@@ -351,24 +351,56 @@ fn metadata_of(player: &Properties) -> Properties {
         .unwrap_or_default()
 }
 
-/// One reading, or nothing when the source has nothing open.
-///
-/// Capabilities are derived from the same properties the reading comes from, so
-/// a declaration and the reading it governs cannot disagree within a round.
-fn translate(identity: &PlayerId, player: &Properties, at: Timestamp) -> Option<PlayerSnapshot> {
-    let metadata = metadata_of(player);
-    let media = media_from(&metadata)?;
-    let capabilities = declare_capabilities(player, &metadata);
-    let position = position_of(player, capabilities.position);
-
-    Some(PlayerSnapshot {
+/// What a source is, as its own properties describe it.
+fn describe(identity: &PlayerId, player: &Properties, metadata: &Properties) -> SourceInfo {
+    SourceInfo {
         player: identity.clone(),
-        media,
+        app: app_from_identity(identity),
+        capabilities: declare_capabilities(player, metadata),
         state: play_state(text(player, "PlaybackStatus")),
+    }
+}
+
+/// What one answer from a source amounts to: what the source is, and what it
+/// has open.
+#[derive(Debug)]
+struct Observation {
+    /// The source, as the answer describes it.
+    source: SourceInfo,
+    /// The reading, absent when the source has nothing open.
+    reading: Option<PlayerSnapshot>,
+}
+
+/// Describe a source and read it, from one answer.
+///
+/// The metadata is decoded once and the reading takes its capabilities and
+/// playback state from the description, so a round cannot publish a description
+/// that contradicts the reading beside it.
+fn observe(identity: &PlayerId, player: &Properties, at: Timestamp) -> Observation {
+    let metadata = metadata_of(player);
+    let source = describe(identity, player, &metadata);
+
+    let Some(media) = media_from(&metadata) else {
+        return Observation {
+            source,
+            reading: None,
+        };
+    };
+
+    let position = position_of(player, source.capabilities.position);
+    let snapshot = PlayerSnapshot {
+        player: source.player.clone(),
+        media,
+        state: source.state,
         position,
-        duration: duration_of(&metadata, position, capabilities.duration),
+        duration: duration_of(&metadata, position, source.capabilities.duration),
         observed_at: at,
-    })
+    };
+
+    Observation {
+        source,
+        reading: Some(snapshot),
+    }
 }
 
 /// Every MPRIS player on the session bus.
@@ -414,33 +446,25 @@ impl<C: Clock> MprisWatcher<C> {
             .collect())
     }
 
-    /// Take one reading, keeping the identity so that a failure can name it.
+    /// Observe one source, keeping the identity so that a failure can name it.
     ///
     /// The identity returned here is the one a [`WatchError`] was built from,
     /// so the two halves of a reported failure cannot name different players.
-    async fn read(
-        &self,
-        identity: PlayerId,
-    ) -> (PlayerId, Result<Option<PlayerSnapshot>, WatchError>) {
-        let reading = self
+    async fn read(&self, identity: PlayerId) -> (PlayerId, Result<Observation, WatchError>) {
+        let observed = self
             .player_properties(&identity)
             .await
-            .map(|player| translate(&identity, &player, self.clock.now()));
+            .map(|player| observe(&identity, &player, self.clock.now()));
 
-        (identity, reading)
+        (identity, observed)
     }
 
     /// Describe one source, or nothing if it did not answer.
-    async fn describe(&self, identity: PlayerId) -> Option<SourceInfo> {
+    async fn listed(&self, identity: PlayerId) -> Option<SourceInfo> {
         let player = self.player_properties(&identity).await.ok()?;
         let metadata = metadata_of(&player);
 
-        Some(SourceInfo {
-            app: app_from_identity(&identity),
-            capabilities: declare_capabilities(&player, &metadata),
-            state: play_state(text(&player, "PlaybackStatus")),
-            player: identity,
-        })
+        Some(describe(&identity, &player, &metadata))
     }
 
     /// Read every playback property of one source in a single call.
@@ -483,7 +507,7 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
             .identities()
             .await?
             .into_iter()
-            .map(|identity| self.describe(identity));
+            .map(|identity| self.listed(identity));
 
         let mut sources: Vec<SourceInfo> =
             join_all(described).await.into_iter().flatten().collect();
@@ -494,8 +518,13 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 
     /// Every source is read in the same round and under its own deadline. A
     /// source with nothing open contributes no snapshot rather than one whose
-    /// media reference is empty, and a source that failed is reported in
-    /// [`PollOutcome::failures`] rather than failing the round.
+    /// media reference is empty, and is described all the same. A source that
+    /// failed is reported in [`PollOutcome::failures`] rather than failing the
+    /// round, and is described nowhere: it answered nothing to describe it by.
+    ///
+    /// One `GetAll` per source serves both halves, so reporting the listing
+    /// alongside the readings costs the bus nothing beyond what a round of
+    /// readings already costs it.
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
         let readings = self
             .identities()
@@ -503,20 +532,25 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
             .into_iter()
             .map(|identity| self.read(identity));
 
+        let mut sources = Vec::new();
         let mut snapshots = Vec::new();
         let mut failures = Vec::new();
 
-        for (identity, reading) in join_all(readings).await {
-            match reading {
-                Ok(Some(snapshot)) => snapshots.push(snapshot),
-                Ok(None) => (),
+        for (identity, observed) in join_all(readings).await {
+            match observed {
+                Ok(Observation { source, reading }) => {
+                    sources.push(source);
+                    snapshots.extend(reading);
+                }
                 Err(error) => failures.push((identity, error)),
             }
         }
 
+        sources.sort_by(|left, right| left.player.cmp(&right.player));
         snapshots.sort_by(|left, right| left.player.cmp(&right.player));
 
         Ok(PollOutcome {
+            sources,
             snapshots,
             failures,
         })
@@ -527,7 +561,7 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 mod tests {
     use super::{
         PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities, duration_of,
-        identity_from_bus_name, media_from, percent_decode, play_state, position_of, translate,
+        identity_from_bus_name, media_from, observe, percent_decode, play_state, position_of,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
@@ -744,7 +778,9 @@ mod tests {
         let clock = TestClock::new();
         clock.advance(Duration::from_secs(20));
 
-        let snapshot = translate(&id("mpv"), &player, clock.now()).expect("a reading");
+        let snapshot = observe(&id("mpv"), &player, clock.now())
+            .reading
+            .expect("a reading");
 
         assert_eq!(snapshot.observed_at, clock.now());
         assert_eq!(
@@ -766,22 +802,28 @@ mod tests {
             ],
         );
 
-        let snapshot = translate(&id("mpv"), &player, Timestamp::epoch()).expect("a reading");
+        let snapshot = observe(&id("mpv"), &player, Timestamp::epoch())
+            .reading
+            .expect("a reading");
 
         assert_eq!(snapshot.position, Known::Value(Duration::from_secs(30)));
         assert_eq!(snapshot.duration, Known::NotReported);
     }
 
     #[test]
-    fn a_source_with_nothing_open_produces_no_reading() {
+    fn a_source_with_nothing_open_produces_no_reading_and_is_still_described() {
         // Chromium idle publishes properties but no metadata. A source with
-        // nothing open contributes no snapshot rather than one naming nothing.
+        // nothing open contributes no snapshot rather than one naming nothing,
+        // and is described all the same: policy is keyed on the application, so
+        // a source the round does not name is one the daemon cannot explain
+        // itself about.
         let player = a_player(vec![("Position", OwnedValue::from(0_i64))], vec![]);
 
-        assert_eq!(
-            translate(&id("chromium"), &player, Timestamp::epoch()),
-            None
-        );
+        let observed = observe(&id("chromium"), &player, Timestamp::epoch());
+
+        assert_eq!(observed.reading, None);
+        assert_eq!(observed.source.player, id("chromium"));
+        assert_eq!(observed.source.app, AppName("chromium".to_owned()));
     }
 
     #[test]

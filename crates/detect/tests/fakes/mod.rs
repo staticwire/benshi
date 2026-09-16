@@ -2,7 +2,7 @@
 //!
 //! Sources and readings only. No watcher lives here, because the two test
 //! binaries that use these need very different ones: one that satisfies every
-//! clause and thirteen that each break one.
+//! clause and fifteen that each break one.
 
 use std::time::Duration;
 
