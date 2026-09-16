@@ -9,10 +9,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use benshi_core::clock::SystemClock;
     use benshi_core::{MediaRef, encoding};
     use benshi_detect::PlayerWatcher;
-    use benshi_detect::mpris::MprisWatcher;
-    use std::time::Duration;
+    use benshi_detect::mpris::{MprisWatcher, SOURCE_DEADLINE};
 
-    let mut watcher = MprisWatcher::connect(SystemClock::new(), Duration::from_secs(2)).await?;
+    let mut watcher = MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE).await?;
     let sources = watcher.sources().await?;
 
     if sources.is_empty() {

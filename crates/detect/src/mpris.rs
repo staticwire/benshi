@@ -49,18 +49,45 @@ const PLAYER_INTERFACE: InterfaceName<'static> =
 /// The scheme a `xesam:url` carries when it names a file on this machine.
 const LOCAL_FILE_SCHEME: &str = "file://";
 
-/// A deadline that suits an ordinary desktop session.
+/// How long from the start of one round of readings to the start of the next.
+///
+/// A suggestion rather than a rule, like [`SOURCE_DEADLINE`]: the daemon owns
+/// the schedule and this crate only says what suits an ordinary desktop. One
+/// second is short enough to notice a seek while the user still remembers
+/// making it, and long enough that a dozen players take under two percent of
+/// it.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long one call may take before it is given up on.
 ///
 /// A suggestion rather than a rule: [`MprisWatcher::connect`] takes the
 /// deadline it is to use, because the daemon may know better than this crate
 /// does.
 ///
-/// Measured on one desktop machine on 2026-09-16: a listing and a reading
-/// across three players on one session bus cost about ten milliseconds
-/// together, spread over eight calls. This leaves room for a machine orders of
-/// magnitude slower before a healthy player is cut off, while capping what one
-/// source that has stopped answering can add to a round.
-pub const SOURCE_DEADLINE: Duration = Duration::from_secs(2);
+/// The size is set by [`POLL_INTERVAL`] and not by how fast a player answers. A
+/// source that has stopped answering must be given up on before the next round
+/// begins, or rounds overlap and one round's failures arrive during the next. A
+/// round is two calls deep, the listing and then every reading together, and
+/// each is bounded separately, so a round costs twice the deadline at worst.
+/// Half the interval is the largest deadline that keeps a whole round inside
+/// one interval.
+///
+/// Nothing is given up to get it. Measured on one desktop machine on
+/// 2026-09-16, a listing and a reading across three players cost about ten
+/// milliseconds together over eight calls, so one call costs a little over a
+/// millisecond and this deadline is some four hundred times what a healthy
+/// player needs.
+pub const SOURCE_DEADLINE: Duration = Duration::from_millis(500);
+
+// The relationship between the two is why either holds the value it does, so it
+// is checked rather than described. Moving either to where a round no longer
+// fits inside the interval stops the build, which prose cannot do. Nanoseconds
+// are what a `Duration` holds, so a violation smaller than a millisecond cannot
+// round itself away.
+const _: () = assert!(
+    SOURCE_DEADLINE.as_nanos() * 2 <= POLL_INTERVAL.as_nanos(),
+    "a source deadline above half the poll interval lets rounds overlap"
+);
 
 /// The properties one `GetAll` returns, keyed as the bus spelled them.
 type Properties = HashMap<String, OwnedValue>;
@@ -567,6 +594,31 @@ mod tests {
         assert_eq!(
             app_from_identity(&id("chromium.instance16481")),
             AppName("chromium".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_component_that_is_only_the_word_instance_qualifies_nothing() {
+        // A qualifier carries a unique identifier after its prefix, so a
+        // component that is exactly the prefix distinguishes no instance from
+        // any other and is part of the name. This is the branch the length
+        // check exists for, and nothing else reaches it.
+        assert_eq!(
+            app_from_identity(&id("mpv.instance")),
+            AppName("mpv.instance".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_instance_qualifier_need_not_be_a_number() {
+        // Observed on 2026-09-16 by opening a second mpv: it took the name
+        // org.mpris.MediaPlayer2.mpv.instance-mZlVuXZe. The specification's
+        // example is a process id, so a rule demanding digits looks right and
+        // would have made this source's application `mpv.instance-mZlVuXZe`,
+        // which no denylist entry can match.
+        assert_eq!(
+            app_from_identity(&id("mpv.instance-mZlVuXZe")),
+            AppName("mpv".to_owned())
         );
     }
 
