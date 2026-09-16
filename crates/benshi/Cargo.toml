@@ -16,6 +16,7 @@ path = "src/main.rs"
 benshi-cli = { path = "../cli" }
 benshi-daemon = { path = "../daemon" }
 benshi-tray = { path = "../tray" }
+clap = { version = "4.6.7", features = ["derive"] }
 
 [lints]
 workspace = true
