@@ -16,4 +16,6 @@
 
 pub mod bus;
 
+pub mod detection;
+
 pub mod supervisor;

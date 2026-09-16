@@ -16,13 +16,13 @@ use tokio::sync::broadcast;
 
 /// How many events the bus keeps for a subscriber that has fallen behind.
 ///
-/// One round of polling emits at least one event per source that has something
-/// open, so a desktop with a handful of them fills this in under a minute at
-/// the one-second default interval. A client on a local socket that has not
-/// read for that long has stopped reading rather than fallen behind, and
-/// dropping its backlog is then the right answer. The cost of being generous is
-/// small: an event is a few hundred bytes, so the whole buffer is tens of
-/// kilobytes.
+/// One round of polling emits an event per source that has something open and
+/// is not denied, and the membership only when it changes, so a desktop with a
+/// handful of players fills this in under a minute at the one-second default
+/// interval. A client on a local socket that has not read for that long has
+/// stopped reading rather than fallen behind, and dropping its backlog is then
+/// the right answer. The cost of being generous is small: an event is a few
+/// hundred bytes, so the whole buffer is tens of kilobytes.
 pub const CAPACITY: usize = 256;
 
 /// Something the daemon did or saw.
@@ -35,10 +35,16 @@ pub const CAPACITY: usize = 256;
 pub enum BusEvent {
     /// A reading was taken from a source.
     Snapshot(PlayerSnapshot),
-    /// The set of sources the platform reports has changed size.
+    /// The set of sources the platform reports has changed.
+    ///
+    /// Carries the membership rather than its size, because a size cannot show
+    /// one player closing while another opens: the number is the same and the
+    /// world is not. A subscriber that joined late learns the whole set from
+    /// the first change it sees, rather than a difference it holds no state to
+    /// apply.
     SourcesChanged {
-        /// How many sources are listed now.
-        count: usize,
+        /// Every source now listed, in identity order.
+        sources: Vec<PlayerId>,
     },
     /// One source could not be read this round.
     SourceFailed {
@@ -125,6 +131,13 @@ mod tests {
         }
     }
 
+    /// A listing of one source, named so that two of them differ.
+    fn a_listing(which: usize) -> BusEvent {
+        BusEvent::SourcesChanged {
+            sources: vec![PlayerId(format!("player{which}"))],
+        }
+    }
+
     #[test]
     fn two_subscribers_receive_the_same_sequence() {
         // What a user watching the stream sees is what the program acts on. A
@@ -134,7 +147,7 @@ mod tests {
         let mut watching = bus.subscribe();
         let mut sink_side = bus.subscribe();
 
-        bus.publish(BusEvent::SourcesChanged { count: 1 });
+        bus.publish(a_listing(1));
         bus.publish(BusEvent::Snapshot(a_snapshot()));
 
         assert_eq!(
@@ -153,7 +166,7 @@ mod tests {
         // watching is the ordinary case.
         let bus = EventBus::new();
 
-        bus.publish(BusEvent::SourcesChanged { count: 0 });
+        bus.publish(a_listing(0));
     }
 
     #[test]
@@ -161,8 +174,8 @@ mod tests {
         let bus = EventBus::with_capacity(2);
         let mut slow = bus.subscribe();
 
-        for count in 0..5 {
-            bus.publish(BusEvent::SourcesChanged { count });
+        for which in 0..5 {
+            bus.publish(a_listing(which));
         }
 
         assert!(matches!(slow.try_recv(), Err(TryRecvError::Lagged(_))));
@@ -175,15 +188,15 @@ mod tests {
         let bus = EventBus::with_capacity(2);
         let mut slow = bus.subscribe();
 
-        for count in 0..5 {
-            bus.publish(BusEvent::SourcesChanged { count });
+        for which in 0..5 {
+            bus.publish(a_listing(which));
         }
 
         let lag = slow.try_recv();
         assert!(matches!(lag, Err(TryRecvError::Lagged(_))));
 
         let next = slow.try_recv().expect("the stream continues after a lag");
-        assert_eq!(next, BusEvent::SourcesChanged { count: 3 });
+        assert_eq!(next, a_listing(3));
     }
 
     #[test]
