@@ -49,6 +49,19 @@ const PLAYER_INTERFACE: InterfaceName<'static> =
 /// The scheme a `xesam:url` carries when it names a file on this machine.
 const LOCAL_FILE_SCHEME: &str = "file://";
 
+/// A deadline that suits an ordinary desktop session.
+///
+/// A suggestion rather than a rule: [`MprisWatcher::connect`] takes the
+/// deadline it is to use, because the daemon may know better than this crate
+/// does.
+///
+/// Measured on one desktop machine on 2026-09-16: a listing and a reading
+/// across three players on one session bus cost about ten milliseconds
+/// together, spread over eight calls. This leaves room for a machine orders of
+/// magnitude slower before a healthy player is cut off, while capping what one
+/// source that has stopped answering can add to a round.
+pub const SOURCE_DEADLINE: Duration = Duration::from_secs(2);
+
 /// The properties one `GetAll` returns, keyed as the bus spelled them.
 type Properties = HashMap<String, OwnedValue>;
 
@@ -343,8 +356,11 @@ impl<C: Clock> MprisWatcher<C> {
     /// Open a connection to the session bus.
     ///
     /// The clock is taken rather than read, so a test can move twenty seconds
-    /// of playback in no time at all. The deadline applies to this call and to
-    /// every later call on one source.
+    /// of playback in no time at all.
+    ///
+    /// The deadline applies to every call this watcher makes, separately: this
+    /// one, the listing of bus names in each round, and each source's own
+    /// `GetAll`. It bounds one call rather than one round.
     ///
     /// # Errors
     ///
