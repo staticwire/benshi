@@ -356,8 +356,11 @@ impl<C: Clock> MprisWatcher<C> {
     /// Open a connection to the session bus.
     ///
     /// The clock is taken rather than read, so a test can move twenty seconds
-    /// of playback in no time at all. The deadline applies to this call and to
-    /// every later call on one source.
+    /// of playback in no time at all.
+    ///
+    /// The deadline applies to every call this watcher makes, separately: this
+    /// one, the listing of bus names in each round, and each source's own
+    /// `GetAll`. It bounds one call rather than one round.
     ///
     /// # Errors
     ///
