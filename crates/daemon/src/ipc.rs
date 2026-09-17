@@ -406,7 +406,7 @@ mod tests {
         /// A daemon whose bus keeps `capacity` events for a slow reader.
         fn holding(capacity: usize, sources: Vec<SourceInfo>) -> Self {
             let bus = Arc::new(EventBus::with_capacity(capacity));
-            let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+            let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
 

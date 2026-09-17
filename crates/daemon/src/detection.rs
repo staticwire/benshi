@@ -404,7 +404,7 @@ mod tests {
     async fn readings_from_admitted_sources_reach_the_bus() {
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![Ok(a_round(vec![
             a_source("mpv.instance1701", "mpv"),
             a_source("vlc", "vlc"),
@@ -427,7 +427,7 @@ mod tests {
         // the membership the bus publishes.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![Ok(a_round(vec![
             a_source("firefox.instance30062", "firefox"),
             a_source("mpv", "mpv"),
@@ -459,11 +459,11 @@ mod tests {
     #[tokio::test]
     async fn policy_is_keyed_on_the_application_and_not_on_the_identity() {
         // A browser qualifies its bus name with a process id, so the identity
-        // is not what the denylist can match. The daemon reads the application
-        // the adapter declared beside the reading.
+        // is not what the policy table is keyed on. The daemon reads the
+        // application the adapter declared beside the reading.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![Ok(a_round(vec![a_source(
             "chromium.instance16481",
             "chromium",
@@ -483,7 +483,7 @@ mod tests {
         // cannot apply policy to, and publishing it would walk past a deny.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let stranger = a_source("firefox", "firefox");
         let watcher = ScriptedWatcher::of(vec![Ok(PollOutcome {
             sources: Vec::new(),
@@ -512,7 +512,7 @@ mod tests {
     async fn a_failing_source_is_reported_and_the_others_continue() {
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let working = a_source("mpv", "mpv");
         let watcher = ScriptedWatcher::of(vec![Ok(PollOutcome {
             sources: vec![working.clone()],
@@ -557,7 +557,7 @@ mod tests {
         // that pair of lines for as long as it ran.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let answering = a_source("mpv", "mpv");
         let silent = || {
             (
@@ -595,7 +595,7 @@ mod tests {
         // second look at the platform, so the round leaves its sources behind
         // and the next round replaces them.
         let bus = Arc::new(EventBus::new());
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
         let watcher = ScriptedWatcher::of(vec![
             Ok(a_round(vec![
@@ -632,7 +632,7 @@ mod tests {
         // a denied source has to be in the record even though none of its
         // readings ever reach the bus.
         let bus = Arc::new(EventBus::new());
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
         let watcher = ScriptedWatcher::of(vec![Ok(a_round(vec![a_source(
             "firefox.instance30062",
@@ -655,7 +655,7 @@ mod tests {
         // mean nothing ever leaves.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![
             Ok(a_round(vec![
                 a_source("mpv", "mpv"),
@@ -681,7 +681,7 @@ mod tests {
         // so a count cannot see it. The membership can.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![
             Ok(a_round(vec![a_source("mpv", "mpv")])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
@@ -704,7 +704,7 @@ mod tests {
         // same thing is how a log stops being read.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
         let mut detection =
             Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
@@ -724,7 +724,7 @@ mod tests {
     async fn a_platform_that_cannot_be_reached_is_transient() {
         // There is no platform failure that stopping detection would improve.
         let bus = Arc::new(EventBus::new());
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::of(vec![Err(WatchError::Transport(Box::new(
             std::io::Error::other("the session bus is gone"),
         )))]);
@@ -745,7 +745,7 @@ mod tests {
         // publishes, and the daemon is not restarted to make it take effect.
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
         let mut detection = Detection::new(
             watcher,
@@ -784,7 +784,7 @@ mod tests {
     async fn a_round_happens_once_an_interval() {
         let bus = Arc::new(EventBus::new());
         let mut events = bus.subscribe();
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
         let mut detection =
             Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
@@ -807,7 +807,7 @@ mod tests {
         // a source the user denied, which is the one mistake policy exists to
         // prevent.
         let bus = Arc::new(EventBus::new());
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let poisoner = Arc::clone(&policy);
         let panicked = std::thread::spawn(move || {
             let _held = poisoner.write().expect("the policy table");
