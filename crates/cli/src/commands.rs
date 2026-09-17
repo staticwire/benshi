@@ -423,7 +423,7 @@ mod tests {
                 socket,
                 bus,
                 policy,
-                serving: tokio::spawn(server.listen(listener)),
+                serving: tokio::spawn(server.listen(Arc::new(listener))),
             }
         }
 
