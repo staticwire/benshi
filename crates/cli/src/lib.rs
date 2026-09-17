@@ -85,6 +85,7 @@ mod tests {
     use crate::commands::{Command, PolicyArgument};
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn the_command_line_is_well_formed() {
@@ -124,6 +125,53 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_is_refused() {
         assert!(Cli::try_parse_from(["benshi", "recognise"]).is_err());
+    }
+
+    #[test]
+    fn a_recording_is_typed_as_a_span_of_time_and_a_path() {
+        let asked = Cli::try_parse_from([
+            "benshi",
+            "record",
+            "--for",
+            "90s",
+            "--output",
+            "one-episode.jsonl",
+        ])
+        .expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Record {
+                duration: Duration::from_secs(90),
+                output: PathBuf::from("one-episode.jsonl"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_span_of_time_may_be_written_the_way_a_person_says_it() {
+        // `--for 3600` would be seconds by an unwritten convention, and a
+        // recording is a thing people describe in minutes.
+        let asked =
+            Cli::try_parse_from(["benshi", "record", "--for", "1h 30min", "-o", "long.jsonl"])
+                .expect("parses");
+
+        let Command::Record { duration, .. } = asked.command else {
+            panic!("expected a recording, got {:?}", asked.command);
+        };
+        assert_eq!(duration, Duration::from_mins(90));
+    }
+
+    #[test]
+    fn a_recording_with_no_span_or_no_path_is_refused() {
+        // Neither has a default worth guessing: a recording of the wrong
+        // length costs the time it took, and a path we chose is a file the
+        // user has to go looking for.
+        assert!(Cli::try_parse_from(["benshi", "record", "--for", "60s"]).is_err());
+        assert!(Cli::try_parse_from(["benshi", "record", "--output", "t.jsonl"]).is_err());
+        assert!(
+            Cli::try_parse_from(["benshi", "record", "--for", "soon", "-o", "t.jsonl"]).is_err()
+        );
     }
 
     #[test]
