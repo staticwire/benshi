@@ -172,6 +172,12 @@ impl Server {
     /// into a detached task. A connection that merely failed is that client's
     /// business and ends only that connection.
     ///
+    /// The listener is shared rather than taken, because a supervised task is
+    /// started again from the same body and this one would otherwise have to
+    /// bind a second time. Rebinding would unlink the socket and make a new one,
+    /// so every client would be refused for as long as the restart took, to
+    /// recover an accept loop that is the only thing that actually failed.
+    ///
     /// # Errors
     ///
     /// Returns [`TaskError::Transient`] when the listener stops accepting. The
@@ -184,7 +190,7 @@ impl Server {
     /// re-raised here so the supervisor records it.
     pub async fn listen(
         self: Arc<Self>,
-        listener: UnixListener,
+        listener: Arc<UnixListener>,
     ) -> std::result::Result<(), TaskError> {
         let mut connections = JoinSet::new();
 

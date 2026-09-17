@@ -103,9 +103,12 @@ name = "benshi"
 version = "0.1.0"
 dependencies = [
  "benshi-cli",
+ "benshi-core",
  "benshi-daemon",
+ "benshi-detect",
  "benshi-tray",
  "clap",
+ "tokio",
 ]
 
 [[package]]

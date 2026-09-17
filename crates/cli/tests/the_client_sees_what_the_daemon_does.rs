@@ -8,9 +8,9 @@
 //! would make the run depend on what happens to be playing.
 
 #![cfg(unix)]
-// The trait's methods are async, so an implementation cannot drop the keyword
-// even when its body has nothing to await. A fake answers from memory, which is
-// the whole point of a fake.
+// A fake answers from memory, which is the whole point of a fake, and the trait
+// asks for a future either way. The `async` therefore stays where there is
+// nothing to await, rather than being spelled out as the future it desugars to.
 #![allow(clippy::unused_async_trait_impl)]
 
 use std::path::PathBuf;
@@ -132,7 +132,7 @@ impl Daemon {
         let socket = home.path().join("run").join("benshi.sock");
         let listener = bind(&socket).expect("the socket binds");
         let server = Arc::new(Server::new(Arc::clone(&bus), policy, seen));
-        drop(tokio::spawn(server.listen(listener)));
+        drop(tokio::spawn(server.listen(Arc::new(listener))));
 
         Self {
             _home: home,

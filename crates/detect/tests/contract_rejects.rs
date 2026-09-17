@@ -8,9 +8,9 @@
 //! The `expected` string ties each test to the clause it proves, so renaming a
 //! clause without updating its proof stops the build.
 
-// The trait's methods are async, so an implementation cannot drop the keyword
-// even when its body has nothing to await. A fake answers from memory, which is
-// the whole point of a fake.
+// A fake answers from memory, which is the whole point of a fake, and the trait
+// asks for a future either way. The `async` therefore stays where there is
+// nothing to await, rather than being spelled out as the future it desugars to.
 #![allow(clippy::unused_async_trait_impl)]
 
 mod contract;

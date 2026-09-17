@@ -12,6 +12,7 @@
 #[cfg(target_os = "linux")]
 pub mod mpris;
 
+use std::future::Future;
 use std::time::Duration;
 
 use benshi_core::{AppName, BoxError, Capabilities, PlayState, PlayerId, PlayerSnapshot};
@@ -88,13 +89,20 @@ pub struct PollOutcome {
 /// nothing and takes no decision: a denied source is still listed here, because
 /// `benshi sources` must be able to show it, and the decision to ignore its
 /// readings is taken by the daemon using `benshi_core::policy`.
-// An `async fn` in a public trait leaves the auto traits of the future it
-// returns undeclared, so code generic over this trait cannot require `Send`.
-// Accepted: a concrete adapter's future carries its own auto traits to the
-// caller regardless, which is how the daemon will await one. Generic code that
-// does need the bound must desugar the method to
-// `fn poll(&mut self) -> impl Future<Output = ...> + Send`.
-#[allow(async_fn_in_trait)]
+// Desugared rather than written `async fn`, because an `async fn` in a trait
+// leaves the auto traits of the future it returns undeclared, and the daemon is
+// generic over this trait: `Supervisor::supervise` needs a `Send` future, and
+// without the bound here no watcher can be supervised at all. An implementation
+// still writes `async fn` in its `impl`, and the compiler checks that the future
+// it returns satisfies the bound.
+//
+// The bound is a constraint on an adapter rather than a formality: a watcher,
+// and everything it holds across an await, has to be able to cross threads. An
+// adapter whose platform handle cannot has to keep that handle on a thread of
+// its own and answer over a channel. Which platforms that applies to is not
+// established here, and is the first question for whoever writes the next
+// adapter; the bound is what makes it a question asked before that adapter is
+// written rather than after.
 pub trait PlayerWatcher {
     /// Every source the platform currently knows about.
     ///
@@ -103,7 +111,7 @@ pub trait PlayerWatcher {
     /// Returns [`WatchError::Transport`] when the platform cannot be enumerated
     /// at all. A single unresponsive source is omitted from the listing rather
     /// than failing it.
-    async fn sources(&mut self) -> Result<Vec<SourceInfo>, WatchError>;
+    fn sources(&mut self) -> impl Future<Output = Result<Vec<SourceInfo>, WatchError>> + Send;
 
     /// Take one reading from every source, concurrently, and describe each
     /// source from the same observation.
@@ -122,5 +130,5 @@ pub trait PlayerWatcher {
     /// unusable. A per-source failure is reported in [`PollOutcome::failures`]
     /// and does not fail the poll: one unresponsive player must not blind the
     /// daemon to the rest.
-    async fn poll(&mut self) -> Result<PollOutcome, WatchError>;
+    fn poll(&mut self) -> impl Future<Output = Result<PollOutcome, WatchError>> + Send;
 }
