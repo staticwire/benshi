@@ -413,7 +413,7 @@ mod tests {
             let listener = bind(&socket).expect("the socket binds");
 
             let bus = Arc::new(bus);
-            let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+            let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
             let server = Arc::new(Server::new(Arc::clone(&bus), Arc::clone(&policy), seen));

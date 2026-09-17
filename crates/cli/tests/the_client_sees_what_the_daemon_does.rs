@@ -116,7 +116,7 @@ impl Daemon {
     fn start() -> Self {
         let platform = OnePlayer::default();
         let bus = Arc::new(EventBus::new());
-        let policy = Arc::new(RwLock::new(PolicyTable::with_default_denylist()));
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
 
         let mut detection = Detection::new(

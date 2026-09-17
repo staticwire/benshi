@@ -649,7 +649,8 @@ mod tests {
         // org.mpris.MediaPlayer2.mpv.instance-mZlVuXZe. The specification's
         // example is a process id, so a rule demanding digits looks right and
         // would have made this source's application `mpv.instance-mZlVuXZe`,
-        // which no denylist entry can match.
+        // which the policy table does not name - so a second mpv window would
+        // have been silently denied.
         assert_eq!(
             app_from_identity(&id("mpv.instance-mZlVuXZe")),
             AppName("mpv".to_owned())
