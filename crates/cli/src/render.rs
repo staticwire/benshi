@@ -198,6 +198,9 @@ mod tests {
     };
     use benshi_daemon::bus::BusEvent;
     use benshi_daemon::protocol::SourceListing;
+    // The reason a failure carries comes from here in the daemon, so the tests
+    // that check how one reads take it from here too rather than writing one.
+    use benshi_detect::WatchError;
     use std::time::Duration;
 
     /// A filename in Shift-JIS, which is not valid UTF-8.
@@ -429,5 +432,49 @@ mod tests {
 
         assert!(shown.contains("vlc"), "{shown}");
         assert!(shown.contains("did not answer within 500ms"), "{shown}");
+    }
+
+    #[test]
+    fn a_failure_line_built_from_a_real_error_reads_as_one_sentence() {
+        // The test above supplies a reason of its own, which is how this got
+        // past a full acceptance pass and 222 tests. What `benshi watch`
+        // actually printed on 2026-09-18, with three players suspended:
+        //
+        //   mpv.instance-X  failed: PlayerId("mpv.instance-X") did not answer within 500ms
+        //
+        // The identity belongs to the event and not to the reason:
+        // `BusEvent::SourceFailed` carries both so that this function lays them
+        // out, and a reason that repeats the subject prints it twice wherever a
+        // person reads it. A test that writes its own reason cannot see that,
+        // so both cases below take the reason from a real error.
+        //
+        // The whole line is pinned rather than picked at. Every weaker check
+        // written for this passed for a line that was still wrong: counting the
+        // identity passes for a bare fragment, and looking for the absence of
+        // `PlayerId` passes for a reason that names the source in any other
+        // form. One sentence, read end to end, is the thing being claimed.
+        let player = PlayerId("mpv.instance-NvZEKsqR".to_owned());
+        let cases = [
+            (
+                WatchError::Timeout {
+                    player: player.clone(),
+                    deadline: Duration::from_millis(500),
+                },
+                "mpv.instance-NvZEKsqR  failed: did not answer within 500ms",
+            ),
+            (
+                WatchError::Unavailable(player.clone()),
+                "mpv.instance-NvZEKsqR  failed: is no longer present",
+            ),
+        ];
+
+        for (failure, expected) in cases {
+            let shown = event(&BusEvent::SourceFailed {
+                player: player.clone(),
+                reason: failure.to_string(),
+            });
+
+            assert_eq!(shown, expected);
+        }
     }
 }

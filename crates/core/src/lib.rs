@@ -15,6 +15,7 @@ pub mod path;
 pub mod policy;
 pub mod trace;
 
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,24 @@ pub enum PlayState {
     Stopped,
 }
 
+// Both of these exist so that `{}` compiles. Without them the only formatting
+// that does is `{:?}`, which prints `PlayerId("mpv")` - and `#[error("...")]`
+// attributes are exactly where the easy form gets reached for. That happened:
+// `benshi watch` printed a source's name in its debug form to a terminal for
+// three commits, and every correct site in the workspace was writing `.0` by
+// hand. A newtype over a name displays as that name.
+impl fmt::Display for PlayerId {
+    fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
+        into.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for AppName {
+    fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
+        into.write_str(&self.0)
+    }
+}
+
 /// One source as the platform currently describes it.
 ///
 /// Capabilities belong to the source rather than to the adapter: mpv and a
@@ -179,10 +198,25 @@ pub struct SessionState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
+    use super::{AppName, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
     use crate::clock::Timestamp;
     use crate::path::RawPath;
     use std::time::Duration;
+
+    #[test]
+    fn a_name_displays_as_the_name_and_not_as_its_type() {
+        // The reason this impl exists. `{:?}` on a newtype prints the type
+        // around the value, which is right for a debugger and wrong for a
+        // terminal, and for three commits it reached one: a failure line read
+        // `failed: PlayerId("mpv") did not answer within 500ms`.
+        assert_eq!(
+            PlayerId("mpv.instance-1701".to_owned()).to_string(),
+            "mpv.instance-1701"
+        );
+        assert_eq!(AppName("mpv".to_owned()).to_string(), "mpv");
+        assert!(!PlayerId("mpv".to_owned()).to_string().contains("PlayerId"));
+        assert!(!AppName("mpv".to_owned()).to_string().contains("AppName"));
+    }
 
     #[test]
     fn known_distinguishes_absence_from_incapability() {
