@@ -30,7 +30,13 @@ use tokio::time::timeout;
 /// One mpv playing a ten-minute file, paused for twenty seconds and seeked
 /// twenty back. Two other players were open and are declared in its header
 /// without a single reading between them, which is the shape a listing is for.
-const FIXTURE: &str = include_str!("fixtures/mpv-one-episode.jsonl");
+///
+/// Kept in `benshi-core`, which defines the `Trace` this file is a sample of,
+/// so that a test in either crate can read it. `include_str!` resolves a path
+/// and not a dependency - it would reach either way - so the direction is the
+/// one the crates already have: the daemon reaches into `core`, never the
+/// reverse.
+const FIXTURE: &str = include_str!("../../core/tests/fixtures/mpv-one-episode.jsonl");
 
 /// The detection loop's period, which the run pays once per reading.
 ///
