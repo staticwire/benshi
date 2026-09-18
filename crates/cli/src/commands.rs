@@ -1,13 +1,17 @@
 //! What each command does, and what the process should exit with.
 //!
-//! A command opens one connection, sends one request and renders what comes
-//! back: one answer for `sources` and `policy`, and a stream for `watch` until
-//! the daemon or the user ends it.
+//! A command opens a connection, sends a request and renders what comes back:
+//! one answer for `sources` and `policy`, and a stream for `watch` until the
+//! daemon or the user ends it. `record` wants both an answer and a stream, so
+//! it takes a second connection for the answer: a stream is the last thing a
+//! connection carries. What it records goes to a file, and only a summary of
+//! it to the terminal.
 //!
 //! A failure is reported here rather than returned. This is where a `Result`
 //! stops being something a caller can act on and becomes a line on the error
 //! stream and a status a shell can test.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,11 +19,11 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use benshi_core::AppName;
 use benshi_core::policy::Policy;
 use benshi_core::trace::{TraceHeader, header_line, snapshot_line};
+use benshi_core::{AppName, PlayerId, SourceInfo};
 use benshi_daemon::bus::BusEvent;
-use benshi_daemon::protocol::{Request, Response};
+use benshi_daemon::protocol::{Request, Response, SourceListing};
 use clap::{Subcommand, ValueEnum};
 use humantime::format_rfc3339_seconds;
 
@@ -126,21 +130,52 @@ async fn carry_out(command: Command, socket: &Path, out: &mut impl Write) -> Res
         Command::Sources => sources(&mut daemon, out).await,
         Command::Watch => watch(&mut daemon, out).await,
         Command::Policy { app, policy } => set_policy(&mut daemon, &app, policy.into()).await,
-        Command::Record { duration, output } => record(&mut daemon, duration, &output, out).await,
+        Command::Record { duration, output } => {
+            record(&mut daemon, socket, duration, &output, out).await
+        }
     }
+}
+
+/// Ask for the listing and read the answer.
+///
+/// The one place the question is asked, so that what a user is shown and what a
+/// recording declares cannot drift apart in which answers they accept, or name
+/// an unexpected one in two different ways.
+async fn ask_for_sources(daemon: &mut Daemon) -> Result<Vec<SourceListing>> {
+    daemon.ask(&Request::Sources).await?;
+
+    match daemon.expect_answer().await? {
+        Response::Sources(listed) => Ok(listed),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("the daemon answered a listing with {unexpected:?}"),
+    }
+}
+
+/// What the daemon has seen, as a recording declares it.
+///
+/// The policy in each line is left behind: it is the daemon's decision about a
+/// source rather than the platform's description of it, and a replay applies
+/// whatever table it is running under rather than one a file remembers.
+async fn listing(socket: &Path) -> Result<Vec<SourceInfo>> {
+    let mut daemon = Daemon::connect(socket).await?;
+    let listed = ask_for_sources(&mut daemon).await?;
+
+    Ok(listed
+        .into_iter()
+        .map(|source| SourceInfo {
+            player: source.player,
+            app: source.app,
+            capabilities: source.capabilities,
+            state: source.state,
+        })
+        .collect())
 }
 
 /// Print every source the daemon has seen.
 async fn sources(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
-    daemon.ask(&Request::Sources).await?;
+    let listed = ask_for_sources(daemon).await?;
 
-    match daemon.expect_answer().await? {
-        Response::Sources(listed) => {
-            write!(out, "{}", render::listing(&listed)).context("the listing could not be printed")
-        }
-        Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("the daemon answered a listing with {unexpected:?}"),
-    }
+    write!(out, "{}", render::listing(&listed)).context("the listing could not be printed")
 }
 
 /// Print the daemon's events until it stops sending them.
@@ -195,22 +230,49 @@ async fn set_policy(daemon: &mut Daemon, app: &str, policy: Policy) -> Result<()
 /// whether the file is worth keeping.
 async fn record(
     daemon: &mut Daemon,
+    socket: &Path,
     duration: Duration,
     output: &Path,
     out: &mut impl Write,
 ) -> Result<()> {
     daemon.ask(&Request::Watch).await?;
 
+    // The subscription goes out first, and the listing is asked for afterwards
+    // on a connection of its own. A reading published between the two ends up
+    // in the trace this way round; the other way round it would be published
+    // into the gap between the answer and the subscription, and be lost. A
+    // recording with a hole in it replays a timeline that never happened, which
+    // is the one failure nothing downstream of the file could notice - the same
+    // reason a lagged stream ends the recording below.
+    //
+    // Not covered by a test. Making the order observable needs a daemon that
+    // stalls a listing while readings are published, and a test that cannot
+    // fail would be worse than this comment.
+    let declared = listing(socket).await?;
+
     // The subscription goes out before the file is made, so a request that
     // cannot be sent leaves no empty trace behind. A socket with nothing
     // listening on it never gets this far: `carry_out` connects before it runs
     // any command at all.
-    let header = TraceHeader::new(format_rfc3339_seconds(SystemTime::now()).to_string());
+    let header = TraceHeader::new(
+        format_rfc3339_seconds(SystemTime::now()).to_string(),
+        declared,
+    );
     let mut file =
         File::create(output).with_context(|| format!("{} is not writable", output.display()))?;
     append(&mut file, &header_line(&header)?, output)?;
 
+    let declared: BTreeSet<PlayerId> = header
+        .sources
+        .iter()
+        .map(|source| source.player.clone())
+        .collect();
+
     let mut readings = 0_usize;
+    // Sources that produced a reading without being in the header. Ordered and
+    // deduplicated because this is read by a person: a player opened during a
+    // recording produces one of these every second otherwise.
+    let mut outran: BTreeSet<PlayerId> = BTreeSet::new();
     // One deadline over the whole recording rather than one per answer. A
     // quiet desktop sends nothing for minutes, and a per-answer timeout would
     // end the recording instead of recording the quiet.
@@ -218,6 +280,9 @@ async fn record(
         while let Some(response) = daemon.answer().await? {
             match response {
                 Response::Event(BusEvent::Snapshot(reading)) => {
+                    if !declared.contains(&reading.player) {
+                        outran.insert(reading.player.clone());
+                    }
                     append(&mut file, &snapshot_line(&reading)?, output)?;
                     readings += 1;
                 }
@@ -270,6 +335,29 @@ async fn record(
         "recorded {readings} readings to {}{why}",
         output.display()
     )
+    .context("the summary could not be printed")?;
+
+    // Said because the file is a true record of what was published and parses
+    // like any other: nothing about it looks wrong, so a replay days later,
+    // against a session that cannot be recorded again, is where this would
+    // otherwise be found out.
+    //
+    // It says what was observed and not why. A player opened during the
+    // recording is the usual cause and not the only one - a recording begun
+    // before the daemon's first round has nothing to declare, and a source that
+    // missed its deadline on the round the listing came from is left out of it -
+    // and naming the wrong one of those is worse than naming none.
+    if outran.is_empty() {
+        return Ok(());
+    }
+
+    let named: Vec<&str> = outran.iter().map(|player| player.0.as_str()).collect();
+    writeln!(
+        out,
+        "some readings came from sources this recording never declared, \
+         so it holds more than it can replay: {}",
+        named.join(", ")
+    )
     .context("the summary could not be printed")
 }
 
@@ -296,12 +384,12 @@ mod tests {
     use benshi_core::trace::Trace;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, SessionState,
+        SourceInfo,
     };
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
     use benshi_daemon::supervisor::TaskError;
-    use benshi_detect::SourceInfo;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -331,13 +419,16 @@ mod tests {
         }
     }
 
+    /// The source every reading in these tests comes from.
+    const PLAYER: &str = "mpv.instance1701";
+
     /// The `index`th reading of a recording, distinguishable from the others.
     fn a_reading(index: u64) -> PlayerSnapshot {
         let clock = TestClock::new();
         clock.advance(Duration::from_secs(index));
 
         PlayerSnapshot {
-            player: PlayerId("mpv.instance1701".to_owned()),
+            player: PlayerId(PLAYER.to_owned()),
             media: MediaRef::LocalFile(RawPath::from_bytes(
                 b"/anime/[Group] Show - 03.mkv".to_vec(),
             )),
@@ -475,6 +566,19 @@ mod tests {
             self.subscribed().await;
 
             (watching, out, err)
+        }
+
+        /// A daemon that has seen the source [`a_reading`] comes from.
+        ///
+        /// A recording declares the sources the daemon listed when it began, so
+        /// a daemon that has already seen this player is the ordinary case: the
+        /// player was open before the recording started, every reading comes
+        /// from a declared source, and the summary has nothing to add about
+        /// them. A player that appears during a recording is the other case,
+        /// and `a_recording_names_a_source_that_outran_the_listing_it_declared`
+        /// is where it is covered.
+        fn that_has_seen_the_player() -> Self {
+            Self::listening(vec![a_source(PLAYER, "mpv")])
         }
 
         /// A `record` against this daemon, writing into a file of its own.
@@ -746,7 +850,7 @@ mod tests {
         // A recorder that assembled its own lines would write a file only it
         // could read, and nothing would say so until a replay was attempted
         // against a recording that can no longer be taken again.
-        let daemon = Daemon::listening(Vec::new());
+        let daemon = Daemon::that_has_seen_the_player();
         let recording = daemon.recording(Duration::from_secs(60)).await;
 
         let published: Vec<_> = (0..3).map(a_reading).collect();
@@ -765,7 +869,7 @@ mod tests {
         // recording, not an empty file. Everything else in these tests reads
         // the file while the command is still running, so this is the one that
         // says why that is allowed.
-        let daemon = Daemon::listening(Vec::new());
+        let daemon = Daemon::that_has_seen_the_player();
         let recording = daemon.recording(Duration::from_secs(60)).await;
 
         daemon.bus.publish(BusEvent::Snapshot(a_reading(0)));
@@ -788,7 +892,7 @@ mod tests {
         // replay has nothing to do with it. The state is the one to watch: it
         // carries a reading inside it, and writing that one down as well would
         // put a moment in the file the player only ever reported once.
-        let daemon = Daemon::listening(Vec::new());
+        let daemon = Daemon::that_has_seen_the_player();
         let recording = daemon.recording(Duration::from_secs(60)).await;
 
         daemon.bus.publish(BusEvent::SourcesChanged {
@@ -827,6 +931,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recording_declares_the_sources_the_daemon_had_when_it_started() {
+        // The half of an observation a reading cannot carry. A reading says
+        // what one source reported; only the daemon's listing says what that
+        // source was able to report, and a replay has to answer both. A
+        // recorder that wrote readings alone would leave every later replay to
+        // work capabilities out from the readings, which is a guess.
+        //
+        // Feishin is the point of the second source: it produced nothing and is
+        // declared anyway, because the listing records what was there rather
+        // than what the file has readings from.
+        let declared = vec![
+            a_source("mpv.instance1701", "mpv"),
+            a_source("Feishin", "Feishin"),
+        ];
+        let daemon = Daemon::listening(declared.clone());
+        let recording = daemon.recording(Duration::from_secs(60)).await;
+
+        daemon.bus.publish(BusEvent::Snapshot(a_reading(0)));
+        let trace = recording.once_it_holds(1).await;
+
+        assert_eq!(trace.header.sources, declared);
+        assert_eq!(trace.snapshots, vec![a_reading(0)]);
+    }
+
+    #[tokio::test]
+    async fn a_recording_names_a_source_that_outran_the_listing_it_declared() {
+        // The header is written once, before the first reading, so a player
+        // opened during a recording is never declared. The file is a true
+        // record of what the daemon published and it parses, so the summary is
+        // the only place that can say it is not one a replay can use. Saying
+        // nothing would leave that to be discovered by a replay days later,
+        // against a recording that cannot be taken again.
+        let daemon = Daemon::listening(vec![a_source(PLAYER, "mpv")]);
+        let recording = daemon.recording(Duration::from_secs(60)).await;
+        let opened_later = PlayerSnapshot {
+            player: PlayerId("vlc".to_owned()),
+            ..a_reading(1)
+        };
+
+        daemon.bus.publish(BusEvent::Snapshot(a_reading(0)));
+        daemon.bus.publish(BusEvent::Snapshot(opened_later.clone()));
+        let trace = recording.holding(2).await;
+        daemon.goes_away();
+
+        let (outcome, shown, complained) = recording.until_it_stops().await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(trace.snapshots, vec![a_reading(0), opened_later]);
+        // Read off the line that reports it rather than the whole output:
+        // `tempfile` picks six random alphanumerics for the path, and a bare
+        // `contains` over everything would pass on one run in sixty thousand
+        // without the line being printed at all.
+        let line = shown
+            .lines()
+            .find(|line| line.contains("more than it can replay"))
+            .unwrap_or_else(|| panic!("nothing reported the undeclared source: {shown:?}"));
+
+        assert!(
+            line.contains("vlc"),
+            "the source that was never declared is not named: {line:?}"
+        );
+        // The absence half: a declared source must not be named as one that
+        // was not, or the line says nothing when it does appear.
+        assert!(
+            !line.contains(PLAYER),
+            "a declared source was named as undeclared: {line:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_recording_stops_when_its_time_is_up() {
         // With nothing published, only the deadline can end it. A recorder
         // that waited for an event would never return on a quiet desktop,
@@ -850,7 +1024,7 @@ mod tests {
         // player was doing, and calling it a failure would have the user throw
         // away a recording that cannot be taken again. The deadline is a
         // minute off, so only the connection closing can end this one.
-        let daemon = Daemon::listening(Vec::new());
+        let daemon = Daemon::that_has_seen_the_player();
         let recording = daemon.recording(Duration::from_secs(60)).await;
         let output = recording.output.clone();
 
@@ -864,6 +1038,14 @@ mod tests {
         assert!(
             shown.contains("closed the connection"),
             "a recording that ended early reads as a complete one: {shown:?}"
+        );
+        // The absence half of the line a recording prints when a source outran
+        // its listing. Here every reading came from the declared source, so
+        // nothing may be said; a line that appears on every recording says
+        // nothing on the one it was written for.
+        assert!(
+            !shown.contains("more than it can replay"),
+            "a recording of a declared source apologised for an undeclared one: {shown:?}"
         );
         assert_eq!(caught.snapshots, vec![a_reading(0)]);
         let text = std::fs::read_to_string(&output).expect("a trace was written");
@@ -925,8 +1107,9 @@ mod tests {
         // `carry_out` connects before it runs any command, so a socket with
         // nothing behind it fails before `record` is reached and leaves no
         // empty file. That is the ordering this holds; the one inside `record`
-        // would need a daemon that went away between the connection and the
-        // subscription, which a test cannot stage.
+        // would need a daemon that went away partway through the three steps
+        // before the file is made - connect, subscribe, ask for the listing -
+        // which a test cannot stage.
         let (home, socket) = nowhere();
         let output = home.path().join("trace.jsonl");
 

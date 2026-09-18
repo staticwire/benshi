@@ -124,6 +124,29 @@ pub enum PlayState {
     Stopped,
 }
 
+/// One source as the platform currently describes it.
+///
+/// Capabilities belong to the source rather than to the adapter: mpv and a
+/// browser are observed through the same MPRIS adapter and do not report the
+/// same things.
+///
+/// Here rather than beside the trait an adapter implements, because nothing in
+/// it is platform knowledge: its four fields are the four types above. It is
+/// what a reading cannot say - a reading reports what one source did, and this
+/// declares what that source is able to do - so a recording carries both and
+/// `benshi_core::trace` needs to name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceInfo {
+    /// The stable identity the platform provides, unique per instance.
+    pub player: PlayerId,
+    /// The application this source belongs to, which policy is keyed on.
+    pub app: AppName,
+    /// What this source is able to report.
+    pub capabilities: Capabilities,
+    /// What it is doing, as far as it will say.
+    pub state: PlayState,
+}
+
 /// One reading taken from a media source.
 ///
 /// Adapters emit snapshots and this crate computes differences between them. An

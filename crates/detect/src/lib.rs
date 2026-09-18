@@ -15,7 +15,13 @@ pub mod mpris;
 use std::future::Future;
 use std::time::Duration;
 
-use benshi_core::{AppName, BoxError, Capabilities, PlayState, PlayerId, PlayerSnapshot};
+use benshi_core::{BoxError, PlayerId, PlayerSnapshot};
+
+// A source is described in `core` and observed here. Re-exported so that an
+// adapter and its consumers name it in the crate whose trait they implement or
+// call, rather than importing the trait from one crate and its argument from
+// another.
+pub use benshi_core::SourceInfo;
 
 /// Why a reading could not be taken.
 ///
@@ -42,23 +48,6 @@ pub enum WatchError {
     /// The source has disappeared since it was listed.
     #[error("{0:?} is no longer present")]
     Unavailable(PlayerId),
-}
-
-/// One source as the platform currently describes it.
-///
-/// Capabilities belong to the source rather than to the adapter: mpv and a
-/// browser are observed through the same MPRIS adapter and do not report the
-/// same things.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceInfo {
-    /// The stable identity the platform provides, unique per instance.
-    pub player: PlayerId,
-    /// The application this source belongs to, which policy is keyed on.
-    pub app: AppName,
-    /// What this source is able to report.
-    pub capabilities: Capabilities,
-    /// What it is doing, as far as it will say.
-    pub state: PlayState,
 }
 
 /// The result of one polling round.
