@@ -14,6 +14,7 @@
 //! called, and replaying a recording would no longer reproduce the playback it
 //! recorded.
 
+use std::mem;
 use std::time::Duration;
 
 use crate::clock::Timestamp;
@@ -93,35 +94,17 @@ struct Previous {
 }
 
 impl Previous {
-    /// Whether the step from this reading to the next one is a break.
+    /// How far the position should have moved by the time of the next reading.
     ///
-    /// The position is predicted from this reading: it advances by the interval
-    /// when this reading was playing and stays put when it was paused. A
-    /// reported position further from that prediction than [`SEEK_THRESHOLD`]
-    /// is a seek.
-    ///
-    /// Nothing here mentions where playback started, and that is the whole of
-    /// it. A position drifts from its first anchor over a long file for reasons
-    /// that are not seeks, so a rule anchored there reports one on every
-    /// reading past the threshold and never stops.
-    fn broke_before(self, reading: &PlayerSnapshot) -> bool {
-        // An interval the state changed inside says nothing about seeking: the
-        // change happened at a moment this cannot name, and everything from
-        // that moment to one end of the interval is unaccounted for. Measured
-        // on this crate's recording, both ends of its one pause diverge by a
-        // whole interval and neither is a seek.
-        if self.state != reading.state {
-            return false;
-        }
-        let (Known::Value(before), Known::Value(now)) = (self.position, reading.position) else {
-            return false;
-        };
-
-        let advance = match self.state {
+    /// The interval when this reading was playing, and nothing when it was not.
+    /// Which of the two readings the state comes from cannot be told apart from
+    /// here, and no test can pin it: the one caller has already returned when
+    /// the two disagree, so at the point this is reached they are the same.
+    fn expects(self, reading: &PlayerSnapshot) -> Duration {
+        match self.state {
             PlayState::Playing => reading.observed_at.since(self.observed_at),
             PlayState::Paused | PlayState::Stopped => Duration::ZERO,
-        };
-        now.abs_diff(before.saturating_add(advance)) > SEEK_THRESHOLD
+        }
     }
 }
 
@@ -132,6 +115,12 @@ pub struct Timeline {
     watched: Duration,
     /// The reading this one will be measured against, absent until the first.
     previous: Option<Previous>,
+    /// Playback the position has not caught up with yet.
+    ///
+    /// Only ever what the run of readings ending at the last one fell behind
+    /// by: one interval of ordinary reporting settles it, whether or not the
+    /// position ever made it up.
+    stalled: Duration,
 }
 
 impl Timeline {
@@ -141,7 +130,73 @@ impl Timeline {
         Self {
             watched: Duration::ZERO,
             previous: None,
+            stalled: Duration::ZERO,
         }
+    }
+
+    /// Whether the step from one reading to the next is a break in playback,
+    /// carrying over what the position still owes.
+    ///
+    /// The position is predicted from the earlier reading: it advances by the
+    /// interval when that reading was playing and stays put when it was paused.
+    /// Nothing here mentions where playback started, and that is the whole of
+    /// it. A position drifts from its first anchor over a long file for reasons
+    /// that are not seeks, so a rule anchored there reports one on every
+    /// reading past the threshold and never stops.
+    ///
+    /// Three things can have happened to the position, and only one of them is
+    /// ever a break.
+    ///
+    /// It went **backwards**, which no amount of reporting lag does, so its
+    /// distance from the prediction is judged against [`SEEK_THRESHOLD`]
+    /// directly.
+    ///
+    /// It advanced **less than the interval implies**, which is what a player
+    /// that has not published a new position yet looks like. Never a break: a
+    /// position that stands still has skipped nothing. What it did not report
+    /// is remembered, because the reading that catches up has to be allowed to.
+    ///
+    /// It advanced **at least as far as the interval implies**, which is
+    /// ordinary playback until the overshoot passes what the stall owed plus
+    /// the threshold. Either way the stall is settled: a player owes its
+    /// backlog at once, and one interval of ordinary reporting says the
+    /// position is current again.
+    fn broke_between(&mut self, previous: Previous, reading: &PlayerSnapshot) -> bool {
+        // Every step settles what the position owed, so it is taken here and
+        // only the one branch that extends it puts anything back. An interval
+        // nothing can be read from is no exception: what was owed before it
+        // cannot be made good across it.
+        let owed = mem::take(&mut self.stalled);
+
+        let (Known::Value(before), Known::Value(now)) = (previous.position, reading.position)
+        else {
+            return false;
+        };
+        // An interval the state changed inside says nothing about seeking: the
+        // change happened at a moment this cannot name, and everything from
+        // that moment to one end of the interval is unaccounted for. Measured
+        // on this crate's recording, both ends of its one pause diverge by a
+        // whole interval and neither is a seek.
+        if previous.state != reading.state {
+            return false;
+        }
+
+        let expected = previous.expects(reading);
+        // Every subtraction below is guarded by the test just above it, so none
+        // of them can saturate. They are written saturating anyway because a
+        // plain one panics rather than going negative, and a lint denies it:
+        // the guard is what makes the answer exact, not the method name.
+        if now < before {
+            return before.saturating_sub(now).saturating_add(expected) > SEEK_THRESHOLD;
+        }
+
+        let advanced = now.saturating_sub(before);
+        if advanced < expected {
+            self.stalled = owed + expected.saturating_sub(advanced);
+            return false;
+        }
+
+        advanced.saturating_sub(expected) > owed.saturating_add(SEEK_THRESHOLD)
     }
 
     /// Fold one reading in, and answer with what it leaves behind.
@@ -175,7 +230,7 @@ impl Timeline {
         }
         let seeked = self
             .previous
-            .is_some_and(|previous| previous.broke_before(reading));
+            .is_some_and(|previous| self.broke_between(previous, reading));
         self.previous = Some(Previous {
             observed_at: reading.observed_at,
             state: reading.state,
@@ -239,6 +294,10 @@ mod tests {
     /// otherwise needs its element type spelled out at every use.
     const NO_SEEKS: [usize; 0] = [];
 
+    /// One reading to build: the interval since the reading before it, the
+    /// state that reading reports, and the position it reports.
+    type Step = (Duration, PlayState, Known<Duration>);
+
     /// A position `seconds` into the media, as a source would report it.
     const fn a_position(seconds: u64) -> Known<Duration> {
         Known::Value(Duration::from_secs(seconds))
@@ -246,14 +305,12 @@ mod tests {
 
     /// A run of readings, each taken the given interval after the one before.
     ///
-    /// A step is the interval since the reading before it, the state that
-    /// reading reports, and the position it reports.
-    ///
     /// Built through a [`TestClock`] because a [`Timestamp`] comes only from a
     /// clock, which is the same reason the timeline needs none of its own. The
     /// clock moves before each reading is stamped, so the first sits one
-    /// interval after the epoch and the others follow it.
-    fn readings(steps: &[(Duration, PlayState, Known<Duration>)]) -> Vec<PlayerSnapshot> {
+    /// interval after the epoch and the others follow it. One clock for the
+    /// whole run, so a test builds its steps and stamps them once.
+    fn readings(steps: &[Step]) -> Vec<PlayerSnapshot> {
         let clock = TestClock::new();
         steps
             .iter()
@@ -572,6 +629,23 @@ mod tests {
     }
 
     #[test]
+    fn a_step_back_is_judged_from_where_playback_should_have_reached() {
+        // Two seconds back over a second of playback is three seconds from the
+        // prediction, and a seek. The step itself is exactly the threshold and
+        // no more, so a rule comparing it against the earlier position instead
+        // of against the prediction reports nothing. The forward branches carry
+        // the same term as an expected advance, where a run exactly the
+        // threshold ahead pins it; this branch is the only place it can go
+        // missing on its own.
+        let stepped_back = readings(&[
+            (SECOND, PlayState::Playing, a_position(30)),
+            (SECOND, PlayState::Playing, a_position(28)),
+        ]);
+
+        assert_eq!(seeks_in(&stepped_back), [1]);
+    }
+
+    #[test]
     fn a_position_exactly_the_threshold_ahead_is_not_yet_a_seek() {
         // The boundary the constant's own reasoning rests on, and the only
         // thing holding the comparison to a strict one. A file at three times
@@ -592,13 +666,22 @@ mod tests {
         // Nothing should advance while a player is paused, so a position that
         // does is the user dragging the bar. The expected advance is zero here
         // and the elapsed time is not, which is why the two are separate.
+        //
+        // Five readings at rest before the drag, and a drag of only four
+        // seconds, both deliberately. A rule that expected a paused source to
+        // advance like a playing one would read the four intervals between
+        // those readings as a stall of four seconds, and would then forgive a
+        // drag of up to seven; four seconds is well inside that.
         let dragged = readings(&[
             (SECOND, PlayState::Paused, a_position(30)),
             (SECOND, PlayState::Paused, a_position(30)),
-            (SECOND, PlayState::Paused, a_position(300)),
+            (SECOND, PlayState::Paused, a_position(30)),
+            (SECOND, PlayState::Paused, a_position(30)),
+            (SECOND, PlayState::Paused, a_position(30)),
+            (SECOND, PlayState::Paused, a_position(34)),
         ]);
 
-        assert_eq!(seeks_in(&dragged), [2]);
+        assert_eq!(seeks_in(&dragged), [5]);
     }
 
     #[test]
@@ -659,5 +742,118 @@ mod tests {
         ]);
 
         assert_eq!(seeks_in(&waiting), NO_SEEKS);
+    }
+
+    /// A player whose reported position stood still across `stalled` intervals
+    /// while it went on playing, as the steps to build it from.
+    ///
+    /// Steps rather than readings so that a test can put more after them and
+    /// have the whole run stamped by one clock. The recording holds no case of
+    /// this, because mpv's position tracks the elapsed time to under two
+    /// milliseconds; every stall in this file is built.
+    fn a_stall_of(stalled: usize) -> Vec<Step> {
+        vec![(SECOND, PlayState::Playing, a_position(12)); stalled + 1]
+    }
+
+    #[test]
+    fn a_player_that_catches_up_after_stalling_has_not_seeked() {
+        // Six readings at one position while playing, then one that moves by
+        // the five seconds that went unreported plus the second that has just
+        // passed. The jump is exactly what was owed, so nothing was skipped,
+        // although judged on its size alone it clears the threshold three times
+        // over.
+        //
+        // Five intervals of stall and not three, so that the run separates a
+        // stall that accumulates from one that remembers only the last
+        // reading's shortfall. The second would forgive an overshoot of one
+        // second plus the threshold, and the overshoot here is five. At three
+        // intervals the two answer alike and this test cannot tell them apart.
+        let mut run = a_stall_of(5);
+        run.push((SECOND, PlayState::Playing, a_position(18)));
+
+        assert_eq!(seeks_in(&readings(&run)), NO_SEEKS);
+    }
+
+    #[test]
+    fn a_position_that_stands_still_is_never_a_seek() {
+        // A playing source whose position does not move has skipped nothing,
+        // whatever the interval: it is a player that has not published a new
+        // position yet, and there is no content it jumped over. The intervals
+        // here are twice the threshold, which is what a round arriving late
+        // during a stall looks like, and what a shortfall judged against the
+        // threshold would report as a seek.
+        let frozen = readings(&[
+            (SECOND, PlayState::Playing, a_position(12)),
+            (SEEK_THRESHOLD * 2, PlayState::Playing, a_position(12)),
+            (SEEK_THRESHOLD * 2, PlayState::Playing, a_position(12)),
+        ]);
+
+        assert_eq!(seeks_in(&frozen), NO_SEEKS);
+    }
+
+    #[test]
+    fn a_jump_past_what_the_stall_owed_is_a_seek() {
+        // The absence half. A rule that forgives any forward jump following a
+        // stall forgives a forward seek that happens to follow one, and this is
+        // what separates the two: the same stall, and a jump far past it.
+        let mut run = a_stall_of(3);
+        run.push((SECOND, PlayState::Playing, a_position(300)));
+
+        assert_eq!(seeks_in(&readings(&run)), [4]);
+    }
+
+    #[test]
+    fn a_stall_is_forgotten_once_the_position_reports_normally() {
+        // What a player owes is owed at once and not indefinitely. One interval
+        // of ordinary reporting says the position is current again, so a jump
+        // after that is judged against the threshold alone. Without this, a
+        // stall forgives a seek of its own size at any later moment.
+        let mut run = a_stall_of(3);
+        run.push((SECOND, PlayState::Playing, a_position(13)));
+        run.push((SECOND, PlayState::Playing, a_position(17)));
+
+        assert_eq!(seeks_in(&readings(&run)), [5]);
+    }
+
+    #[test]
+    fn a_stall_does_not_survive_a_change_of_state() {
+        // An interval the state changed inside is unreadable, so what the
+        // position owed before it cannot be settled across it. A stall of three
+        // seconds, then a pause, then a four second drag: the drag is a seek,
+        // and a stall that carried over would forgive it.
+        let mut run = a_stall_of(3);
+        run.push((SECOND, PlayState::Paused, a_position(12)));
+        run.push((SECOND, PlayState::Paused, a_position(16)));
+
+        assert_eq!(seeks_in(&readings(&run)), [5]);
+    }
+
+    #[test]
+    fn a_stall_does_not_survive_a_position_that_went_backwards() {
+        // A stall of three seconds, then a step back of one second, then a four
+        // second jump. A second back over a second of playback sits exactly the
+        // threshold from the prediction, so the step back is not itself a seek
+        // and only the jump is reported. That jump is judged against the
+        // threshold alone, and a stall that carried over would forgive it.
+        let mut run = a_stall_of(3);
+        run.push((SECOND, PlayState::Playing, a_position(11)));
+        run.push((SECOND, PlayState::Playing, a_position(15)));
+
+        assert_eq!(seeks_in(&readings(&run)), [5]);
+    }
+
+    #[test]
+    fn a_stall_does_not_survive_a_reading_without_a_position() {
+        // The same rule for the other unreadable interval. Every reading in the
+        // recording carries a position, so only a built run puts this one to
+        // the test: a stall of three seconds, then a reading that reports no
+        // position at all, then a four second jump once positions are back. The
+        // jump is a seek, and a stall that carried over would forgive it.
+        let mut run = a_stall_of(3);
+        run.push((SECOND, PlayState::Playing, NOWHERE));
+        run.push((SECOND, PlayState::Playing, a_position(12)));
+        run.push((SECOND, PlayState::Playing, a_position(16)));
+
+        assert_eq!(seeks_in(&readings(&run)), [6]);
     }
 }
