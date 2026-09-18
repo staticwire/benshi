@@ -13,6 +13,7 @@ pub mod clock;
 pub mod encoding;
 pub mod path;
 pub mod policy;
+pub mod timeline;
 pub mod trace;
 
 use std::fmt;
