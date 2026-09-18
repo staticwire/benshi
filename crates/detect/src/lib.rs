@@ -12,6 +12,8 @@
 #[cfg(target_os = "linux")]
 pub mod mpris;
 
+pub mod replay;
+
 use std::future::Future;
 use std::time::Duration;
 
