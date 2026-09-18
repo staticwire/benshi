@@ -79,6 +79,39 @@ pub struct Progress {
 /// seek, and reading the playback rate is the real answer, not written yet.
 pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 
+/// The longest interval between two readings the timeline counts as observed.
+///
+/// A longer one is a gap. Nothing is known about what happened inside it, so
+/// nothing inside it is judged or counted, and the reading that ends it becomes
+/// the anchor the next one is measured against.
+///
+/// **What produces one today is a source that stops answering**, since a round
+/// that times out publishes no reading at all. The two other explanations that
+/// come to mind are both wrong here, and are written down so that nobody
+/// reaches for them twice. A machine suspended to memory produces no gap,
+/// because [`Instant`](std::time::Instant) reads `CLOCK_MONOTONIC` on Linux and
+/// that clock does not count suspended time. A restarted daemon produces none
+/// either, because a new timeline has no earlier reading at all and its first
+/// one is a first reading rather than the far end of a gap - though that one
+/// becomes real as soon as this state outlives the process.
+///
+/// **A gap is discarded even when the position resumes exactly where playing
+/// through it would have left it**, and that is the point rather than a
+/// shortcoming. A minute of playback and a drag of the bar a minute forward end
+/// at the same position, and over an interval nobody watched there is nothing
+/// to tell them apart. Counting it would let one drag mark an episode, which is
+/// the reason [`Progress`] carries a position and a watched time rather than
+/// one number.
+///
+/// Ten seconds, from the two bounds around it. **Below**, a source that fails to
+/// answer misses that round entirely, and the detection crate suggests a one
+/// second cadence, so a handful of consecutive timeouts is a handful of seconds
+/// and must stay observed or a merely slow player loses its progress.
+/// **Above**, an interval at or under this is counted in full whether or not
+/// anyone saw it, so this is also the most watched time a single hiccup can
+/// add: ten seconds of a twenty-four minute episode is under one percent of it.
+pub const OBSERVED_LIMIT: Duration = Duration::from_secs(10);
+
 /// The part of a reading the next one is measured against.
 ///
 /// Only the three fields the fold needs, rather than the whole reading, so
@@ -106,9 +139,22 @@ impl Previous {
             PlayState::Paused | PlayState::Stopped => Duration::ZERO,
         }
     }
+
+    /// Whether the interval up to `reading` is short enough to have been seen.
+    ///
+    /// Compared against [`OBSERVED_LIMIT`], and not strictly: an interval of
+    /// exactly the limit is a daemon under load rather than one that was not
+    /// running.
+    fn observed(self, reading: &PlayerSnapshot) -> bool {
+        reading.observed_at.since(self.observed_at) <= OBSERVED_LIMIT
+    }
 }
 
 /// The state a sequence of readings is folded through.
+///
+/// One continuous playback of one thing, and nothing here notices otherwise.
+/// No rule reads [`PlayerSnapshot::media`], so a source that finishes one file
+/// and opens another goes on adding to the watched time of the first.
 #[derive(Debug, Default)]
 pub struct Timeline {
     /// Watched time accumulated over every reading so far.
@@ -223,14 +269,21 @@ impl Timeline {
     /// reading when, inside the interval before it, the viewer reached for the
     /// keyboard.
     pub fn advance(&mut self, reading: &PlayerSnapshot) -> Progress {
-        if let Some(previous) = self.previous
-            && previous.state == PlayState::Playing
-        {
-            self.watched += reading.observed_at.since(previous.observed_at);
+        // An interval longer than `OBSERVED_LIMIT` is a gap, and the reading
+        // before it is dropped here rather than in each rule below: nothing
+        // inside a gap was seen, so there is nothing to count, nothing to
+        // judge, and nothing the position can still be owed across it.
+        let previous = self.previous.filter(|earlier| earlier.observed(reading));
+        if previous.is_none() {
+            self.stalled = Duration::ZERO;
         }
-        let seeked = self
-            .previous
-            .is_some_and(|previous| self.broke_between(previous, reading));
+
+        if let Some(earlier) = previous
+            && earlier.state == PlayState::Playing
+        {
+            self.watched += reading.observed_at.since(earlier.observed_at);
+        }
+        let seeked = previous.is_some_and(|earlier| self.broke_between(earlier, reading));
         self.previous = Some(Previous {
             observed_at: reading.observed_at,
             state: reading.state,
@@ -248,7 +301,7 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, SEEK_THRESHOLD, Timeline};
+    use super::{OBSERVED_LIMIT, Progress, SEEK_THRESHOLD, Timeline};
     use crate::clock::{Clock, TestClock, Timestamp};
     use crate::path::RawPath;
     use crate::trace::Trace;
@@ -277,6 +330,17 @@ mod tests {
     const SHORTEST_INTERVAL: Duration = Duration::from_nanos(998_109_148);
     const LONGEST_INTERVAL: Duration = Duration::from_nanos(1_002_104_074);
 
+    // Every test that replays the recording assumes the whole of it was
+    // observed, and a limit under its cadence makes every interval in the file
+    // a gap. Checked rather than described, because the replay tests that then
+    // fail say nothing about the limit, and one of them does not fail at all:
+    // `an_interval_that_began_paused_adds_no_watched_time` asserts that nothing
+    // is counted, and a fold of gaps counts nothing.
+    const _: () = assert!(
+        LONGEST_INTERVAL.as_nanos() <= OBSERVED_LIMIT.as_nanos(),
+        "an observed limit below the recording's cadence makes the recording a gap"
+    );
+
     /// The one break in the recording, also measured from it.
     ///
     /// Reading 50 reports 11.0 s where the reading before it reported
@@ -286,6 +350,18 @@ mod tests {
 
     /// The interval a run of readings uses unless it is about a longer one.
     const SECOND: Duration = Duration::from_secs(1);
+
+    /// An interval long enough that nobody watched it.
+    ///
+    /// Named rather than written as a multiple of the limit, because the
+    /// positions either side of a gap have to be consistent with playing
+    /// through it and the arithmetic that makes them so needs the number.
+    const A_GAP: Duration = Duration::from_secs(60);
+
+    const _: () = assert!(
+        A_GAP.as_nanos() > OBSERVED_LIMIT.as_nanos(),
+        "an interval a test calls a gap has to be longer than the limit"
+    );
 
     /// A position no source reported, for runs that are not about positions.
     const NOWHERE: Known<Duration> = Known::NotReported;
@@ -477,18 +553,8 @@ mod tests {
         // with the same `since` the fold measures it with. This total is a
         // literal taken off the file, and it would.
         let trace = Trace::from_jsonl(RECORDING).expect("the recording parses");
-        let mut timeline = Timeline::new();
 
-        // A plain loop, because folding with a side effect through an iterator
-        // chain is a trap here: `.map(..).next_back()` reads as "the last
-        // answer" and advances the timeline exactly once, over the last
-        // reading. It was written that way first and the total came out zero.
-        let mut watched = Duration::ZERO;
-        for reading in &trace.snapshots {
-            watched = timeline.advance(reading).watched;
-        }
-
-        assert_eq!(watched, WATCHED_IN_FULL);
+        assert_eq!(watched_over(&trace.snapshots), WATCHED_IN_FULL);
     }
 
     #[test]
@@ -512,11 +578,7 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let mut timeline = Timeline::new();
-        let mut watched = Duration::ZERO;
-        for reading in &trace.snapshots {
-            watched = timeline.advance(reading).watched;
-        }
+        let watched = watched_over(&trace.snapshots);
         let spent = started.elapsed();
 
         assert!(watched > Duration::ZERO, "the fold counted nothing");
@@ -855,5 +917,89 @@ mod tests {
         run.push((SECOND, PlayState::Playing, a_position(16)));
 
         assert_eq!(seeks_in(&readings(&run)), [6]);
+    }
+
+    /// How much the timeline counts as watched over a whole run.
+    ///
+    /// A plain loop, because folding with a side effect through an iterator
+    /// chain is a trap: `.map(..).next_back()` reads as "the last answer" and
+    /// advances the timeline exactly once, over the last reading. It was
+    /// written that way first and the total came out zero. This helper is
+    /// where the chain is most tempting, so the warning belongs here.
+    fn watched_over(run: &[PlayerSnapshot]) -> Duration {
+        let mut timeline = Timeline::new();
+        let mut watched = Duration::ZERO;
+        for reading in run {
+            watched = timeline.advance(reading).watched;
+        }
+        watched
+    }
+
+    #[test]
+    fn a_gap_nobody_watched_counts_as_nothing_watched() {
+        // The daemon was restarted, or the machine slept, or the source stopped
+        // answering for a minute. The position resumes exactly where a minute
+        // of playback would have left it, which is also exactly where a minute
+        // forward on the seek bar would have left it, and the two cannot be
+        // told apart. Counting it would let one drag of the bar mark an
+        // episode, which is the whole reason a position and a watched time are
+        // two fields and not one.
+        // The position after the gap is derived from the gap and not written
+        // as a literal: the point of the run is that playing through the gap
+        // and dragging the bar across it end in the same place, and a literal
+        // is only consistent with the interval in the author's head.
+        let resumed = 11 + A_GAP.as_secs();
+        let gap = readings(&[
+            (SECOND, PlayState::Playing, a_position(10)),
+            (SECOND, PlayState::Playing, a_position(11)),
+            (A_GAP, PlayState::Playing, a_position(resumed)),
+            (SECOND, PlayState::Playing, a_position(resumed + 1)),
+        ]);
+
+        assert_eq!(watched_over(&gap), SECOND * 2);
+    }
+
+    #[test]
+    fn a_gap_nobody_watched_is_never_a_seek() {
+        // The other half, and the reason the gap is judged before the break
+        // is: over an unobserved minute the position can be anywhere at all,
+        // and a timeline that called that a seek would report one every time a
+        // player was left running while the daemon was not.
+        let gap = readings(&[
+            (SECOND, PlayState::Playing, a_position(10)),
+            (A_GAP, PlayState::Playing, a_position(500)),
+            (SECOND, PlayState::Playing, a_position(501)),
+        ]);
+
+        assert_eq!(seeks_in(&gap), NO_SEEKS);
+    }
+
+    #[test]
+    fn an_interval_of_exactly_the_limit_was_still_observed() {
+        // The boundary, and the only thing keeping the comparison from becoming
+        // a strict one. A run of intervals each exactly at the limit is a daemon
+        // under load rather than a daemon that was not running, and every second
+        // of it is counted.
+        let slow = readings(&[
+            (SECOND, PlayState::Playing, a_position(10)),
+            (OBSERVED_LIMIT, PlayState::Playing, a_position(20)),
+            (OBSERVED_LIMIT, PlayState::Playing, a_position(30)),
+        ]);
+
+        assert_eq!(watched_over(&slow), OBSERVED_LIMIT * 2);
+        assert_eq!(seeks_in(&slow), NO_SEEKS);
+    }
+
+    #[test]
+    fn a_gap_clears_what_the_position_owed() {
+        // A stall of three seconds, then a gap, then a four second jump. The
+        // jump is a seek: whatever the position owed before an interval nobody
+        // watched cannot be made good across it, for the same reason a change
+        // of state settles it.
+        let mut run = a_stall_of(3);
+        run.push((A_GAP, PlayState::Playing, a_position(12)));
+        run.push((SECOND, PlayState::Playing, a_position(16)));
+
+        assert_eq!(seeks_in(&readings(&run)), [5]);
     }
 }
