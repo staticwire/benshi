@@ -125,7 +125,7 @@ async fn serve() -> ExitCode {
     // Reached only when nothing is left running, which for a daemon is a
     // failure however tidily each task arrived at it.
     for task in &stopped {
-        eprintln!("benshi: {} stopped: {:?}", task.name, task.stopped_by);
+        eprintln!("benshi: {} {}", task.name, task.stopped_by);
     }
 
     ExitCode::FAILURE

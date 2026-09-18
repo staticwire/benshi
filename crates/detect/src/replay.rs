@@ -34,7 +34,7 @@ pub enum ReplayError {
     /// was published and parses like any other; what nothing in it says is how
     /// to describe that source, and a round that carried its reading without
     /// describing it would break the contract every watcher is held to.
-    #[error("line {line} is a reading from {player:?}, which the trace does not declare")]
+    #[error("line {line} is a reading from {player}, which the trace does not declare")]
     UndeclaredSource {
         /// Which line of the file, counting the header as line 1.
         line: usize,
@@ -316,6 +316,16 @@ mod tests {
             matches!(&failure, ReplayError::UndeclaredSource { line: 3, player } if player.0 == opened_later),
             "got {failure:?}"
         );
-        assert!(failure.to_string().contains("line 3"), "got {failure}");
+        let said = failure.to_string();
+        assert!(said.contains("line 3"), "got {said}");
+        // This message names its subject, unlike a `WatchError`: whoever gets
+        // it holds the trace and not the pair the reading came in. Named
+        // plainly, though - the identity goes through `Display`, and nothing
+        // else here would notice if that went back to the debug form.
+        assert!(said.contains(opened_later), "got {said}");
+        assert!(
+            !said.contains("PlayerId"),
+            "a Rust type name reached a message: {said}"
+        );
     }
 }

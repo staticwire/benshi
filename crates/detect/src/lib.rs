@@ -32,10 +32,28 @@ pub use benshi_core::SourceInfo;
 /// [`WatchError::Unavailable`] is permanent for that source and stops polling
 /// it until it appears again. The third class, a bug, panics and never becomes
 /// a variant here.
+///
+/// **A message here is a reason and never a subject.** Whoever holds one of
+/// these holds the identity beside it: a per-source failure travels in
+/// [`PollOutcome::failures`] as a pair, and `BusEvent::SourceFailed` carries
+/// the player and the reason as two fields so that a client can lay them out.
+/// A message that named the source as well would print it twice on the one
+/// line a person reads, which is what `benshi watch` did until three suspended
+/// players on a real session bus showed it:
+///
+/// ```text
+/// mpv.instance-X  failed: PlayerId("mpv.instance-X") did not answer within 500ms
+/// ```
+///
+/// The identity stays in the variants as data, for a caller that has an error
+/// and not the pair it came from.
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
     /// The platform accepted the call and did not answer within its deadline.
-    #[error("{player:?} did not answer within {deadline:?}")]
+    ///
+    /// The deadline is written with `{:?}`, which for a `Duration` is the only
+    /// form there is and happens to be the readable one: `500ms`.
+    #[error("did not answer within {deadline:?}")]
     Timeout {
         /// Which source failed to answer.
         player: PlayerId,
@@ -48,7 +66,12 @@ pub enum WatchError {
     Transport(#[source] BoxError),
 
     /// The source has disappeared since it was listed.
-    #[error("{0:?} is no longer present")]
+    ///
+    /// A fragment, like the other two. Each completes the sentence its reporter
+    /// began - "mpv.instance-X failed: is no longer present" - and a pronoun
+    /// here would be the only one of the four reasons a client can show that
+    /// refers to a subject the reason itself never names.
+    #[error("is no longer present")]
     Unavailable(PlayerId),
 }
 
@@ -122,4 +145,65 @@ pub trait PlayerWatcher {
     /// and does not fail the poll: one unresponsive player must not blind the
     /// daemon to the rest.
     fn poll(&mut self) -> impl Future<Output = Result<PollOutcome, WatchError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchError;
+    use benshi_core::PlayerId;
+    use std::time::Duration;
+
+    /// The identity every message below is checked against.
+    const PLAYER: &str = "mpv.instance-NvZEKsqR";
+
+    #[test]
+    fn a_failure_reads_as_a_reason_and_leaves_the_subject_to_its_reporter() {
+        // Held here as well as where a line is rendered, because this is the
+        // crate that decides it.
+        let player = PlayerId(PLAYER.to_owned());
+        let reasons = [
+            WatchError::Timeout {
+                player: player.clone(),
+                deadline: Duration::from_millis(500),
+            },
+            WatchError::Unavailable(player.clone()),
+            WatchError::Transport("the connection dropped".into()),
+        ];
+
+        for failure in reasons {
+            // Exhaustive and empty on purpose. The list above is written by
+            // hand, so this is the only thing keeping a variant added later
+            // from sitting outside the assertions below: adding one stops the
+            // crate compiling here, in front of the list it has to join.
+            match &failure {
+                WatchError::Timeout { .. }
+                | WatchError::Transport(_)
+                | WatchError::Unavailable(_) => {}
+            }
+
+            let said = failure.to_string();
+            assert!(
+                !said.contains(PLAYER),
+                "a reason names its own subject: {said}"
+            );
+            assert!(
+                !said.contains("PlayerId"),
+                "a Rust type name reached a message: {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_says_the_deadline_it_exceeded() {
+        // The one number in the message, and the reason a person looks at the
+        // line at all: a source that answers in 600ms and one that never
+        // answers produce the same failure and want different fixes.
+        let said = WatchError::Timeout {
+            player: PlayerId(PLAYER.to_owned()),
+            deadline: Duration::from_millis(500),
+        }
+        .to_string();
+
+        assert_eq!(said, "did not answer within 500ms");
+    }
 }

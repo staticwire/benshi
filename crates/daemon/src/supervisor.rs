@@ -22,6 +22,7 @@
 //! retries and takes no measurable time to run.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -100,6 +101,21 @@ pub enum Stopped {
     Permanent(String),
     /// It kept panicking. The last panic is rendered here.
     Exhausted(String),
+}
+
+// Written so that the binary's last line before it exits reads as a sentence.
+// Without this, `{:?}` is the only formatting that compiles and a user's final
+// word from the daemon was `detection stopped: Exhausted("...")` - a variant
+// name and a quoted string, which is a debugger's view of a value rather than
+// an account of what happened.
+impl fmt::Display for Stopped {
+    fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Finished => into.write_str("finished and returned"),
+            Self::Permanent(why) => write!(into, "stopped for good: {why}"),
+            Self::Exhausted(last) => write!(into, "kept panicking and was given up on: {last}"),
+        }
+    }
 }
 
 /// What became of one supervised task.
@@ -475,6 +491,38 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "it must not try again");
         assert_eq!(records[0].restarts, 0);
+    }
+
+    #[test]
+    fn an_outcome_reads_as_an_account_rather_than_a_value() {
+        // This is the binary's last line before it exits, and `{:?}` was the
+        // only formatting that compiled until `Stopped` had a `Display`, so a
+        // user's final word from the daemon was `Exhausted("...")`. The match
+        // below is exhaustive and empty: a variant added later stops the crate
+        // compiling here, in front of the list it has to join.
+        let outcomes = [
+            Stopped::Finished,
+            Stopped::Permanent("the session bus went away".to_owned()),
+            Stopped::Exhausted("index out of bounds".to_owned()),
+        ];
+
+        for outcome in &outcomes {
+            match outcome {
+                Stopped::Finished | Stopped::Permanent(_) | Stopped::Exhausted(_) => {}
+            }
+
+            let said = outcome.to_string();
+            assert!(
+                !said.contains("Stopped") && !said.contains('"'),
+                "a value reached a terminal instead of an account: {said}"
+            );
+        }
+
+        assert_eq!(
+            Stopped::Exhausted("index out of bounds".to_owned()).to_string(),
+            "kept panicking and was given up on: index out of bounds"
+        );
+        assert_eq!(Stopped::Finished.to_string(), "finished and returned");
     }
 
     #[tokio::test(start_paused = true)]
