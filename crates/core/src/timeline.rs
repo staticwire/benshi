@@ -117,6 +117,243 @@ pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 /// add: ten seconds of a twenty-four minute episode is under one percent of it.
 pub const OBSERVED_LIMIT: Duration = Duration::from_secs(10);
 
+/// How much of the media has to have been watched, as a percentage of its
+/// length, unless [`WatchedPolicy`] is built with another.
+///
+/// **What this number is for.** It is the trigger that registers a title, not a
+/// record of how much was watched. The only question it answers is when to
+/// write the title down, and it is asked of [`Progress::watched`] alone.
+///
+/// **Why a percentage and not a count of seconds.** The same number of seconds
+/// is the whole of a short and a fifth of a film. A percentage is the only form
+/// that means the same thing for both.
+///
+/// **Why this is far below the whole file.** Media ends in credits, and a series
+/// repeats them at both ends: roughly a minute and a half of opening and the
+/// same of closing in a twenty-four minute episode, plus a preview. A viewer who
+/// skips both can never accumulate more than about seven eighths of the file, so
+/// a high setting is unreachable for the ordinary way of watching a series.
+///
+/// **Why it is half rather than more.** Registering a title does not require
+/// finishing it. A viewer who stops in the middle has still watched the thing,
+/// and whether they abandoned it or were called away is not something any
+/// reading can tell - so it is not asked.
+///
+/// **Nothing measured here fixes this number**: what fraction of a file a viewer
+/// reaches before stopping is a fact about viewers, and the one recording this
+/// crate replays is sixty readings of one playback.
+pub const WATCHED_PERCENT: u8 = 50;
+
+/// The smallest percentage [`WatchedPolicy::new`] accepts.
+///
+/// A floor on the configuration rather than on the decision. Below this the
+/// setting stops describing watching at all: a fifth of a twenty-four minute
+/// episode is four minutes and forty-eight seconds, which nobody reaches by
+/// opening a file to look at it, and anything lower starts to be reachable that
+/// way.
+///
+/// It does not protect very short media on its own, because a fifth of a three
+/// minute short is thirty-six seconds. [`WATCHED_MINIMUM`] is what covers that.
+pub const WATCHED_PERCENT_MIN: u8 = 20;
+
+/// The largest percentage [`WatchedPolicy::new`] accepts.
+///
+/// **A hundred is not reachable in one pass over a file and is therefore not
+/// offered.** Watched time accumulates from the first reading, which arrives
+/// after playback has already started, so one pass ends short of the length. A
+/// setting nothing can satisfy is a trap rather than a preference, and the same
+/// argument takes the ceiling well below a hundred: skipping the opening of a
+/// twenty-four minute episode leaves fifteen sixteenths of it to accumulate
+/// from, and skipping the closing as well leaves seven eighths.
+///
+/// Four fifths is reachable for a viewer who skips both.
+pub const WATCHED_PERCENT_MAX: u8 = 80;
+
+/// The least watched time that can count, whatever percentage is in force.
+///
+/// **Very short media is what this is for.** A fifth of a three minute short is
+/// thirty-six seconds, which is the length of a look rather than of a viewing,
+/// and the percentage alone cannot tell the two apart. One minute can.
+///
+/// **It never demands more than [`WATCHED_PERCENT_MAX`] of the media itself**,
+/// and that cap is not a nicety. Checked against MyAnimeList on 2026-09-19:
+/// `Jigazou` runs twelve seconds, `Sora Iro no Tane` thirty and
+/// `Doubutsu Sumo Taikai` fifty-two, so media shorter than this minimum exists
+/// and is catalogued. Without the cap, playing one of those through would not
+/// register it, and nothing would say why.
+///
+/// Below a handful of seconds the poll cadence decides rather than this number:
+/// the first reading arrives a poll into playback, so a file of a few seconds
+/// leaves only a few readings to accumulate from.
+///
+/// It is also the smallest fallback [`WatchedPolicy::new`] accepts, because both
+/// answer the same question - the least watched time worth registering - and two
+/// numbers for one question drift apart.
+pub const WATCHED_MINIMUM: Duration = Duration::from_mins(1);
+
+/// The watched time that counts where no usable length arrives, unless
+/// [`WatchedPolicy`] is built with another.
+///
+/// **When there is no length there is nothing to take a percentage of**, and the
+/// cases are real: a live stream has no end to report, a source may not declare
+/// the capability at all, and a length its own reading contradicts is discarded
+/// before it reaches here.
+///
+/// **A nominal length is not the answer.** Standing in a twenty-four minute
+/// episode or a ninety minute film would be a guess about media the source
+/// deliberately did not describe, and a guess that is wrong is worse here than
+/// no answer: it writes a title down on evidence that was invented.
+///
+/// So a flat span of watched time, and five minutes for the same reason
+/// [`WATCHED_PERCENT_MIN`] exists - long enough that nobody reaches it by
+/// opening something to look at it, short enough that a stream somebody is
+/// actually watching gets registered.
+pub const WATCHED_FALLBACK: Duration = Duration::from_mins(5);
+
+/// The largest fallback [`WatchedPolicy::new`] accepts.
+///
+/// Three hours is within a single sitting, so every accepted value is one a
+/// viewer can actually reach. Above this the setting means "never register a
+/// source that reports no length", which is a thing to say plainly rather than
+/// to express as a number nothing meets.
+pub const WATCHED_FALLBACK_MAX: Duration = Duration::from_hours(3);
+
+/// Why a [`WatchedPolicy`] could not be built.
+///
+/// Refused rather than corrected. A percentage quietly moved into range makes a
+/// configuration file disagree with the program reading it, and nothing later
+/// can tell the user which number is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WatchedPolicyError {
+    /// The percentage is outside [`WATCHED_PERCENT_MIN`] to
+    /// [`WATCHED_PERCENT_MAX`].
+    #[error(
+        "a watched percentage of {percent} is outside {WATCHED_PERCENT_MIN} to {WATCHED_PERCENT_MAX}"
+    )]
+    Percent {
+        /// What was asked for.
+        percent: u8,
+    },
+    /// The fallback is outside [`WATCHED_MINIMUM`] to [`WATCHED_FALLBACK_MAX`].
+    #[error(
+        "a fallback of {fallback:?} is outside {WATCHED_MINIMUM:?} to {WATCHED_FALLBACK_MAX:?}"
+    )]
+    Fallback {
+        /// What was asked for.
+        fallback: Duration,
+    },
+}
+
+/// When enough of the media has been watched to register the title.
+///
+/// Two numbers, because a source is free to report no length. The percentage
+/// applies to the length in force; the fallback is a flat span of watched time
+/// that answers where there is none.
+///
+/// **The decision is taken from the watched time and never from the position.**
+/// A viewer who drags the bar to the last minute has playback at the end and has
+/// watched nothing, and holding those two apart is what [`Progress`] is shaped
+/// for.
+///
+/// Both numbers are checked when the policy is built and are private afterwards,
+/// so every policy that exists is one whose answer is reachable. What each bound
+/// is for is written on the constant that sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchedPolicy {
+    /// Checked against [`WATCHED_PERCENT_MIN`] and [`WATCHED_PERCENT_MAX`].
+    percent: u8,
+    /// Checked against [`WATCHED_MINIMUM`] and [`WATCHED_FALLBACK_MAX`].
+    fallback: Duration,
+}
+
+impl Default for WatchedPolicy {
+    /// [`WATCHED_PERCENT`] and [`WATCHED_FALLBACK`], which are in range by
+    /// construction.
+    fn default() -> Self {
+        Self {
+            percent: WATCHED_PERCENT,
+            fallback: WATCHED_FALLBACK,
+        }
+    }
+}
+
+impl WatchedPolicy {
+    /// Build a policy, refusing either number if it is out of range.
+    ///
+    /// # Errors
+    ///
+    /// [`WatchedPolicyError::Percent`] or [`WatchedPolicyError::Fallback`],
+    /// naming the value that was refused. The percentage is checked first, so a
+    /// configuration with both wrong reports the percentage.
+    pub fn new(percent: u8, fallback: Duration) -> Result<Self, WatchedPolicyError> {
+        if !(WATCHED_PERCENT_MIN..=WATCHED_PERCENT_MAX).contains(&percent) {
+            return Err(WatchedPolicyError::Percent { percent });
+        }
+        if !(WATCHED_MINIMUM..=WATCHED_FALLBACK_MAX).contains(&fallback) {
+            return Err(WatchedPolicyError::Fallback { fallback });
+        }
+        Ok(Self { percent, fallback })
+    }
+
+    /// The percentage of the length that has to have been watched.
+    #[must_use]
+    pub const fn percent(&self) -> u8 {
+        self.percent
+    }
+
+    /// The watched time that answers where there is no usable length.
+    #[must_use]
+    pub const fn fallback(&self) -> Duration {
+        self.fallback
+    }
+
+    /// Whether this answer registers the media as watched.
+    ///
+    /// The percentage where there is a length to take a percentage of, and the
+    /// fallback where there is not. **Neither comparison is strict**: the rule
+    /// is watched *at* the threshold, and a source whose last reading lands
+    /// exactly on it is under no obligation to send another.
+    ///
+    /// A length of **zero** falls back rather than satisfying the percentage.
+    /// The timeline cannot produce one, because a length of zero arrives absent,
+    /// but [`Progress`] is a value with public fields and that refusal does not
+    /// travel with it. Any percentage of zero is zero, which would register a
+    /// viewer who has watched nothing at all.
+    ///
+    /// The fallback needs no floor of its own: every accepted fallback is at
+    /// least [`WATCHED_MINIMUM`] already.
+    #[must_use]
+    pub fn counts_as_watched(&self, progress: &Progress) -> bool {
+        match progress.duration {
+            Known::Value(length) if !length.is_zero() => {
+                progress.watched >= self.threshold_for(length)
+            }
+            Known::Value(_) | Known::NotReported | Known::Unsupported => {
+                progress.watched >= self.fallback
+            }
+        }
+    }
+
+    /// The watched time this policy asks for from media of `length`.
+    ///
+    /// The percentage of the length, raised to [`WATCHED_MINIMUM`] where that is
+    /// more - and that floor is itself held down to [`WATCHED_PERCENT_MAX`] of
+    /// the length, so it can never ask for more of a file than the largest
+    /// setting would. Media shorter than about a minute and a quarter is decided
+    /// by the cap rather than by either number.
+    ///
+    /// Divided before it is multiplied, which cannot overflow, where multiplying
+    /// first can. The division truncates by under a nanosecond and the
+    /// multiplication scales that by at most [`WATCHED_PERCENT_MAX`], so the
+    /// threshold is under 80 nanoseconds low against a poll cadence of a second.
+    fn threshold_for(&self, length: Duration) -> Duration {
+        let hundredth = length / 100;
+        let asked = hundredth * u32::from(self.percent);
+        let floor = WATCHED_MINIMUM.min(hundredth * u32::from(WATCHED_PERCENT_MAX));
+        asked.max(floor)
+    }
+}
+
 /// How long the media is, with a length its own reading contradicts discarded.
 ///
 /// Players lie about length, and the two values refused here are the ones a
@@ -353,7 +590,11 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
-    use super::{OBSERVED_LIMIT, Progress, SEEK_THRESHOLD, Timeline};
+    use super::{
+        OBSERVED_LIMIT, Progress, SEEK_THRESHOLD, Timeline, WATCHED_FALLBACK, WATCHED_FALLBACK_MAX,
+        WATCHED_MINIMUM, WATCHED_PERCENT, WATCHED_PERCENT_MAX, WATCHED_PERCENT_MIN, WatchedPolicy,
+        WatchedPolicyError,
+    };
     use crate::clock::{Clock, TestClock, Timestamp};
     use crate::path::RawPath;
     use crate::trace::Trace;
@@ -1081,20 +1322,25 @@ mod tests {
         assert_eq!(seeks_in(&readings(&run)), [6]);
     }
 
-    /// How much the timeline counts as watched over a whole run.
+    /// What the last reading of a whole run leaves behind.
     ///
     /// A plain loop, because folding with a side effect through an iterator
     /// chain is a trap: `.map(..).next_back()` reads as "the last answer" and
     /// advances the timeline exactly once, over the last reading. It was
     /// written that way first and the total came out zero. This helper is
     /// where the chain is most tempting, so the warning belongs here.
-    fn watched_over(run: &[PlayerSnapshot]) -> Duration {
+    fn progress_over(run: &[PlayerSnapshot]) -> Progress {
         let mut timeline = Timeline::new();
-        let mut watched = Duration::ZERO;
+        let mut progress = None;
         for reading in run {
-            watched = timeline.advance(reading).watched;
+            progress = Some(timeline.advance(reading));
         }
-        watched
+        progress.expect("a run holds at least one reading")
+    }
+
+    /// How much the timeline counts as watched over a whole run.
+    fn watched_over(run: &[PlayerSnapshot]) -> Duration {
+        progress_over(run).watched
     }
 
     #[test]
@@ -1163,5 +1409,227 @@ mod tests {
         run.push((SECOND, PlayState::Playing, a_position(16)));
 
         assert_eq!(seeks_in(&readings(&run)), [5]);
+    }
+
+    /// The answer a caller holds, with everything the decision ignores fixed.
+    ///
+    /// The position among them, and deliberately: a rule reading the position
+    /// where it should read the watched time finds nothing here to read.
+    fn progress(watched: Duration, duration: Known<Duration>) -> Progress {
+        Progress {
+            position: NOWHERE,
+            watched,
+            duration,
+            seeked: false,
+        }
+    }
+
+    /// A run of `rounds` readings a second apart, playing media `length` long.
+    ///
+    /// [`readings`] reports no length at all, which sends every decision below
+    /// to the fallback; this is the same run with a length on each reading.
+    fn playing_for(length: Duration, rounds: u64) -> Vec<PlayerSnapshot> {
+        let steps: Vec<Step> = (0..rounds)
+            .map(|round| (SECOND, PlayState::Playing, a_position(round)))
+            .collect();
+        readings(&steps)
+            .into_iter()
+            .map(|snapshot| PlayerSnapshot {
+                duration: Known::Value(length),
+                ..snapshot
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_episode_is_watched_at_the_configured_percentage_of_its_length() {
+        // Both halves. A ten minute file and 361 readings a second apart, which
+        // is 360 intervals and six minutes of watched time: past the default
+        // half of it, short of the largest setting's four fifths. Built rather
+        // than replayed, for the reason the test below this one states.
+        let run = playing_for(Duration::from_mins(10), 361);
+        let progress = progress_over(&run);
+        assert_eq!(progress.watched, Duration::from_mins(6));
+
+        let strictest = WatchedPolicy::new(WATCHED_PERCENT_MAX, WATCHED_MINIMUM)
+            .expect("the largest percentage is in range");
+
+        assert!(WatchedPolicy::default().counts_as_watched(&progress));
+        assert!(!strictest.counts_as_watched(&progress));
+    }
+
+    #[test]
+    fn the_recording_cannot_reach_the_smallest_percentage_that_may_be_set() {
+        // The trap in this rule, stated as a test rather than left as a comment.
+        // The recording holds 39 seconds of playback against a ten minute file,
+        // which is under a fifteenth of it, so no policy that can be built marks
+        // it watched. An implementation that registers nothing ever passes this
+        // exactly as well, which is why the test above it is built by hand.
+        let trace = Trace::from_jsonl(RECORDING).expect("the recording parses");
+        let progress = progress_over(&trace.snapshots);
+
+        let Known::Value(length) = progress.duration else {
+            panic!("the recording reports a length")
+        };
+        let reached = 100.0 * progress.watched.as_secs_f64() / length.as_secs_f64();
+        assert!(
+            reached < f64::from(WATCHED_PERCENT_MIN),
+            "the recording reaches {reached}% of its length, inside the range"
+        );
+
+        let loosest = WatchedPolicy::new(WATCHED_PERCENT_MIN, WATCHED_MINIMUM)
+            .expect("the smallest percentage is in range");
+
+        assert!(!loosest.counts_as_watched(&progress));
+        assert!(!WatchedPolicy::default().counts_as_watched(&progress));
+    }
+
+    #[test]
+    fn a_twenty_minute_episode_and_a_ninety_minute_film_differ_in_seconds() {
+        // Why the threshold is a percentage and not a count of seconds. The same
+        // twelve minutes is past half the episode and under a quarter of the
+        // film, so no single number of seconds answers for both.
+        let policy = WatchedPolicy::default();
+        let twelve_minutes = Duration::from_mins(12);
+
+        let episode = progress(twelve_minutes, a_length(20 * 60));
+        let film = progress(twelve_minutes, a_length(90 * 60));
+
+        assert!(policy.counts_as_watched(&episode));
+        assert!(!policy.counts_as_watched(&film));
+    }
+
+    #[test]
+    fn a_duration_that_cannot_be_reported_falls_back_to_a_timer() {
+        // Both absences, separately. They answer alike here and they are still
+        // different facts: a source that cannot report a length has settled the
+        // question for its lifetime, while one that did not report a length this
+        // time may report one in the next reading.
+        let policy = WatchedPolicy::default();
+        let plenty = policy.fallback() * 2;
+        let short = policy.fallback().saturating_sub(SECOND);
+
+        assert!(policy.counts_as_watched(&progress(plenty, Known::NotReported)));
+        assert!(policy.counts_as_watched(&progress(plenty, Known::Unsupported)));
+        assert!(!policy.counts_as_watched(&progress(short, Known::NotReported)));
+        assert!(!policy.counts_as_watched(&progress(short, Known::Unsupported)));
+    }
+
+    #[test]
+    fn exactly_the_threshold_is_already_enough_in_either_branch() {
+        // Watched *at* the threshold, on the percentage and on the fallback:
+        // neither comparison is strict. A source whose last reading lands
+        // exactly on the threshold is under no obligation to send another, and a
+        // strict rule would be waiting for one that never comes.
+        //
+        // Ten minutes is half of twenty exactly, so the percentage branch is
+        // tested on its boundary rather than near it.
+        let policy = WatchedPolicy::default();
+        let half = progress(Duration::from_mins(10), a_length(20 * 60));
+
+        assert!(policy.counts_as_watched(&half));
+        assert!(policy.counts_as_watched(&progress(policy.fallback(), Known::NotReported)));
+    }
+
+    #[test]
+    fn a_length_of_zero_falls_back_rather_than_registering_everything() {
+        // `Timeline` cannot produce this, because a length of zero arrives
+        // absent, but `Progress` is a value with public fields and that refusal
+        // does not travel with it. Any percentage of zero is zero, so the rule
+        // would register a viewer who has watched nothing at all - the one
+        // failure this crate exists to prevent.
+        let policy = WatchedPolicy::default();
+
+        assert!(!policy.counts_as_watched(&progress(Duration::ZERO, a_length(0))));
+        assert!(policy.counts_as_watched(&progress(policy.fallback(), a_length(0))));
+    }
+
+    #[test]
+    fn a_short_is_held_to_the_minimum_rather_than_to_its_percentage() {
+        // A three minute short at the smallest percentage that can be
+        // configured asks for thirty-six seconds, which is the length of a look
+        // rather than of a viewing. The minimum is what the percentage cannot
+        // express, and it is the whole reason there are two numbers here.
+        let loosest = WatchedPolicy::new(WATCHED_PERCENT_MIN, WATCHED_MINIMUM)
+            .expect("the smallest percentage is in range");
+        let short = a_length(3 * 60);
+
+        assert!(!loosest.counts_as_watched(&progress(Duration::from_secs(40), short)));
+        assert!(loosest.counts_as_watched(&progress(WATCHED_MINIMUM, short)));
+    }
+
+    #[test]
+    fn the_minimum_never_asks_more_of_a_file_than_the_largest_setting_would() {
+        // Media shorter than the minimum itself exists and is catalogued: read
+        // off MyAnimeList on 2026-09-19, `Jigazou` runs twelve seconds. Without
+        // the cap its threshold would be a minute, five times the file, and it
+        // could never be registered at all while nothing said why.
+        //
+        // Twelve seconds, so the cap decides and the percentage does not: four
+        // fifths of the file is 9.6 s, and the default half of it is 6 s.
+        let policy = WatchedPolicy::default();
+        let jigazou = a_length(12);
+
+        assert!(!policy.counts_as_watched(&progress(Duration::from_millis(9_599), jigazou)));
+        assert!(policy.counts_as_watched(&progress(Duration::from_millis(9_600), jigazou)));
+    }
+
+    #[test]
+    fn a_percentage_outside_its_range_is_refused_and_each_bound_is_not() {
+        // Refused and not corrected: a number quietly moved into range makes a
+        // configuration file disagree with the program reading it, and the error
+        // carries what was asked for so the disagreement can be named.
+        let below = WATCHED_PERCENT_MIN - 1;
+        let above = WATCHED_PERCENT_MAX + 1;
+
+        assert_eq!(
+            WatchedPolicy::new(below, WATCHED_FALLBACK),
+            Err(WatchedPolicyError::Percent { percent: below })
+        );
+        assert_eq!(
+            WatchedPolicy::new(above, WATCHED_FALLBACK),
+            Err(WatchedPolicyError::Percent { percent: above })
+        );
+        assert!(WatchedPolicy::new(WATCHED_PERCENT_MIN, WATCHED_FALLBACK).is_ok());
+        assert!(WatchedPolicy::new(WATCHED_PERCENT_MAX, WATCHED_FALLBACK).is_ok());
+
+        // Both wrong reports the percentage, which is the only thing the order
+        // of the two checks promises and the only thing that pins it.
+        assert_eq!(
+            WatchedPolicy::new(below, Duration::ZERO),
+            Err(WatchedPolicyError::Percent { percent: below })
+        );
+    }
+
+    #[test]
+    fn a_fallback_outside_its_range_is_refused_and_each_bound_is_not() {
+        // The other field, and both of its bounds. The lower one is the same
+        // number as the minimum under the percentage rule, because both answer
+        // the least watched time worth registering.
+        let below = WATCHED_MINIMUM.saturating_sub(SECOND);
+        let above = WATCHED_FALLBACK_MAX + SECOND;
+
+        assert_eq!(
+            WatchedPolicy::new(WATCHED_PERCENT, below),
+            Err(WatchedPolicyError::Fallback { fallback: below })
+        );
+        assert_eq!(
+            WatchedPolicy::new(WATCHED_PERCENT, above),
+            Err(WatchedPolicyError::Fallback { fallback: above })
+        );
+        assert!(WatchedPolicy::new(WATCHED_PERCENT, WATCHED_MINIMUM).is_ok());
+        assert!(WatchedPolicy::new(WATCHED_PERCENT, WATCHED_FALLBACK_MAX).is_ok());
+    }
+
+    #[test]
+    fn the_default_policy_is_one_that_could_have_been_configured() {
+        // The `Default` impl skips the checks, so nothing but this stops a
+        // default that no caller would be allowed to ask for.
+        let policy = WatchedPolicy::default();
+
+        assert_eq!(
+            WatchedPolicy::new(policy.percent(), policy.fallback()),
+            Ok(policy)
+        );
     }
 }
