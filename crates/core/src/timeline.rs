@@ -18,7 +18,7 @@ use std::mem;
 use std::time::Duration;
 
 use crate::clock::Timestamp;
-use crate::{Known, PlayState, PlayerSnapshot};
+use crate::{Known, MediaRef, PlayState, PlayerSnapshot};
 
 /// What one reading left the timeline in.
 ///
@@ -439,9 +439,11 @@ impl Previous {
 
 /// The state a sequence of readings is folded through.
 ///
-/// One continuous playback of one thing, and nothing here notices otherwise.
-/// No rule reads [`PlayerSnapshot::media`], so a source that finishes one file
-/// and opens another goes on adding to the watched time of the first.
+/// **One continuous playback of one thing, and a change of that thing starts
+/// the whole of it again.** Nothing else clears the watched total: a pause does
+/// not, a seek does not, and an interval nobody watched does not. Each of those
+/// is still the same media, and a viewer who stops and comes back to it later
+/// goes on adding to one total.
 #[derive(Debug, Default)]
 pub struct Timeline {
     /// Watched time accumulated over every reading so far.
@@ -454,6 +456,11 @@ pub struct Timeline {
     /// by: one interval of ordinary reporting settles it, whether or not the
     /// position ever made it up.
     stalled: Duration,
+    /// What the readings so far were about, absent until the first of them.
+    ///
+    /// Held here rather than on [`Previous`], which is [`Copy`] while a
+    /// [`MediaRef`] owns a path or a string.
+    open: Option<MediaRef>,
 }
 
 impl Timeline {
@@ -464,6 +471,7 @@ impl Timeline {
             watched: Duration::ZERO,
             previous: None,
             stalled: Duration::ZERO,
+            open: None,
         }
     }
 
@@ -546,7 +554,9 @@ impl Timeline {
     /// before it when that earlier reading was playing, and by nothing at all
     /// otherwise. The earlier one and not this one, because the interval was
     /// spent in the state it began in, and a reading says what was true when it
-    /// was taken rather than what became true during the interval after it.
+    /// was taken rather than what became true during the interval after it. A
+    /// reading with no earlier one to measure from adds nothing: the first of a
+    /// run, the one that ends a gap, and the one that opens a different file.
     ///
     /// A pause therefore costs up to one interval at each end, in opposite
     /// directions. Both ends are in this crate's recording and were measured:
@@ -558,6 +568,23 @@ impl Timeline {
     /// reading when, inside the interval before it, the viewer reached for the
     /// keyboard.
     pub fn advance(&mut self, reading: &PlayerSnapshot) -> Progress {
+        // A different thing is open, so nothing held here is about this
+        // reading. Not the watched time, which was earned by the file that is
+        // gone; not the anchor, whose position measures something else
+        // entirely; and not what the position owed, which is owed by the file
+        // that fell behind. The whole state goes rather than part of it, and
+        // the interval the change fell inside counts as nothing, because
+        // nothing says how much of it belonged to each file.
+        if matches!(&self.open, Some(open) if *open != reading.media) {
+            *self = Self::new();
+        }
+        // Nothing is open on the first reading and nothing is open after the
+        // reset above, so one branch answers both. The clone costs one
+        // allocation each time what is open changes, and none in between.
+        if self.open.is_none() {
+            self.open = Some(reading.media.clone());
+        }
+
         // An interval longer than `OBSERVED_LIMIT` is a gap, and the reading
         // before it is dropped here rather than in each rule below: nothing
         // inside a gap was seen, so there is nothing to count, nothing to
@@ -1409,6 +1436,122 @@ mod tests {
         run.push((SECOND, PlayState::Playing, a_position(16)));
 
         assert_eq!(seeks_in(&readings(&run)), [5]);
+    }
+
+    /// A run whose readings from `switch` onwards have a second file open.
+    ///
+    /// Built from one run rather than two, so that one clock stamps the whole
+    /// sequence and the change of media falls inside an ordinary interval. The
+    /// second file is only ever compared for equality, so what it is does not
+    /// matter beyond differing from the first.
+    fn switching_at(switch: usize, steps: &[Step]) -> Vec<PlayerSnapshot> {
+        let second = MediaRef::LocalFile(RawPath::from_bytes(b"/anime/show-04.mkv".to_vec()));
+        readings(steps)
+            .into_iter()
+            .enumerate()
+            .map(|(index, snapshot)| {
+                if index >= switch {
+                    PlayerSnapshot {
+                        media: second.clone(),
+                        ..snapshot
+                    }
+                } else {
+                    snapshot
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_second_file_starts_its_watched_time_from_nothing() {
+        // Every step rather than the final total, because a total alone cannot
+        // show where the time went. Three readings of one file, three of
+        // another: the first file reaches two seconds, the interval the change
+        // falls inside adds nothing because nothing says how much of it
+        // belonged to each file, and the second file counts from zero.
+        let run = switching_at(
+            3,
+            &[
+                (SECOND, PlayState::Playing, a_position(10)),
+                (SECOND, PlayState::Playing, a_position(11)),
+                (SECOND, PlayState::Playing, a_position(12)),
+                (SECOND, PlayState::Playing, a_position(0)),
+                (SECOND, PlayState::Playing, a_position(1)),
+                (SECOND, PlayState::Playing, a_position(2)),
+            ],
+        );
+        let mut timeline = Timeline::new();
+
+        let watched: Vec<Duration> = run
+            .iter()
+            .map(|reading| timeline.advance(reading).watched)
+            .collect();
+
+        assert_eq!(
+            watched,
+            [
+                Duration::ZERO,
+                SECOND,
+                SECOND * 2,
+                Duration::ZERO,
+                SECOND,
+                SECOND * 2
+            ]
+        );
+    }
+
+    #[test]
+    fn a_change_of_media_is_never_a_seek() {
+        // The second file starts at its own beginning here, so the position
+        // falls by as much as the first had reached. There is nothing to
+        // compare: the two numbers measure different things, and a rule that
+        // judged them against each other would report a seek whenever a file
+        // opens far enough from where the last one stood.
+        let run = switching_at(
+            2,
+            &[
+                (SECOND, PlayState::Playing, a_position(300)),
+                (SECOND, PlayState::Playing, a_position(301)),
+                (SECOND, PlayState::Playing, a_position(0)),
+                (SECOND, PlayState::Playing, a_position(1)),
+            ],
+        );
+
+        assert_eq!(seeks_in(&run), NO_SEEKS);
+    }
+
+    #[test]
+    fn a_change_of_media_clears_what_the_position_owed() {
+        // A stall of three seconds in one file, then another file, then a four
+        // second jump. The jump is a seek: what a position owed is owed by the
+        // file it was reading, and a stall that carried over would forgive a
+        // seek in the next one. A gap and a change of state settle the stall
+        // too. Here the whole state goes, and the stall with it.
+        let mut steps = a_stall_of(3);
+        steps.push((SECOND, PlayState::Playing, a_position(12)));
+        steps.push((SECOND, PlayState::Playing, a_position(16)));
+
+        assert_eq!(seeks_in(&switching_at(4, &steps)), [5]);
+    }
+
+    #[test]
+    fn the_same_media_across_a_gap_goes_on_adding_to_one_total() {
+        // The case this rule has to leave alone, and the reason it compares
+        // media rather than resetting on anything that looks like an ending. A
+        // viewer watches part of a file, stops, and comes back to the same file
+        // later: the gap costs its own interval and nothing else, so the total
+        // is both sittings. A second sitting crossing a threshold the first did
+        // not is the whole point of keeping one total.
+        let run = readings(&[
+            (SECOND, PlayState::Playing, a_position(10)),
+            (SECOND, PlayState::Playing, a_position(11)),
+            (SECOND, PlayState::Playing, a_position(12)),
+            (A_GAP, PlayState::Playing, a_position(13)),
+            (SECOND, PlayState::Playing, a_position(14)),
+            (SECOND, PlayState::Playing, a_position(15)),
+        ]);
+
+        assert_eq!(watched_over(&run), SECOND * 4);
     }
 
     /// The answer a caller holds, with everything the decision ignores fixed.
