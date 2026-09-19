@@ -37,6 +37,11 @@ pub struct Progress {
     /// How much of the media has been watched, accumulated over the readings.
     pub watched: Duration,
     /// How long the media is, as far as it can be known.
+    ///
+    /// The source's own answer, except where its own reading contradicts it. A
+    /// length below the position it arrived with, and a length of zero, arrive
+    /// here as [`Known::NotReported`]: both are impossible, and a consumer
+    /// handed one has no way to tell it from a true one.
     pub duration: Known<Duration>,
     /// Whether the step that produced this answer was a seek.
     pub seeked: bool,
@@ -111,6 +116,51 @@ pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 /// anyone saw it, so this is also the most watched time a single hiccup can
 /// add: ten seconds of a twenty-four minute episode is under one percent of it.
 pub const OBSERVED_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long the media is, with a length its own reading contradicts discarded.
+///
+/// Players lie about length, and the two values refused here are the ones a
+/// consumer below has no way to tell from the truth. A length **below the
+/// position it arrives with** describes media playback has already run past,
+/// which a genuinely short file never does. A length of **zero** is no media at
+/// all, and the contradiction rule reaches it only when a position arrives
+/// above it: a position of zero is legal and reported, so a player at the start
+/// of a file offers nothing for zero to be below.
+///
+/// Refused rather than corrected. The only correction available is the position
+/// itself, since playback reached it, and a watched decision taken as a fraction
+/// of that number would call every such file complete the moment it arrived. An
+/// absence is a fact the fallback for a missing length has to answer for.
+///
+/// A position **equal** to the length is the last instant of the media and is
+/// kept. The comparison is strict for that reason, and because the contract
+/// every adapter is held to states the rule in those words: a duration is never
+/// shorter than its position.
+///
+/// [`Known::Unsupported`] is carried through rather than folded into
+/// [`Known::NotReported`], because a source that cannot report a length and one
+/// that reported an impossible one are different facts: the first is settled for
+/// the life of the source, the second is about this reading alone.
+///
+/// **This is the second place the rule lives.** The MPRIS adapter refuses the
+/// same two values before a reading is ever built. It is repeated here because a
+/// recording is a text file anyone can edit, and because the adapter that has
+/// not been written yet is not bound by the one that has.
+fn duration_of(reading: &PlayerSnapshot) -> Known<Duration> {
+    let Known::Value(duration) = reading.duration else {
+        return reading.duration;
+    };
+    if duration.is_zero() {
+        return Known::NotReported;
+    }
+
+    match reading.position {
+        Known::Value(position) if duration < position => Known::NotReported,
+        // Both absences answer alike, though they are different facts: with no
+        // position reported there is nothing a length can contradict.
+        Known::Value(_) | Known::NotReported | Known::Unsupported => Known::Value(duration),
+    }
+}
 
 /// The part of a reading the next one is measured against.
 ///
@@ -247,11 +297,13 @@ impl Timeline {
 
     /// Fold one reading in, and answer with what it leaves behind.
     ///
-    /// The position and the length are the source's own answers, carried
-    /// through as they arrived. The watched time and the seek are the
-    /// timeline's, and no reading carries either: a seek is a break between two
-    /// consecutive readings, and watched time is what a sequence of them adds
-    /// up to.
+    /// The position is the source's own answer, carried through exactly as it
+    /// arrived. The length is the source's answer too, except where the reading
+    /// it came with contradicts it: a length below its own position, or a
+    /// length of zero, is published absent. The watched time and the seek are
+    /// the timeline's, and no reading carries either: a seek is a break between
+    /// two consecutive readings, and watched time is what a sequence of them
+    /// adds up to.
     ///
     /// The watched time grows by the interval between this reading and the one
     /// before it when that earlier reading was playing, and by nothing at all
@@ -293,7 +345,7 @@ impl Timeline {
         Progress {
             position: reading.position,
             watched: self.watched,
-            duration: reading.duration,
+            duration: duration_of(reading),
             seeked,
         }
     }
@@ -313,14 +365,15 @@ mod tests {
     const RECORDING: &str = include_str!("../tests/fixtures/mpv-one-episode.jsonl");
 
     // What the recording holds, measured from it on 2026-09-18. One note for
-    // all three constants below, so not a doc comment on the first of them.
+    // every constant below, so not a doc comment on the first of them. It said
+    // "all three" until there were five, which is what a count in prose does.
     //
     // The readings are a second apart but not exactly: the shortest interval
     // is 998.109148 ms and the longest 1002.104074 ms, so a test that assumes
-    // a round second asserts something the recording does not contain. Of the
-    // 59 intervals, 39 begin while playback is running and span 39.001189719 s
-    // together, and 20 begin paused and span 19.998711057 s; the two add up to
-    // the 58.999900776 s the recording covers.
+    // a round second asserts something the recording does not contain. Its 60
+    // readings leave 59 intervals, of which 39 begin while playback is running
+    // and span 39.001189719 s together, while 20 begin paused and span
+    // 19.998711057 s; the two add up to the 58.999900776 s it covers.
     //
     // Nanoseconds and not microseconds, because the first measurement of this
     // divided them away and the total below was wrong by 719 of them.
@@ -329,6 +382,7 @@ mod tests {
     const WATCHED_IN_FULL: Duration = Duration::from_nanos(39_001_189_719);
     const SHORTEST_INTERVAL: Duration = Duration::from_nanos(998_109_148);
     const LONGEST_INTERVAL: Duration = Duration::from_nanos(1_002_104_074);
+    const READINGS: usize = 60;
 
     // Every test that replays the recording assumes the whole of it was
     // observed, and a limit under its cadence makes every interval in the file
@@ -376,6 +430,15 @@ mod tests {
 
     /// A position `seconds` into the media, as a source would report it.
     const fn a_position(seconds: u64) -> Known<Duration> {
+        Known::Value(Duration::from_secs(seconds))
+    }
+
+    /// A media `seconds` long, as a source would report its length.
+    ///
+    /// The same construction as [`a_position`] under the name of the argument
+    /// it fills, because both arguments of `reading` are the same type and
+    /// `reading(a_position(10), a_position(5))` reads as two positions.
+    const fn a_length(seconds: u64) -> Known<Duration> {
         Known::Value(Duration::from_secs(seconds))
     }
 
@@ -474,6 +537,105 @@ mod tests {
                 seeked: false,
             }
         );
+    }
+
+    #[test]
+    fn a_length_below_its_position_is_absent_rather_than_believed() {
+        // Players lie about length, and this is the lie nothing downstream can
+        // tell from the truth: five seconds of media arriving with a position
+        // ten seconds into it describes a file playback has already run past,
+        // which a genuinely short file never does.
+        //
+        // Absent and not corrected. A corrected length is a number nobody
+        // measured, and the one honest correction - the position, since
+        // playback reached it - is the number the watched decision would then
+        // be a fraction of, making every such file complete on arrival.
+        let mut timeline = Timeline::new();
+
+        let progress = timeline.advance(&reading(a_position(10), a_length(5)));
+
+        assert_eq!(progress.duration, Known::NotReported);
+        // The position survives. It is the source's own answer and it was not
+        // what the reading contradicted, so a rule that threw away the pair
+        // would discard the one half of it never in question.
+        assert_eq!(progress.position, a_position(10));
+    }
+
+    #[test]
+    fn a_position_at_the_very_end_of_its_length_is_not_a_contradiction() {
+        // The boundary, and the only thing holding the comparison to a strict
+        // one. A position equal to the length is the last instant of the media
+        // rather than an impossible one, the contract every adapter is held to
+        // permits it in those words, and the MPRIS adapter keeps it. Refusing
+        // it here would take the length away exactly where a watched decision
+        // needs one, and would put this crate at odds with the two places that
+        // already answer.
+        let mut timeline = Timeline::new();
+
+        let progress = timeline.advance(&reading(a_position(600), a_length(600)));
+
+        assert_eq!(progress.duration, a_length(600));
+    }
+
+    #[test]
+    fn a_length_of_zero_is_absent_even_where_no_position_contradicts_it() {
+        // Zero is a length no file has, and it is the one impossible value the
+        // contradiction rule cannot reach: a position of zero is legal and the
+        // MPRIS adapter deliberately keeps it, so a player sitting at the start
+        // of a file offers nothing for zero to be below. Published as a value
+        // it would make every consumer special-case a sentinel, which is what
+        // `Known` exists to stop.
+        let mut timeline = Timeline::new();
+
+        let at_the_start = timeline.advance(&reading(a_position(0), a_length(0)));
+        let unplaced = timeline.advance(&reading(NOWHERE, a_length(0)));
+
+        assert_eq!(at_the_start.duration, Known::NotReported);
+        assert_eq!(unplaced.duration, Known::NotReported);
+    }
+
+    #[test]
+    fn a_length_stands_when_there_is_no_position_to_contradict_it() {
+        // Both absences, and they answer alike here although they are different
+        // facts. `Capabilities` declares a position and a length separately, so
+        // a source reporting one and not the other is a source the type allows,
+        // and a rule discarding a length whenever the position is missing would
+        // leave that source with no length it can ever publish.
+        let mut timeline = Timeline::new();
+
+        let silent = timeline.advance(&reading(Known::NotReported, a_length(600)));
+        let incapable = timeline.advance(&reading(Known::Unsupported, a_length(600)));
+
+        assert_eq!(silent.duration, a_length(600));
+        assert_eq!(incapable.duration, a_length(600));
+    }
+
+    #[test]
+    fn the_recording_keeps_every_length_it_reports() {
+        // The rule discards nothing a well-behaved player reports, which is
+        // what separates it from one that fires on ordinary data: an inverted
+        // comparison takes the length off all sixty readings here. The
+        // constructed tests above catch that inversion too, and what they
+        // cannot show is this: the rule stays quiet over a real player's own
+        // numbers. The count at the end is what stops this from passing over a
+        // recording that reports no length at all, where carrying nothing
+        // through unchanged is trivially true.
+        let trace = Trace::from_jsonl(RECORDING).expect("the recording parses");
+        let mut timeline = Timeline::new();
+        let mut reported = 0;
+
+        for (index, reading) in trace.snapshots.iter().enumerate() {
+            let published = timeline.advance(reading).duration;
+            assert_eq!(
+                published, reading.duration,
+                "reading {index} reports a length this rule discarded"
+            );
+            if matches!(reading.duration, Known::Value(_)) {
+                reported += 1;
+            }
+        }
+
+        assert_eq!(reported, READINGS, "every reading reports a length");
     }
 
     #[test]
