@@ -14,6 +14,8 @@
 //! and that number is not carried here: inserting a stage renumbers every stage
 //! after it, while a name says what decided and does not move.
 
+pub mod parse;
+
 /// How well a candidate title matched, from nothing to exactly.
 ///
 /// A proportion and nothing else can be one, so it is checked on the way in and

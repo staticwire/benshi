@@ -12,6 +12,16 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# The anime filename parser, a Rust port of erengy/anitomy. Pure Rust with one
+# direct runtime dependency, `regex` without its Unicode tables, which brings
+# `aho-corasick`, `memchr`, `regex-automata` and `regex-syntax` with it. All of
+# them are Rust, so nothing C arrives and this crate stays free of platform
+# code. MPL-2.0, the only non-permissive licence in the graph; section 3.3
+# permits a Larger Work under other terms, so benshi stays MIT.
+#
+# Not `anitomy-rs`, the port this project first meant to use: it was never
+# published to crates.io and was last touched in 2024. Checked on 2026-09-19.
+anitomy-ng = "1.0.10"
 chardetng = "1.0.0"
 encoding_rs = "0.8.41"
 serde = { version = "1.0.229", features = ["derive"] }
