@@ -6,15 +6,20 @@
 //! stops the build and has to be given an answer instead of changing behaviour
 //! quietly.
 //!
-//! Five kinds are kept and the choice was measured on 2026-09-20 rather than
-//! taken from the plan, which asked for seven. `Part` did not fire on the form
-//! the plan named: `Show Title Part 2` comes back with the part still inside the
-//! title, because a bare unenclosed `Part` counts as ambiguous upstream. It does
-//! fire on `Cour 2` and on an enclosed `(Season 1 Part 2)`. `EpisodeTitle` fired
-//! and was wrong: `Show Title - 03 - The Episode Name` reported an episode title
-//! of `The`. Neither earns a field.
+//! Six kinds are kept, and which six was measured rather than assumed.
+//! `EpisodeTitle` fired and was wrong: `Show Title - 03 - The Episode Name`
+//! reported an episode title of `The`, measured on 2026-09-20, so it earns no
+//! field. `Part` was dropped here too at first and has been kept since
+//! 2026-09-21, when a measurement of the key it will feed showed that AniList
+//! lists the second part of some seasons as an entry of its own.
+//!
+//! **The parser also loses a part in more than one place, and one of them is
+//! read back here.** A bare `Part` counts upstream only inside brackets, and a
+//! title ends at the season marker, so in `Show Title Season 3 Part 2 - 03`
+//! the part belongs to no element at all. [`parse`] reads it back from that
+//! one place and no other.
 
-use anitomy_ng::{ElementKind, Options};
+use anitomy_ng::{Element, ElementKind, Options};
 
 use crate::encoding::{Confidence, decode};
 use crate::path::RawPath;
@@ -68,10 +73,22 @@ pub struct Parsed {
     /// and no season at all, measured on 2026-09-20, which is why the normaliser
     /// has to carry a rule of its own rather than trust this field.
     pub season: Option<u32>,
+    /// The part of a season, where the parser reported one or [`parse`] read
+    /// one back from after the season marker.
+    ///
+    /// What the name said and nothing decided about it: `Part 1` is one here,
+    /// and whether a first part is the same list entry as no part at all is the
+    /// key's rule. A part the name spells inside the title, with no season in
+    /// front of it, stays in [`title`](Parsed::title) where the parser left it.
+    pub part: Option<u32>,
     /// The year, which is what tells a remake from its original.
     pub year: Option<u32>,
-    /// The release group, kept because a corpus entry never carries one and the
-    /// normaliser has to take it off both sides.
+    /// The release group, which the parser reports apart from the title.
+    ///
+    /// Taken off here and nowhere later. Brackets in a list entry are part of
+    /// its name - `[Oshi no Ko]` is the whole romaji title of one series on
+    /// AniList - so a rule stripping a bracketed tag from text would reduce
+    /// that title to nothing.
     pub release_group: Option<String>,
     /// Whether the text this was parsed from was read or inferred.
     ///
@@ -94,21 +111,25 @@ pub fn parse(name: &RawPath) -> Parsed {
         title: None,
         episode: Episode::Absent,
         season: None,
+        part: None,
         year: None,
         release_group: None,
         confidence: decoded.confidence,
     };
     let mut episodes = Vec::new();
+    let elements = anitomy_ng::parse(&decoded.text, Options::default());
+    let lost_part = part_lost_after_season(&decoded.text, &elements);
 
-    for element in anitomy_ng::parse(&decoded.text, Options::default()) {
-        // The first of a kind wins. The parser reports them in the order it
-        // found them, so the first is the leftmost, and a name carrying two of
+    for element in elements {
+        // The first of a kind wins. The parser sorts what it reports by
+        // position, so the first is the leftmost, and a name carrying two of
         // anything but an episode is a name this crate has no better rule for.
         match element.kind {
             ElementKind::Title if parsed.title.is_none() => parsed.title = Some(element.value),
             ElementKind::Season if parsed.season.is_none() => {
                 parsed.season = element.value.parse().ok();
             }
+            ElementKind::Part if parsed.part.is_none() => parsed.part = element.value.parse().ok(),
             ElementKind::Year if parsed.year.is_none() => parsed.year = element.value.parse().ok(),
             ElementKind::ReleaseGroup if parsed.release_group.is_none() => {
                 parsed.release_group = Some(element.value);
@@ -118,6 +139,7 @@ pub fn parse(name: &RawPath) -> Parsed {
             // Kept above, and reached here only where one was already found.
             ElementKind::Title
             | ElementKind::Season
+            | ElementKind::Part
             | ElementKind::Year
             | ElementKind::ReleaseGroup
 
@@ -130,7 +152,6 @@ pub fn parse(name: &RawPath) -> Parsed {
             | ElementKind::FileExtension
             | ElementKind::Language
             | ElementKind::Other
-            | ElementKind::Part
             | ElementKind::ReleaseInformation
             | ElementKind::ReleaseVersion
             | ElementKind::Source
@@ -147,7 +168,56 @@ pub fn parse(name: &RawPath) -> Parsed {
         [] => Episode::Absent,
         _ => Episode::Several,
     };
+    parsed.part = parsed.part.or(lost_part);
     parsed
+}
+
+/// A part the parser read past without reporting it anywhere.
+///
+/// Looked for only between the season element and the element after it. The
+/// parser loses one there because the title ends at the season marker and a
+/// bare `Part` counts upstream only inside brackets. `Part II` does not count
+/// even inside them, because the parser reads only digits after a `Part`.
+/// After the episode, a `Part` is part of the episode's own title, and the
+/// parser is right about that. A `Part` after a year or a resolution is lost
+/// the same way, as in `Show Title (2019) Part 2 - 03`, measured on
+/// 2026-09-21. Nothing here reads that one back.
+///
+/// Positions are counted in `char`s, read off the parser's tokenizer on
+/// 2026-09-21, so the text is cut by characters rather than by bytes.
+fn part_lost_after_season(text: &str, elements: &[Element]) -> Option<u32> {
+    let mut from_season = elements
+        .iter()
+        .skip_while(|element| element.kind != ElementKind::Season);
+    let start = from_season.next()?.position;
+    let end = from_season.next().map_or(usize::MAX, |next| next.position);
+    let between: String = text
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
+
+    let mut words = between
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty());
+    words.find(|word| word.eq_ignore_ascii_case("part"))?;
+    words.next().and_then(part_number)
+}
+
+/// The number a word after `Part` spells, in digits or in roman numerals.
+///
+/// A roman numeral is safe to read here in a way it is not in a title: after
+/// the word `Part` an `I` or a `V` cannot be anything else.
+fn part_number(word: &str) -> Option<u32> {
+    const NUMERALS: [&str; 10] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
+
+    word.parse().ok().or_else(|| {
+        NUMERALS
+            .iter()
+            .zip(1..)
+            .find(|(numeral, _)| numeral.eq_ignore_ascii_case(word))
+            .map(|(_, number)| number)
+    })
 }
 
 #[cfg(test)]
@@ -164,8 +234,7 @@ mod tests {
     #[test]
     fn a_release_group_and_a_checksum_are_taken_off_the_title() {
         // The ordinary case, and the one every other fixture is a variation of.
-        // The group is kept because the normaliser has to strip it from a
-        // corpus entry too; the checksum and the resolution are dropped, and
+        // The group is kept; the checksum and the resolution are dropped, and
         // nothing below here can see that they were ever present.
         let parsed = spelled("[SubsPlease] Show Title - 03 (1080p) [A1B2C3D4].mkv");
 
@@ -290,5 +359,89 @@ mod tests {
         let parsed = spelled("[Group] Show Title - 03v2.mkv");
 
         assert_eq!(parsed.episode, Episode::Only(3));
+    }
+
+    #[test]
+    fn a_part_the_parser_reports_is_kept() {
+        // `Cour 2` is a part the parser recognises on its own. AniList lists
+        // the second part of some seasons as an entry of its own, so a name
+        // that spells one has to say so.
+        let parsed = spelled("Show Title Season 2 Cour 2 - 03.mkv");
+
+        assert_eq!(parsed.season, Some(2));
+        assert_eq!(parsed.part, Some(2));
+    }
+
+    #[test]
+    fn a_part_after_a_season_is_found_where_the_parser_loses_it() {
+        // Measured on 2026-09-21: for every one of these the parser reports a
+        // title of `Show Title` and a season of three, and the part appears
+        // nowhere - in no element and not in the title. A bare `Part` counts
+        // upstream only inside brackets, and the title ends at the season, so
+        // what lies between the season and the episode belongs to nobody.
+        //
+        // Left there, a file of a season's second part would reach the list
+        // entry for its first.
+        for name in [
+            "Show Title Season 3 Part 2 - 03.mkv",
+            "Show Title S3 Part 2 - 03.mkv",
+            "Show Title 3rd Season Part 2 - 03.mkv",
+            "Show Title Season 3 - Part 2 - 03.mkv",
+            "Show Title Season 3 Part.2 - 03.mkv",
+            "Show Title Season 3 Part II - 03.mkv",
+        ] {
+            let parsed = spelled(name);
+
+            assert_eq!(parsed.title.as_deref(), Some("Show Title"), "{name}");
+            assert_eq!(parsed.season, Some(3), "{name}");
+            assert_eq!(parsed.part, Some(2), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_part_after_the_episode_names_the_episode_and_not_the_season() {
+        // What the parser is right to leave alone: after the episode number,
+        // `Part 1` is part of an episode's own title. Read as the season's
+        // part, it would report something the name did not say. A `Part 2` in
+        // its place would send the file to a list entry it does not belong to.
+        let parsed = spelled("Show Title Season 3 - 03 - The Comeback, Part 1.mkv");
+
+        assert_eq!(parsed.season, Some(3));
+        assert_eq!(parsed.part, None);
+    }
+
+    #[test]
+    fn a_part_inside_the_title_stays_in_the_title() {
+        // With no season in front of it, the parser keeps `Part 2` inside the
+        // title, measured on 2026-09-21. Nothing here reads it out. A list
+        // entry is text that never meets the parser, so the normaliser has to
+        // take a part out of a title's text anyway, and one place doing that
+        // is one rule where two would have to agree.
+        let parsed = spelled("Show Title Part 2 - 03.mkv");
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title Part 2"));
+        assert_eq!(parsed.part, None);
+    }
+
+    #[test]
+    fn a_first_part_is_reported_as_the_first() {
+        // What the name spelled, and nothing decided about it. Whether a first
+        // part is the same list entry as no part at all is the key's rule; the
+        // parse only reports that the name said `Part 1`.
+        let parsed = spelled("Show Title Season 3 Part 1 - 03.mkv");
+
+        assert_eq!(parsed.part, Some(1));
+    }
+
+    #[test]
+    fn a_part_is_found_behind_a_title_that_is_not_ascii() {
+        // The parser counts positions in `char`s, read off its tokenizer on
+        // 2026-09-21. A title in katakana is four characters and twelve bytes,
+        // so the text between the season and the episode is found only when it
+        // is cut by characters.
+        let parsed = spelled("ソレッタ Season 3 Part 2 - 03.mkv");
+
+        assert_eq!(parsed.season, Some(3));
+        assert_eq!(parsed.part, Some(2));
     }
 }
