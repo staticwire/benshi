@@ -14,13 +14,53 @@
 //! and that number is not carried here: inserting a stage renumbers every stage
 //! after it, while a name says what decided and does not move.
 
+pub mod altname;
 pub mod corpus;
 pub mod normalise;
 pub mod parse;
 
+use crate::recognise::altname::Altnames;
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::Key;
 use crate::recognise::parse::{Episode, Parsed};
+
+/// What the stages answer, in the order they are asked.
+///
+/// A name the user assigned by hand wins over a name the program worked out,
+/// and it wins where the program would have been right. Why the order is this
+/// one is written on [`Stage`].
+///
+/// Ends in a refusal rather than in a best guess. The stages that narrow and
+/// score are not written, so a name neither stage answers is refused here with
+/// nothing to compare against; where the name spelled no title at all, the
+/// refusal names nothing, because there is nothing it could name.
+#[must_use]
+pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus) -> Recognition {
+    by_altname(parsed, altnames)
+        .map(Recognition::Recognised)
+        .or_else(|| by_key(parsed, corpus))
+        .unwrap_or_else(|| {
+            Recognition::Unrecognised(Refusal {
+                parsed: parsed.title.clone().unwrap_or_default(),
+                best: None,
+            })
+        })
+}
+
+/// The entry the user named this file's spelling, where they named one.
+///
+/// A [`Match`] rather than a [`Recognition`]: this stage cannot be ambiguous,
+/// because one key names one entry, and it has no standing to refuse - a
+/// refusal is a fact about the corpus, and this stage never looked at one.
+#[must_use]
+pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
+    let title = altnames.titled(&Key::from_parsed(parsed)?)?;
+    Some(Match {
+        title: title.to_owned(),
+        episode: parsed.episode,
+        stage: Stage::Altname,
+    })
+}
 
 /// What an exact match on the normalised key answers, where it answers at all.
 ///
@@ -199,8 +239,9 @@ pub enum Recognition {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ambiguity, Match, Recognition, Refusal, Score, Stage, by_key};
+    use super::{Ambiguity, Match, Recognition, Refusal, Score, Stage, by_key, decide};
     use crate::path::RawPath;
+    use crate::recognise::altname::Altnames;
     use crate::recognise::corpus::Corpus;
     use crate::recognise::parse::{Episode, Parsed, parse};
 
@@ -421,6 +462,105 @@ mod tests {
         assert_eq!(
             found("Gokushufudou S2 - 03.mkv", &corpus),
             Some(recognised("Gokushufudou Season 2", Episode::Only(3)))
+        );
+    }
+
+    #[test]
+    fn a_name_the_user_gave_outranks_what_the_corpus_answers() {
+        // The discriminating half: the corpus is asked the same name and
+        // answers something else, so the assignment is not a fallback for
+        // where nothing matched. Two entries a filename cannot tell apart are
+        // what a person settles by hand, and the answer names the stage that
+        // decided it.
+        let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
+        let mut altnames = Altnames::new();
+        altnames
+            .name("Nisekoi", "Nisekoi:", &corpus)
+            .expect("two entries under one key are the user's to settle");
+
+        assert_eq!(
+            decide(&named("Nisekoi - 03.mkv"), &altnames, &corpus),
+            Recognition::Recognised(Match {
+                title: "Nisekoi:".to_owned(),
+                episode: Episode::Only(3),
+                stage: Stage::Altname,
+            })
+        );
+        assert_eq!(
+            by_key(&named("Nisekoi - 03.mkv"), &corpus),
+            Some(Recognition::Ambiguous(Ambiguity {
+                parsed: "Nisekoi".to_owned(),
+                candidates: vec!["Nisekoi".to_owned(), "Nisekoi:".to_owned()],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_file_the_user_named_is_found_by_what_that_file_spelled() {
+        // The parser takes `S03` out of the title, so the season is in the
+        // file's key and in no text the file leaves behind. A stage looking an
+        // assignment up by the title alone would miss the file it was made for
+        // and catch the season before it, where the corpus was already right.
+        let corpus: Corpus = [
+            "Kaguya-sama: Love is War",
+            "Kaguya-sama: Love is War -Ultra Romantic-",
+        ]
+        .into_iter()
+        .collect();
+        let third = named("Kaguya-sama.Love.is.War.S03E03.1080p.WEB-DL.mkv");
+        let mut altnames = Altnames::new();
+        altnames
+            .name_as_parsed(&third, "Kaguya-sama: Love is War -Ultra Romantic-", &corpus)
+            .expect("the third season reaches no entry, so naming it takes nothing");
+
+        assert_eq!(
+            decide(&third, &altnames, &corpus),
+            Recognition::Recognised(Match {
+                title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
+                episode: Episode::Only(3),
+                stage: Stage::Altname,
+            })
+        );
+        assert_eq!(
+            decide(
+                &named("Kaguya-sama.Love.is.War.S01E03.1080p.WEB-DL.mkv"),
+                &altnames,
+                &corpus
+            ),
+            recognised("Kaguya-sama: Love is War", Episode::Only(3))
+        );
+    }
+
+    #[test]
+    fn a_name_nobody_assigned_is_left_to_the_corpus() {
+        // The other direction, and what stops stage one from swallowing
+        // everything: a name nobody named reaches the stage below unchanged,
+        // and the answer says which stage decided.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(
+            decide(&named("Show Title - 03.mkv"), &Altnames::new(), &corpus),
+            recognised("Show Title", Episode::Only(3))
+        );
+    }
+
+    #[test]
+    fn a_name_no_stage_answered_is_refused_rather_than_guessed_at() {
+        // The sequence ends in a refusal. Nothing below it may read that as a
+        // title, which is why it is a variant of its own carrying what the
+        // name spelled and no candidate at all.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(
+            decide(
+                &named("Some Other Show - 03.mkv"),
+                &Altnames::new(),
+                &corpus
+            ),
+            Recognition::Unrecognised(Refusal {
+                parsed: "Some Other Show".to_owned(),
+                best: None,
+            })
         );
     }
 
