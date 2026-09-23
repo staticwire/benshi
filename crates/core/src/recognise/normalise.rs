@@ -97,6 +97,24 @@ impl Key {
         )
     }
 
+    /// The marks the title ended in, which are the one thing a lookup widens
+    /// over.
+    pub(super) fn marks(&self) -> &str {
+        &self.marks
+    }
+
+    /// The same key with nothing after its last letter.
+    ///
+    /// Spellings that differ only in the marks they end in reach the same one
+    /// of these, so a name that lost its marks still reaches the entries that
+    /// carry them.
+    pub(super) fn without_marks(&self) -> Self {
+        Self {
+            marks: String::new(),
+            ..self.clone()
+        }
+    }
+
     fn new(letters: String, marks: String, season: Option<u32>, part: Option<u32>) -> Option<Self> {
         let not_the_first = |number: &u32| *number != 1;
         (!letters.is_empty()).then(|| Self {
