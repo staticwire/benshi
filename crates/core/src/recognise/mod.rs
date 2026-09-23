@@ -6,16 +6,52 @@
 //! decides nothing - it hands candidates to the scorer - so [`Stage`] has three
 //! variants and not four. Why they run in that order is written on [`Stage`].
 //!
-//! Nothing here computes a recognition yet. The answer is defined first so that
-//! every stage below is written against a shape that already has to explain
-//! itself, which is the same order the timeline was built in.
+//! The answer is defined for every stage, so that each one is written against a
+//! shape that already has to explain itself. [`by_key`] is the only stage here
+//! that computes one.
 //!
 //! **A stage is named rather than numbered.** The criteria speak of "stage one",
 //! and that number is not carried here: inserting a stage renumbers every stage
 //! after it, while a name says what decided and does not move.
 
+pub mod corpus;
 pub mod normalise;
 pub mod parse;
+
+use crate::recognise::corpus::Corpus;
+use crate::recognise::normalise::Key;
+use crate::recognise::parse::{Episode, Parsed};
+
+/// What an exact match on the normalised key answers, where it answers at all.
+///
+/// Nothing where the name reaches no entry: an exact key hits or misses, and a
+/// name that misses is what the stages below are for. A refusal is the whole
+/// sequence's answer rather than this stage's, so nothing here says a name was
+/// not recognised - only that this stage did not recognise it.
+///
+/// Several entries under one key is an answer, and the answer is that the name
+/// does not say. Two list entries share a key honestly - a remake spelled like
+/// its original, a season told from the one before it by a mark a filename
+/// cannot carry - and picking whichever was filed first writes progress against
+/// a title nobody named.
+#[must_use]
+pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
+    let spelled = parsed.title.as_deref()?;
+    let candidates = corpus.candidates(&Key::from_parsed(parsed)?);
+
+    match candidates.as_slice() {
+        [] => None,
+        [title] => Some(Recognition::Recognised(Match {
+            title: (*title).to_owned(),
+            episode: parsed.episode,
+            stage: Stage::Key,
+        })),
+        several => Some(Recognition::Ambiguous(Ambiguity {
+            parsed: spelled.to_owned(),
+            candidates: several.iter().map(|title| (*title).to_owned()).collect(),
+        })),
+    }
+}
 
 /// How well a candidate title matched, from nothing to exactly.
 ///
@@ -79,15 +115,22 @@ pub enum Stage {
 pub struct Match {
     /// The title as the corpus spells it.
     pub title: String,
-    /// The episode in the release's numbering, where the name carried one.
+    /// The episode in the release's numbering, exactly as the name spelled it.
     ///
-    /// [`Option`] and not [`Known`](crate::Known), which is the one place in
-    /// this workspace the difference has to be argued rather than assumed.
-    /// `Known` exists because a source that *cannot* report a value and one that
-    /// did not report it are different facts about that source. A filename is
-    /// not a source and declares no capabilities, so the third case would have
-    /// nothing to mean, and a name either spells an episode or does not.
-    pub episode: Option<u32>,
+    /// The parser's four answers travel here whole, because this is what a
+    /// consumer reads and the four lead different places. A film spells none
+    /// and can be marked watched; a file holding twelve episodes spells several
+    /// and is neither the first nor the twelfth. Reduced to a number and an
+    /// absence, the two would arrive alike, and a file of twelve episodes would
+    /// mark the series watched.
+    ///
+    /// Not [`Known`](crate::Known), and this is the one place in the workspace
+    /// the difference has to be argued rather than assumed. `Known` exists
+    /// because a source that *cannot* report a value and one that did not
+    /// report it are different facts about that source. A filename is not a
+    /// source and declares no capabilities, so the third case would have
+    /// nothing to mean.
+    pub episode: Episode,
     /// Which stage decided, and how well where it scored.
     pub stage: Stage,
 }
@@ -112,11 +155,39 @@ pub struct Refusal {
     pub best: Option<Score>,
 }
 
+/// Several entries one name reaches, and none of them chosen.
+///
+/// Apart from a [`Refusal`] because the two send a reader to different places.
+/// A refusal says the corpus was searched and nothing in it was the title; an
+/// ambiguity says the corpus holds the title more than once and the name does
+/// not say which. What settles it is the entries' own data - a format, an
+/// episode count, a date - which is the list's to answer and not the text's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ambiguity {
+    /// The title as the filename spelled it.
+    pub parsed: String,
+    /// The entries it reaches, as the corpus spells them, in the order the
+    /// corpus filed them.
+    ///
+    /// More than one wherever [`by_key`] built it: one candidate is a [`Match`]
+    /// and none is no ambiguity at all. Reserved rather than enforced, as
+    /// [`Refusal::best`] is - the field is public and nothing here refuses a
+    /// shorter list.
+    pub candidates: Vec<String>,
+}
+
 /// What recognition answers with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Recognition {
     /// A title, and the stage that decided it.
     Recognised(Match),
+    /// Several titles, and nothing in the name to choose between them.
+    ///
+    /// A variant of its own rather than a refusal carrying a list, because a
+    /// consumer that treats it as a refusal loses the one thing that makes it
+    /// answerable later, and a consumer that treats it as a match has to invent
+    /// which candidate it meant.
+    Ambiguous(Ambiguity),
     /// Nothing matched, and why.
     ///
     /// A variant rather than an `Err`, because an unrecognised filename is a
@@ -128,11 +199,34 @@ pub enum Recognition {
 
 #[cfg(test)]
 mod tests {
-    use super::{Match, Recognition, Refusal, Score, Stage};
+    use super::{Ambiguity, Match, Recognition, Refusal, Score, Stage, by_key};
+    use crate::path::RawPath;
+    use crate::recognise::corpus::Corpus;
+    use crate::recognise::parse::{Episode, Parsed, parse};
 
     /// A score the tests use where the exact value is not the point.
     fn a_score(value: f64) -> Score {
         Score::new(value).expect("the value is between nought and one")
+    }
+
+    /// What a file of this name spells, so that a test names a file rather
+    /// than building the parse by hand.
+    fn named(name: &str) -> Parsed {
+        parse(&RawPath::from_bytes(name.as_bytes().to_vec()))
+    }
+
+    /// The answer stage two gives a file of this name against this corpus.
+    fn found(name: &str, corpus: &Corpus) -> Option<Recognition> {
+        by_key(&named(name), corpus)
+    }
+
+    /// A recognition of this title by this stage, for comparing against.
+    fn recognised(title: &str, episode: Episode) -> Recognition {
+        Recognition::Recognised(Match {
+            title: title.to_owned(),
+            episode,
+            stage: Stage::Key,
+        })
     }
 
     #[test]
@@ -144,7 +238,7 @@ mod tests {
         // was. The two travel together or neither is worth printing.
         let scored = Recognition::Recognised(Match {
             title: "Show".to_owned(),
-            episode: Some(3),
+            episode: Episode::Only(3),
             stage: Stage::Scored(a_score(0.91)),
         });
 
@@ -176,17 +270,21 @@ mod tests {
         // would have to know it meant absence - the sentinel this workspace
         // refuses everywhere else.
         //
-        // `Option` and not `Known`, deliberately. `Known` exists because a
-        // source that cannot report a value and one that did not report it are
-        // different facts. A filename is not a source and declares no
-        // capabilities, so the third case would have nothing to mean.
+        // A film and a batch are apart here as well, which is why the parser's
+        // own answer is carried rather than a number that may be missing: a
+        // film can be marked watched and a file of twelve episodes cannot.
         let film = Match {
             title: "A Film".to_owned(),
-            episode: None,
+            episode: Episode::Absent,
             stage: Stage::Key,
         };
+        let batch = Match {
+            episode: Episode::Several,
+            ..film.clone()
+        };
 
-        assert_eq!(film.episode, None);
+        assert_eq!(film.episode, Episode::Absent);
+        assert_ne!(film.episode, batch.episode);
     }
 
     #[test]
@@ -239,5 +337,103 @@ mod tests {
         // back unchanged, which is what bit equality says and what an epsilon
         // would only approximate.
         assert_eq!(a_score(0.5).value().to_bits(), 0.5_f64.to_bits());
+    }
+
+    #[test]
+    fn a_name_one_entry_is_filed_under_names_it_and_the_stage_that_found_it() {
+        // The release group, the resolution and the episode are all off the
+        // name before the key is built, so what is compared is the title
+        // alone, and the answer names the entry rather than the text.
+        let corpus: Corpus = ["Show Title", "Another Show"].into_iter().collect();
+
+        assert_eq!(
+            found("[Group] Show Title - 03 [1080p].mkv", &corpus),
+            Some(recognised("Show Title", Episode::Only(3)))
+        );
+    }
+
+    #[test]
+    fn two_entries_under_one_key_are_reported_rather_than_chosen() {
+        // A remake spelled like its original, told apart on the list by a year
+        // the key drops because the parser reports a year apart from the
+        // title. Answering the first entry filed would write a season of one
+        // show against the other, and nothing in the name says which is meant.
+        let corpus: Corpus = ["Fruits Basket", "Fruits Basket (2019)"]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            found("Fruits Basket - 01.mkv", &corpus),
+            Some(Recognition::Ambiguous(Ambiguity {
+                parsed: "Fruits Basket".to_owned(),
+                candidates: vec![
+                    "Fruits Basket".to_owned(),
+                    "Fruits Basket (2019)".to_owned()
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_name_no_entry_is_filed_under_leaves_the_answer_to_the_stages_below() {
+        // Not a refusal. An exact key hits or misses, and a name the parser
+        // shortened or a list spells differently misses it while still being
+        // recognisable further down, so this stage says nothing rather than
+        // saying no.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(found("Some Other Show - 03.mkv", &corpus), None);
+    }
+
+    #[test]
+    fn a_mark_the_name_keeps_chooses_between_two_seasons() {
+        // End to end, and the reason the marks are in the key at all. A colon
+        // is the whole difference between these two entries: the file that
+        // kept it names one, and the file that lost it names neither.
+        let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
+
+        assert_eq!(
+            found("Nisekoi: - 03.mkv", &corpus),
+            Some(recognised("Nisekoi:", Episode::Only(3)))
+        );
+        assert_eq!(
+            found("Nisekoi - 03.mkv", &corpus),
+            Some(Recognition::Ambiguous(Ambiguity {
+                parsed: "Nisekoi".to_owned(),
+                candidates: vec!["Nisekoi".to_owned(), "Nisekoi:".to_owned()],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_part_is_not_the_season_of_the_same_number() {
+        // Both are entries of their own on a list, the part being half of the
+        // first season and the season being the whole of the second. A name
+        // abbreviating the season reaches the season alone.
+        let corpus: Corpus = [
+            "Gokushufudou",
+            "Gokushufudou Part 2",
+            "Gokushufudou Season 2",
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            found("Gokushufudou S2 - 03.mkv", &corpus),
+            Some(recognised("Gokushufudou Season 2", Episode::Only(3)))
+        );
+    }
+
+    #[test]
+    fn a_file_of_several_episodes_names_its_title_and_none_of_them() {
+        // The title was recognised and the episode was not, which is one
+        // answer rather than two. A batch reduced to no episode would arrive
+        // looking like a film, and a consumer would mark the series watched.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(
+            found("[Group] Show Title 01-12 [BD].mkv", &corpus),
+            Some(recognised("Show Title", Episode::Several))
+        );
     }
 }
