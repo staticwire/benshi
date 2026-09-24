@@ -143,21 +143,7 @@ struct Spelled {
 
 impl Spelled {
     fn read(title: &str, reported: Reported) -> Self {
-        let text: String = title
-            .nfkc()
-            .map(|c| if c == '×' { 'x' } else { c })
-            .collect();
-        let mut text = without_markers(&text);
-        let part = if reported.part {
-            None
-        } else {
-            take(&mut text, part_at)
-        };
-        let season = if reported.season {
-            None
-        } else {
-            take(&mut text, season_at).or_else(|| take_ending_numeral(&mut text))
-        };
+        let (text, season, part) = Self::strip(title, reported);
 
         let name_end = text
             .char_indices()
@@ -179,6 +165,51 @@ impl Spelled {
             part,
         }
     }
+
+    /// The text with everything a key forgives taken out of it, and the season
+    /// and the part it spelled.
+    ///
+    /// Everything but the last step of building a key, which is what lets the
+    /// words of a title be read by the same rules the key is built with. The
+    /// key goes on to throw the word breaks away, so that `Fate/Zero` and
+    /// `Fate Zero` reach one key; the words cannot be cut out of it again.
+    fn strip(title: &str, reported: Reported) -> (String, Option<u32>, Option<u32>) {
+        let text: String = title
+            .nfkc()
+            .map(|c| if c == '×' { 'x' } else { c })
+            .collect();
+        let mut text = without_markers(&text);
+        let part = if reported.part {
+            None
+        } else {
+            take(&mut text, part_at)
+        };
+        let season = if reported.season {
+            None
+        } else {
+            take(&mut text, season_at).or_else(|| take_ending_numeral(&mut text))
+        };
+        (text, season, part)
+    }
+}
+
+/// The words a title spells, in the form the key would have compared them in.
+///
+/// Case, width, a year, a bracketed type, and the way a season or a part is
+/// spelled are all gone, because each of them is a thing one side writes and
+/// the other does not. What is left is cut on anything that is not a letter or
+/// a digit, so `Fate/Zero` spells `fate` and `zero`.
+///
+/// Empty where the title spells no letters at all, which is the same answer
+/// [`Key::from_title`] gives such a title.
+#[must_use]
+pub fn words_in(title: &str) -> Vec<String> {
+    let (text, _, _) = Spelled::strip(title, Reported::default());
+    text.to_lowercase()
+        .split(|c| !is_letter(c))
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The part a stretch of text spells, in any form a title's part is read in.
@@ -581,7 +612,7 @@ fn ordinal(word: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::Key;
+    use super::{Key, words_in};
     use crate::encoding::Confidence;
     use crate::path::RawPath;
     use crate::recognise::parse::{Episode, Parsed, parse};
@@ -1068,5 +1099,16 @@ mod tests {
             named("[Group] Show Title: - 03 [1080p].mkv"),
             listed("Show Title")
         );
+    }
+
+    #[test]
+    fn a_title_spells_the_words_its_key_would_have_compared() {
+        // One step before the key runs the letters together: everything a key
+        // forgives is gone from the words as well, and the breaks a key erases
+        // are what is left to cut on.
+        assert_eq!(words_in("Fate/Zero"), ["fate", "zero"]);
+        assert_eq!(words_in("ＳＨＯＷ　Title (2019)"), ["show", "title"]);
+        assert_eq!(words_in("Show Title (TV) 2nd Season"), ["show", "title"]);
+        assert!(words_in("(2019)").is_empty());
     }
 }

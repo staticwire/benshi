@@ -16,6 +16,7 @@
 
 pub mod altname;
 pub mod corpus;
+pub mod index;
 pub mod normalise;
 pub mod parse;
 
