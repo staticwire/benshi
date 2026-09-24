@@ -42,6 +42,10 @@ struct Filed {
     /// The marks that spelling ended in, which is all the bucket does not
     /// already hold.
     marks: String,
+    /// The spelling itself, which the key cannot be read back into: a key
+    /// erases the breaks between words, and a stage that compares words needs
+    /// them.
+    spelled: String,
     /// The entry's title, which is what an answer names.
     title: String,
 }
@@ -74,8 +78,20 @@ impl Corpus {
             .or_default()
             .push(Filed {
                 marks: key.marks().to_owned(),
+                spelled: spelling.to_owned(),
                 title: title.to_owned(),
             });
+    }
+
+    /// Every spelling filed, with the entry it belongs to.
+    ///
+    /// For the stage that compares words rather than keys, so that one corpus
+    /// answers both and the two cannot be filed differently.
+    pub(super) fn spellings(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.filed
+            .values()
+            .flatten()
+            .map(|filed| (filed.spelled.as_str(), filed.title.as_str()))
     }
 
     /// The entries a key reaches, in the order they were filed.
