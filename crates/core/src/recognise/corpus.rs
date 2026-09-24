@@ -83,6 +83,25 @@ impl Corpus {
             });
     }
 
+    /// Every spelling one entry is filed under.
+    ///
+    /// For the stage that compares an entry against a name word by word: an
+    /// entry filed under romaji, English and native spellings meets the name on
+    /// whichever of them is closest, and the title it answers with is not
+    /// necessarily the one that matched.
+    pub(super) fn spellings_of(&self, title: &str) -> Vec<&str> {
+        let mut found: Vec<&str> = self
+            .spellings()
+            .filter(|(_, filed)| *filed == title)
+            .map(|(spelled, _)| spelled)
+            .collect();
+        // Sorted for the same reason the index sorts: these come out of a hash
+        // map, and a caller choosing between two of them that score alike
+        // would choose differently between two runs of one program.
+        found.sort_unstable();
+        found
+    }
+
     /// Every spelling filed, with the entry it belongs to.
     ///
     /// For the stage that compares words rather than keys, so that one corpus
@@ -224,6 +243,20 @@ mod tests {
         assert_eq!(
             corpus.candidates(&listed("Show Title")),
             ["Show Title", "Show Title!"]
+        );
+    }
+
+    #[test]
+    fn an_entry_hands_over_its_spellings_in_one_order() {
+        // A bucket comes out of a hash map, so what is filed under one entry
+        // arrives in no particular order. A stage picking between spellings
+        // that score alike would pick differently between two runs.
+        let mut corpus = Corpus::new();
+        corpus.file("Show Title", ["Zeta Spelling", "Alpha Spelling"]);
+
+        assert_eq!(
+            corpus.spellings_of("Show Title"),
+            ["Alpha Spelling", "Show Title", "Zeta Spelling"]
         );
     }
 

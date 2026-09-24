@@ -19,11 +19,14 @@ pub mod corpus;
 pub mod index;
 pub mod normalise;
 pub mod parse;
+pub mod score;
 
 use crate::recognise::altname::Altnames;
 use crate::recognise::corpus::Corpus;
+use crate::recognise::index::Index;
 use crate::recognise::normalise::Key;
 use crate::recognise::parse::{Episode, Parsed};
+use crate::recognise::score::by_score;
 
 /// What the stages answer, in the order they are asked.
 ///
@@ -31,15 +34,19 @@ use crate::recognise::parse::{Episode, Parsed};
 /// and it wins where the program would have been right. Why the order is this
 /// one is written on [`Stage`].
 ///
-/// Ends in a refusal rather than in a best guess. The stages that narrow and
-/// score are not written, so a name neither stage answers is refused here with
-/// nothing to compare against; where the name spelled no title at all, the
-/// refusal names nothing, because there is nothing it could name.
+/// Ends in a refusal rather than in a best guess. Where the name spelled no
+/// title at all, the refusal names nothing, because there is nothing it could
+/// name. It carries no score: the scorer knows how close the best candidate
+/// came and this does not ask it.
 #[must_use]
-pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus) -> Recognition {
+pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Index) -> Recognition {
     by_altname(parsed, altnames)
         .map(Recognition::Recognised)
         .or_else(|| by_key(parsed, corpus))
+        .or_else(|| {
+            let candidates = index.candidates(parsed.title.as_deref()?);
+            by_score(parsed, &candidates, corpus).map(Recognition::Recognised)
+        })
         .unwrap_or_else(|| {
             Recognition::Unrecognised(Refusal {
                 parsed: parsed.title.clone().unwrap_or_default(),
@@ -192,7 +199,8 @@ pub struct Refusal {
     /// points at the corpus; a low score says the corpus was searched and
     /// nothing in it was close, which points at the name or at a missing entry.
     /// Reserved rather than enforced: nothing here can stop a caller writing
-    /// `None` after scoring, and the stage that will honour it is not written.
+    /// `None` after scoring, and [`decide`] writes `None` whatever the scorer
+    /// found.
     pub best: Option<Score>,
 }
 
@@ -244,6 +252,7 @@ mod tests {
     use crate::path::RawPath;
     use crate::recognise::altname::Altnames;
     use crate::recognise::corpus::Corpus;
+    use crate::recognise::index::Index;
     use crate::recognise::parse::{Episode, Parsed, parse};
 
     /// A score the tests use where the exact value is not the point.
@@ -480,7 +489,12 @@ mod tests {
             .expect("two entries under one key are the user's to settle");
 
         assert_eq!(
-            decide(&named("Nisekoi - 03.mkv"), &altnames, &corpus),
+            decide(
+                &named("Nisekoi - 03.mkv"),
+                &altnames,
+                &corpus,
+                &Index::of(&corpus)
+            ),
             Recognition::Recognised(Match {
                 title: "Nisekoi:".to_owned(),
                 episode: Episode::Only(3),
@@ -515,7 +529,7 @@ mod tests {
             .expect("the third season reaches no entry, so naming it takes nothing");
 
         assert_eq!(
-            decide(&third, &altnames, &corpus),
+            decide(&third, &altnames, &corpus, &Index::of(&corpus)),
             Recognition::Recognised(Match {
                 title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 episode: Episode::Only(3),
@@ -526,7 +540,8 @@ mod tests {
             decide(
                 &named("Kaguya-sama.Love.is.War.S01E03.1080p.WEB-DL.mkv"),
                 &altnames,
-                &corpus
+                &corpus,
+                &Index::of(&corpus)
             ),
             recognised("Kaguya-sama: Love is War", Episode::Only(3))
         );
@@ -540,7 +555,12 @@ mod tests {
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
         assert_eq!(
-            decide(&named("Show Title - 03.mkv"), &Altnames::new(), &corpus),
+            decide(
+                &named("Show Title - 03.mkv"),
+                &Altnames::new(),
+                &corpus,
+                &Index::of(&corpus)
+            ),
             recognised("Show Title", Episode::Only(3))
         );
     }
@@ -556,7 +576,8 @@ mod tests {
             decide(
                 &named("Some Other Show - 03.mkv"),
                 &Altnames::new(),
-                &corpus
+                &corpus,
+                &Index::of(&corpus)
             ),
             Recognition::Unrecognised(Refusal {
                 parsed: "Some Other Show".to_owned(),
