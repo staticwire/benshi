@@ -1011,6 +1011,7 @@ mod tests {
             year: None,
             release_group: Some("Group".to_owned()),
             confidence: Confidence::Certain,
+            text: String::new(),
         };
 
         assert_eq!(Key::from_parsed(&nothing), None);
@@ -1082,6 +1083,7 @@ mod tests {
             year: None,
             release_group: None,
             confidence: Confidence::Certain,
+            text: String::new(),
         };
         assert_eq!(
             Key::from_parsed(&reported),

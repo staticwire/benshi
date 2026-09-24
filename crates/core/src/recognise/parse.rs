@@ -97,6 +97,21 @@ pub struct Parsed {
     /// is a weaker input than one that could not have been anything else. The
     /// fact travels with the parse so that an explanation can give it.
     pub confidence: Confidence,
+    /// The name with everything the parser could name as noise struck out.
+    ///
+    /// **What a stage comparing text is given, and it is not
+    /// [`title`](Parsed::title).** A title ends at the first thing the parser
+    /// recognises, so a name spelling `Show Title - The Subtitle - 03` reports
+    /// a title of `Show Title` and the subtitle belongs to no element at all.
+    /// A stage reading the title alone cannot tell such a file from the series
+    /// it extends. What is struck out is the release group, the episode, the
+    /// season, the part, the year, the resolution, the source, the extension
+    /// and the rest of the release's own vocabulary - everything a list never
+    /// spells, and nothing a name might be.
+    ///
+    /// A space is left wherever something was struck out, so that the words on
+    /// either side of it stay two words.
+    pub text: String,
 }
 
 /// Read a filename for what it says about the media.
@@ -115,11 +130,13 @@ pub fn parse(name: &RawPath) -> Parsed {
         year: None,
         release_group: None,
         confidence: decoded.confidence,
+        text: String::new(),
     };
     let mut episodes = Vec::new();
     let elements = anitomy_ng::parse(&decoded.text, Options::default());
     let lost_part = part_lost_after_season(&decoded.text, &elements);
     let cut_marks = marks_cut_off_the_title(&decoded.text, &elements);
+    parsed.text = without_the_release(&decoded.text, &elements);
 
     for element in elements {
         // The first of a kind wins. The parser sorts what it reports by
@@ -245,6 +262,35 @@ fn part_lost_after_season(text: &str, elements: &[Element]) -> Option<u32> {
     part_in(&between)
 }
 
+/// The name with everything the release itself spells struck out.
+///
+/// Kept: the title, an episode title, and anything the parser could not place,
+/// which is where a subtitle beyond the end of the title ends up. Struck out:
+/// every other kind, because a list entry never spells a resolution, a group or
+/// an episode number, and counting them would tell against every candidate
+/// alike.
+///
+/// What goes is replaced by a space rather than removed, so that two words
+/// which were apart stay apart. Positions come from the parser and are counted
+/// in `char`s.
+fn without_the_release(text: &str, elements: &[Element]) -> String {
+    let mut kept: Vec<char> = text.chars().collect();
+    for element in elements {
+        if matches!(
+            element.kind,
+            ElementKind::Title | ElementKind::EpisodeTitle | ElementKind::Other
+        ) {
+            continue;
+        }
+        let from = element.position.min(kept.len());
+        let upto = (from + element.value.chars().count()).min(kept.len());
+        for slot in &mut kept[from..upto] {
+            *slot = ' ';
+        }
+    }
+    kept.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Episode, Parsed, parse};
@@ -254,6 +300,30 @@ mod tests {
     /// Parse a name given as text, which is what every fixture here is.
     fn spelled(name: &str) -> Parsed {
         parse(&RawPath::from_bytes(name.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn the_release_is_struck_out_of_the_text_a_stage_compares() {
+        // A title ends at the first thing the parser recognises, so a subtitle
+        // beyond it belongs to no element at all and a stage reading the title
+        // alone cannot tell this file from the series it extends. What the
+        // release itself spells goes, because no list entry spells any of it.
+        let parsed =
+            spelled("[SubsPlease] Show Title Cour 2 - The Subtitle - 03 (1080p) [A1B2C3D4].mkv");
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert!(
+            parsed.text.contains("Subtitle"),
+            "the subtitle is gone: {:?}",
+            parsed.text
+        );
+        for noise in ["SubsPlease", "1080p", "A1B2C3D4", "mkv"] {
+            assert!(
+                !parsed.text.contains(noise),
+                "{noise} is still in {:?}",
+                parsed.text
+            );
+        }
     }
 
     #[test]
