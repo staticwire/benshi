@@ -1,7 +1,9 @@
 //! Which of a handful of candidates the name is about, where one stands out.
 //!
 //! Stage four, and the last that can answer. It is given the candidates stage
-//! three narrowed to and decides between them, or decides that it cannot.
+//! three narrowed to and decides between them, or decides that it cannot, and
+//! that second answer is the sequence's refusal: it says how close the best
+//! candidate came and never which candidate it was.
 //!
 //! **The text it scores is the whole name**, through
 //! [`Parsed::text`](super::parse::Parsed::text), which is the filename with the
@@ -42,7 +44,7 @@ use std::collections::HashSet;
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::words_in;
 use crate::recognise::parse::Parsed;
-use crate::recognise::{Match, Score, Stage};
+use crate::recognise::{Match, Recognition, Refusal, Score, Stage};
 
 /// How many words a comparison has to spell before the ordinary margin applies.
 ///
@@ -90,44 +92,55 @@ pub fn alike(name: &[String], spelling: &[String]) -> Score {
 
 /// The entry a name is about, where one candidate stands out from the next.
 ///
-/// Nothing where the best two run level: entries of one franchise score alike
-/// against a name carrying the franchise's words, and picking the higher of two
-/// that are neck and neck is guessing.
+/// A refusal where the best two run level: entries of one franchise score
+/// alike against a name carrying the franchise's words, and picking the higher
+/// of two that are neck and neck is guessing. No stage runs after this one, so
+/// its refusal is the sequence's, and it carries how close the best candidate
+/// came rather than which it was: a near miss travels as a score, and nothing
+/// downstream can read it as a title. Where there was no candidate to score,
+/// the refusal carries no score at all.
 #[must_use]
-pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Option<Match> {
+pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Recognition {
     let name = words_in(&parsed.text);
-    let mut judged: Vec<(f64, usize, &str)> = candidates
+    let mut judged: Vec<(Score, usize, &str)> = candidates
         .iter()
-        .map(|title| {
+        .filter_map(|title| {
             let (score, words) = corpus
                 .spellings_of(title)
                 .into_iter()
                 .map(|spelling| {
                     let spelled = words_in(spelling);
-                    (alike(&name, &spelled).value(), spelled.len())
+                    (alike(&name, &spelled), spelled.len())
                 })
-                .max_by(|one, other| one.0.total_cmp(&other.0))
-                .unwrap_or((0.0, 0));
-            (score, words, *title)
+                .max_by(|one, other| one.0.value().total_cmp(&other.0.value()))?;
+            Some((score, words, *title))
         })
         .collect();
     // Stable, so candidates that score alike keep the order they arrived in.
-    judged.sort_by(|one, other| other.0.total_cmp(&one.0));
+    judged.sort_by(|one, other| other.0.value().total_cmp(&one.0.value()));
 
-    let &(best, words, title) = judged.first()?;
-    let runner_up = judged.get(1).map_or(0.0, |&(score, ..)| score);
+    let refused = |best| {
+        Recognition::Unrecognised(Refusal {
+            parsed: parsed.title.clone().unwrap_or_default(),
+            best,
+        })
+    };
+    let Some(&(best, words, title)) = judged.first() else {
+        return refused(None);
+    };
+    let runner_up = judged.get(1).map_or(0.0, |&(score, ..)| score.value());
     let ahead = if words.min(name.len()) < SHORT {
         AHEAD_SHORT
     } else {
         AHEAD
     };
-    if best < NEAR_ENOUGH || best - runner_up < ahead {
-        return None;
+    if best.value() < NEAR_ENOUGH || best.value() - runner_up < ahead {
+        return refused(Some(best));
     }
-    Some(Match {
+    Recognition::Recognised(Match {
         title: title.to_owned(),
         episode: parsed.episode,
-        stage: Stage::Scored(Score::new(best)?),
+        stage: Stage::Scored(best),
     })
 }
 
@@ -135,14 +148,27 @@ pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Option
 mod tests {
     use super::{NEAR_ENOUGH, alike, by_score};
     use crate::path::RawPath;
-    use crate::recognise::Stage;
     use crate::recognise::corpus::Corpus;
     use crate::recognise::normalise::words_in;
     use crate::recognise::parse::{Episode, parse};
+    use crate::recognise::{Match, Recognition, Refusal, Score, Stage};
 
     /// What a file of this name spells.
     fn named(name: &str) -> crate::recognise::parse::Parsed {
         parse(&RawPath::from_bytes(name.as_bytes().to_vec()))
+    }
+
+    /// A score the tests use where the exact value is not the point.
+    fn a_score(value: f64) -> Score {
+        Score::new(value).expect("the value is between nought and one")
+    }
+
+    /// The match an answer carries, where the test says it has to be one.
+    fn answered(answer: Recognition, must: &str) -> Match {
+        match answer {
+            Recognition::Recognised(found) => found,
+            refused => panic!("{must}, got {refused:?}"),
+        }
     }
 
     #[test]
@@ -168,9 +194,12 @@ mod tests {
             &long,
         );
 
-        assert_eq!(by_the_short, None, "a two-word entry needs a wider win");
         assert!(
-            by_the_long.is_some(),
+            matches!(by_the_short, Recognition::Unrecognised(_)),
+            "a two-word entry needs a wider win"
+        );
+        assert!(
+            matches!(by_the_long, Recognition::Recognised(_)),
             "the same win is enough for four words"
         );
     }
@@ -184,25 +213,65 @@ mod tests {
 
         let alone = by_score(&named("Some Other Show - 03.mkv"), &["Show Title"], &corpus);
 
-        assert_eq!(alone, None);
+        assert!(matches!(alone, Recognition::Unrecognised(_)));
         assert!(alike(&words_in("Some Other Show"), &words_in("Show Title")).value() < NEAR_ENOUGH);
     }
 
     #[test]
     fn two_candidates_running_level_are_no_answer() {
-        // An unresolved mapping is reported, never guessed, and this stage
-        // reports it by not answering: the sequence below it refuses.
+        // An unresolved mapping is reported, never guessed. This is the last
+        // stage that can answer, so its refusal is the sequence's.
         let corpus: Corpus = ["Show Title Alpha", "Show Title Beta"]
+            .into_iter()
+            .collect();
+
+        assert!(matches!(
+            by_score(
+                &named("Show Title - 03.mkv"),
+                &["Show Title Alpha", "Show Title Beta"],
+                &corpus
+            ),
+            Recognition::Unrecognised(_)
+        ));
+    }
+
+    #[test]
+    fn a_refusal_says_how_close_the_best_came_and_not_why() {
+        // Refused for the margin and not for the floor. `Show Title Alpha`
+        // shares two words of the five between it and the name, which is near
+        // enough; `Show Title Beta Gamma` shares two of six, which is too close
+        // behind for a name of two words. The refusal carries the best score,
+        // as it would below the floor, and not the entry: a reader asking why
+        // has the constants, and a reader asking which does not get one.
+        let corpus: Corpus = ["Show Title Alpha", "Show Title Beta Gamma"]
             .into_iter()
             .collect();
 
         assert_eq!(
             by_score(
                 &named("Show Title - 03.mkv"),
-                &["Show Title Alpha", "Show Title Beta"],
+                &["Show Title Alpha", "Show Title Beta Gamma"],
                 &corpus
             ),
-            None
+            Recognition::Unrecognised(Refusal {
+                parsed: "Show Title".to_owned(),
+                best: Some(a_score(0.8)),
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_to_score_is_no_score_rather_than_nought() {
+        // No candidate reached the scorer, so no comparison was made. Nought
+        // would say one was made and the closest entry shared nothing.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(
+            by_score(&named("Show Title - 03.mkv"), &[], &corpus),
+            Recognition::Unrecognised(Refusal {
+                parsed: "Show Title".to_owned(),
+                best: None,
+            })
         );
     }
 
@@ -212,12 +281,14 @@ mod tests {
             .into_iter()
             .collect();
 
-        let found = by_score(
-            &named("[Group] Shingeki no Kyojin - 03 [1080p].mkv"),
-            &["Shingeki no Kyojin", "Kimi no Na wa"],
-            &corpus,
-        )
-        .expect("one candidate stands out");
+        let found = answered(
+            by_score(
+                &named("[Group] Shingeki no Kyojin - 03 [1080p].mkv"),
+                &["Shingeki no Kyojin", "Kimi no Na wa"],
+                &corpus,
+            ),
+            "one candidate stands out",
+        );
 
         assert_eq!(found.title, "Shingeki no Kyojin");
         assert_eq!(found.episode, Episode::Only(3));
@@ -236,12 +307,14 @@ mod tests {
         let file = named("Show Title Cour 2 - The Subtitle - 03.mkv");
         assert_eq!(file.title.as_deref(), Some("Show Title"));
 
-        let found = by_score(
-            &file,
-            &["Show Title", "Show Title Cour 2 The Subtitle"],
-            &corpus,
-        )
-        .expect("the subtitle is in the name even where the title lost it");
+        let found = answered(
+            by_score(
+                &file,
+                &["Show Title", "Show Title Cour 2 The Subtitle"],
+                &corpus,
+            ),
+            "the subtitle is in the name even where the title lost it",
+        );
 
         assert_eq!(found.title, "Show Title Cour 2 The Subtitle");
     }
@@ -254,12 +327,14 @@ mod tests {
         // its score to them.
         let corpus: Corpus = ["Show Title", "Another Show"].into_iter().collect();
 
-        let found = by_score(
-            &named("[SubsPlease] Show Title - 03 (1080p) [A1B2C3D4].mkv"),
-            &["Show Title", "Another Show"],
-            &corpus,
-        )
-        .expect("the release's own words are not the name");
+        let found = answered(
+            by_score(
+                &named("[SubsPlease] Show Title - 03 (1080p) [A1B2C3D4].mkv"),
+                &["Show Title", "Another Show"],
+                &corpus,
+            ),
+            "the release's own words are not the name",
+        );
 
         assert_eq!(found.title, "Show Title");
     }
@@ -272,12 +347,14 @@ mod tests {
         let mut corpus: Corpus = ["Kimi no Na wa"].into_iter().collect();
         corpus.file("Shingeki no Kyojin", ["Attack on Titan"]);
 
-        let found = by_score(
-            &named("Attack on Titan - 03.mkv"),
-            &["Shingeki no Kyojin", "Kimi no Na wa"],
-            &corpus,
-        )
-        .expect("the English spelling is what matched");
+        let found = answered(
+            by_score(
+                &named("Attack on Titan - 03.mkv"),
+                &["Shingeki no Kyojin", "Kimi no Na wa"],
+                &corpus,
+            ),
+            "the English spelling is what matched",
+        );
 
         assert_eq!(found.title, "Shingeki no Kyojin");
     }
