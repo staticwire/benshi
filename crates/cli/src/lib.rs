@@ -6,7 +6,9 @@
 //! the daemon does with one of them, and takes effect without a restart.
 //! `benshi watch` prints the daemon's own event stream, so the log a user can
 //! read is the one the program acts on rather than a second one written for the
-//! occasion.
+//! occasion. `benshi why` prints the most recent recognition decision: what the
+//! name spelled, what was answered, and for a match which stage decided it and
+//! by what.
 //!
 //! The client renders; it never decides. Anything it shows came from the daemon
 //! in that answer, so two runs of `benshi sources` a second apart can differ and
@@ -125,6 +127,16 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_is_refused() {
         assert!(Cli::try_parse_from(["benshi", "recognise"]).is_err());
+    }
+
+    #[test]
+    fn why_takes_no_argument() {
+        // The daemon keeps one decision, the most recent, so there is nothing
+        // to name: the question is always about that one.
+        let asked = Cli::try_parse_from(["benshi", "why"]).expect("parses");
+
+        assert_eq!(asked.command, Command::Why);
+        assert!(Cli::try_parse_from(["benshi", "why", "some.mkv"]).is_err());
     }
 
     #[test]

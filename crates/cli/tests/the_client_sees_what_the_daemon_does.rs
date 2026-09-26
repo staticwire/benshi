@@ -27,6 +27,7 @@ use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, P
 use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen};
 use benshi_daemon::ipc::{Server, bind};
+use benshi_daemon::recognition::{Decided, Recogniser};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use tempfile::TempDir;
 use tokio::sync::broadcast::Receiver;
@@ -118,12 +119,15 @@ impl Daemon {
         let bus = Arc::new(EventBus::new());
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
+        let decided = Decided::new();
 
         let mut detection = Detection::new(
             platform.clone(),
             Arc::clone(&bus),
             Arc::clone(&policy),
             seen.clone(),
+            Arc::new(Recogniser::empty()),
+            decided.clone(),
             PERIOD,
         );
         drop(tokio::spawn(async move { detection.run().await }));
@@ -131,7 +135,7 @@ impl Daemon {
         let home = tempfile::tempdir().expect("a directory of our own");
         let socket = home.path().join("run").join("benshi.sock");
         let listener = bind(&socket).expect("the socket binds");
-        let server = Arc::new(Server::new(Arc::clone(&bus), policy, seen));
+        let server = Arc::new(Server::new(Arc::clone(&bus), policy, seen, decided));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 
         Self {
@@ -181,6 +185,24 @@ async fn a_listing_shows_the_source_a_round_saw() {
     assert!(shown.contains(PLAYER), "{shown}");
     assert!(shown.contains("auto"), "{shown}");
     assert!(shown.contains("pos+dur+pause+loc"), "{shown}");
+}
+
+#[tokio::test]
+async fn why_explains_the_reading_a_round_decided() {
+    // The other record a round leaves behind, read through the socket: a
+    // reading was admitted, its file was decided, and the client prints that
+    // decision rather than making one of its own. The second round starting is
+    // what says the first one finished, record and all.
+    let daemon = Daemon::start();
+    daemon.platform.after(2).await;
+
+    let (outcome, shown) = daemon.ask(Command::Why).await;
+
+    assert_eq!(outcome, ExitCode::SUCCESS);
+    assert!(shown.contains(PLAYER), "{shown}");
+    assert!(shown.contains("/anime/ep 03.mkv"), "{shown}");
+    assert!(shown.contains("episode 3"), "{shown}");
+    assert!(shown.contains("unrecognised"), "{shown}");
 }
 
 #[tokio::test]

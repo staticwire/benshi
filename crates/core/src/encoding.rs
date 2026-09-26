@@ -11,13 +11,14 @@
 //! fact or a guess.
 
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
+use serde::{Deserialize, Serialize};
 
 /// How far the text can be trusted.
 ///
 /// Two-valued for the same reason [`crate::Known`] is three-valued: a fact and
 /// an inference lead to different behaviour, and a type that cannot tell them
 /// apart forces every consumer to assume the worse of the two or the better.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
     /// The bytes were valid UTF-8. Nothing was inferred.
     Certain,

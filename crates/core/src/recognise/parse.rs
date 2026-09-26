@@ -18,6 +18,7 @@
 //! one place and no other.
 
 use anitomy_ng::{Element, ElementKind, Options};
+use serde::{Deserialize, Serialize};
 
 use crate::encoding::{Confidence, decode};
 use crate::path::RawPath;
@@ -29,7 +30,7 @@ use crate::recognise::normalise::part_in;
 /// and a name spelling none are different facts that lead different places. A
 /// batch is a thing this program cannot record progress for; a film is a thing
 /// it can. Collapsing them would leave an explanation with nothing to say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Episode {
     /// Exactly one, the only case that names an episode to record progress
     /// against.
@@ -60,7 +61,7 @@ pub enum Episode {
 /// The parser's answer, narrowed to what the stages below read, and nothing is
 /// matched or judged yet. Every field is what the **name** said, never what a
 /// corpus holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parsed {
     /// The title as the name spelled it, where the parser found one.
     pub title: Option<String>,

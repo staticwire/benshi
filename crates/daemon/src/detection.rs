@@ -16,17 +16,22 @@
 //! asking for a listing is answered from. The same question again: a listing
 //! shows what the daemon is acting on, and a second look at the platform would
 //! be free to disagree with it.
+//!
+//! And a round decides what each admitted reading has open, leaving the last
+//! decision in [`Decided`] for a client asking why. Recognition itself is pure
+//! logic in `benshi-core`; what is here is the moment it is asked.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use benshi_core::PlayerId;
 use benshi_core::policy::PolicyTable;
+use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use tokio::time::MissedTickBehavior;
 
 use crate::bus::{BusEvent, EventBus};
+use crate::recognition::{Decided, Decision, Recogniser};
 use crate::supervisor::TaskError;
 
 /// What is said about a reading whose source the same round did not describe.
@@ -115,6 +120,8 @@ pub struct Detection<W> {
     bus: Arc<EventBus>,
     policy: Arc<RwLock<PolicyTable>>,
     seen: Seen,
+    recogniser: Arc<Recogniser>,
+    decided: Decided,
     period: Duration,
     listed: BTreeSet<PlayerId>,
 }
@@ -123,14 +130,18 @@ impl<W: PlayerWatcher> Detection<W> {
     /// Detection over one platform, reading one policy table.
     ///
     /// The table is shared rather than copied, so that setting a policy changes
-    /// what a running loop publishes without restarting it. `seen` is the other
-    /// direction: what each round found, left where a client can read it.
+    /// what a running loop publishes without restarting it. `seen` and
+    /// `decided` are the other direction: what each round found and what it
+    /// decided, left where a client can read them. `recogniser` is what a
+    /// reading's file is decided against.
     #[must_use]
     pub fn new(
         watcher: W,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
         seen: Seen,
+        recogniser: Arc<Recogniser>,
+        decided: Decided,
         period: Duration,
     ) -> Self {
         Self {
@@ -138,6 +149,8 @@ impl<W: PlayerWatcher> Detection<W> {
             bus,
             policy,
             seen,
+            recogniser,
+            decided,
             period,
             listed: BTreeSet::new(),
         }
@@ -203,6 +216,7 @@ impl<W: PlayerWatcher> Detection<W> {
 
         for snapshot in snapshots {
             if admitted.contains(&snapshot.player) {
+                self.decide(&snapshot);
                 self.bus.publish(BusEvent::Snapshot(snapshot));
             } else if !described.contains(&snapshot.player) {
                 self.bus.publish(BusEvent::SourceFailed {
@@ -229,6 +243,28 @@ impl<W: PlayerWatcher> Detection<W> {
                 sources: listed.iter().cloned().collect(),
             });
         }
+    }
+
+    /// Decide what an admitted reading has open, and leave the decision where a
+    /// client can read it.
+    ///
+    /// A file and nothing else. An address names no file on this machine, and
+    /// a title with nothing underneath it is what a browser publishes;
+    /// recognition reads filenames, and neither is one. Every admitted reading
+    /// of a file is decided, every round, so that what a client reads is the
+    /// decision about the reading the daemon last acted on.
+    fn decide(&self, snapshot: &PlayerSnapshot) {
+        let MediaRef::LocalFile(path) = &snapshot.media else {
+            return;
+        };
+        let (parsed, answer) = self.recogniser.decide(path);
+
+        self.decided.record(Decision {
+            player: snapshot.player.clone(),
+            media: snapshot.media.clone(),
+            parsed,
+            answer,
+        });
     }
 
     /// Which of this round's sources policy admits readings from.
@@ -262,9 +298,12 @@ impl<W: PlayerWatcher> Detection<W> {
 mod tests {
     use super::{Detection, Seen};
     use crate::bus::{BusEvent, EventBus};
+    use crate::recognition::{Decided, Recogniser};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
+    use benshi_core::recognise::Recognition;
+    use benshi_core::recognise::parse::Episode;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
@@ -295,14 +334,68 @@ mod tests {
     }
 
     fn a_reading(source: &SourceInfo) -> PlayerSnapshot {
+        a_reading_of(
+            source,
+            MediaRef::LocalFile(RawPath::from_bytes(b"/anime/ep 03.mkv".to_vec())),
+        )
+    }
+
+    fn a_reading_of(source: &SourceInfo, media: MediaRef) -> PlayerSnapshot {
         PlayerSnapshot {
             player: source.player.clone(),
-            media: MediaRef::LocalFile(RawPath::from_bytes(b"/anime/ep 03.mkv".to_vec())),
+            media,
             state: source.state,
             position: Known::Value(Duration::from_secs(5)),
             duration: Known::Value(Duration::from_mins(23)),
             observed_at: Timestamp::epoch(),
         }
+    }
+
+    /// A reading of a file whose name a release would give it.
+    fn a_reading_of_a_file(source: &SourceInfo, name: &str) -> PlayerSnapshot {
+        a_reading_of(
+            source,
+            MediaRef::LocalFile(RawPath::from_bytes(name.as_bytes().to_vec())),
+        )
+    }
+
+    /// Detection over these rounds, against this policy table, leaving what it
+    /// saw in `seen`.
+    ///
+    /// Nothing to match a name against, and no decision read back: a test that
+    /// reads one takes [`deciding`] instead.
+    fn detecting(
+        watcher: ScriptedWatcher,
+        bus: Arc<EventBus>,
+        policy: Arc<RwLock<PolicyTable>>,
+        seen: Seen,
+    ) -> Detection<ScriptedWatcher> {
+        Detection::new(
+            watcher,
+            bus,
+            policy,
+            seen,
+            Arc::new(Recogniser::empty()),
+            Decided::new(),
+            INTERVAL,
+        )
+    }
+
+    /// Detection over these rounds, leaving its decisions in `decided`.
+    fn deciding(
+        watcher: ScriptedWatcher,
+        bus: Arc<EventBus>,
+        decided: Decided,
+    ) -> Detection<ScriptedWatcher> {
+        Detection::new(
+            watcher,
+            bus,
+            Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
+            Seen::new(),
+            Arc::new(Recogniser::empty()),
+            decided,
+            INTERVAL,
+        )
     }
 
     /// A round in which every source answered and had something open.
@@ -409,8 +502,7 @@ mod tests {
             a_source("mpv.instance1701", "mpv"),
             a_source("vlc", "vlc"),
         ]))]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
 
@@ -432,8 +524,7 @@ mod tests {
             a_source("firefox.instance30062", "firefox"),
             a_source("mpv", "mpv"),
         ]))]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -468,8 +559,7 @@ mod tests {
             "chromium.instance16481",
             "chromium",
         )]))]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
 
@@ -490,8 +580,7 @@ mod tests {
             snapshots: vec![a_reading(&stranger)],
             failures: Vec::new(),
         })]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -525,8 +614,7 @@ mod tests {
                 },
             )],
         })]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -576,8 +664,7 @@ mod tests {
                 failures: vec![silent()],
             }),
         ]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round it went quiet in");
@@ -604,8 +691,7 @@ mod tests {
             ])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
         ]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, seen.clone(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, seen.clone());
 
         assert!(
             seen.sources().is_empty(),
@@ -638,7 +724,7 @@ mod tests {
             "firefox.instance30062",
             "firefox",
         )]))]);
-        let mut detection = Detection::new(watcher, bus, policy, seen.clone(), INTERVAL);
+        let mut detection = detecting(watcher, bus, policy, seen.clone());
 
         detection.round().await.expect("a round");
 
@@ -663,8 +749,7 @@ mod tests {
             ])),
             Ok(a_round(vec![a_source("mpv", "mpv")])),
         ]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round after vlc closed");
@@ -686,8 +771,7 @@ mod tests {
             Ok(a_round(vec![a_source("mpv", "mpv")])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
         ]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -706,8 +790,7 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -721,6 +804,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_round_decides_what_an_admitted_reading_has_open() {
+        // `benshi why` reads a decision rather than making one, so the round
+        // that admits a reading of a file is what decides it, and the
+        // decision is left where a client can read it.
+        let bus = Arc::new(EventBus::new());
+        let decided = Decided::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(vec![Ok(PollOutcome {
+            sources: vec![mpv.clone()],
+            snapshots: vec![a_reading_of_a_file(
+                &mpv,
+                "/anime/[Group] Show Title - 03.mkv",
+            )],
+            failures: Vec::new(),
+        })]);
+        let mut detection = deciding(watcher, bus, decided.clone());
+
+        detection.round().await.expect("a round");
+
+        let decision = decided.latest().expect("the reading was decided");
+        assert_eq!(decision.player, id("mpv"));
+        assert_eq!(
+            decision.media,
+            MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/[Group] Show Title - 03.mkv".to_vec()
+            ))
+        );
+        assert_eq!(decision.parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(decision.parsed.episode, Episode::Only(3));
+        assert!(
+            matches!(decision.answer, Recognition::Unrecognised(_)),
+            "nothing to match against, got {:?}",
+            decision.answer
+        );
+    }
+
+    #[tokio::test]
+    async fn the_decision_kept_is_the_most_recent_readings() {
+        // One record, replaced each time, the way the listing is: an
+        // explanation is of what the daemon last acted on.
+        let bus = Arc::new(EventBus::new());
+        let decided = Decided::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(vec![
+            Ok(PollOutcome {
+                sources: vec![mpv.clone()],
+                snapshots: vec![a_reading_of_a_file(
+                    &mpv,
+                    "/anime/[Group] Show Title - 03.mkv",
+                )],
+                failures: Vec::new(),
+            }),
+            Ok(PollOutcome {
+                sources: vec![mpv.clone()],
+                snapshots: vec![a_reading_of_a_file(
+                    &mpv,
+                    "/anime/[Group] Show Title - 04.mkv",
+                )],
+                failures: Vec::new(),
+            }),
+        ]);
+        let mut detection = deciding(watcher, bus, decided.clone());
+
+        detection.round().await.expect("the first round");
+        detection.round().await.expect("the second round");
+
+        assert_eq!(
+            decided
+                .latest()
+                .expect("a decision was recorded")
+                .parsed
+                .episode,
+            Episode::Only(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_reading_is_not_decided() {
+        // Policy suppresses the reading, and a reading the daemon does not
+        // act on is not one it should explain: a decision about a denied
+        // player's file would send the user looking at recognition for a
+        // player the listing says is ignored.
+        let bus = Arc::new(EventBus::new());
+        let decided = Decided::new();
+        let firefox = a_source("firefox.instance30062", "firefox");
+        let watcher = ScriptedWatcher::of(vec![Ok(PollOutcome {
+            sources: vec![firefox.clone()],
+            snapshots: vec![a_reading_of_a_file(
+                &firefox,
+                "/anime/[Group] Show Title - 03.mkv",
+            )],
+            failures: Vec::new(),
+        })]);
+        let mut detection = deciding(watcher, bus, decided.clone());
+
+        detection.round().await.expect("a round");
+
+        assert!(decided.latest().is_none(), "a denied reading was decided");
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_names_no_file_is_not_decided() {
+        // Recognition reads filenames. An address names no file on this
+        // machine, and a title with nothing underneath it is what a browser
+        // publishes; neither is a name the stages were written for.
+        let bus = Arc::new(EventBus::new());
+        let decided = Decided::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(vec![Ok(PollOutcome {
+            sources: vec![mpv.clone()],
+            snapshots: vec![
+                a_reading_of(
+                    &mpv,
+                    MediaRef::Remote("https://example.invalid/stream".to_owned()),
+                ),
+                a_reading_of(&mpv, MediaRef::Title("Show Title - 03".to_owned())),
+            ],
+            failures: Vec::new(),
+        })]);
+        let mut detection = deciding(watcher, bus, decided.clone());
+
+        detection.round().await.expect("a round");
+
+        assert!(
+            decided.latest().is_none(),
+            "a reading naming no file was decided"
+        );
+    }
+
+    #[tokio::test]
     async fn a_platform_that_cannot_be_reached_is_transient() {
         // There is no platform failure that stopping detection would improve.
         let bus = Arc::new(EventBus::new());
@@ -728,7 +941,7 @@ mod tests {
         let watcher = ScriptedWatcher::of(vec![Err(WatchError::Transport(Box::new(
             std::io::Error::other("the session bus is gone"),
         )))]);
-        let mut detection = Detection::new(watcher, bus, policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, bus, policy, Seen::new());
 
         let failure = detection.round().await.expect_err("the round fails");
 
@@ -747,13 +960,7 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = Detection::new(
-            watcher,
-            Arc::clone(&bus),
-            Arc::clone(&policy),
-            Seen::new(),
-            INTERVAL,
-        );
+        let mut detection = detecting(watcher, Arc::clone(&bus), Arc::clone(&policy), Seen::new());
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL / 2).await;
@@ -786,8 +993,7 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection =
-            Detection::new(watcher, Arc::clone(&bus), policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL * 3 + INTERVAL / 2).await;
@@ -817,7 +1023,7 @@ mod tests {
         assert!(panicked.is_err(), "the thread did not panic");
 
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = Detection::new(watcher, bus, policy, Seen::new(), INTERVAL);
+        let mut detection = detecting(watcher, bus, policy, Seen::new());
 
         let read = tokio::spawn(async move { detection.round().await });
 
