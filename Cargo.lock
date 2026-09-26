@@ -197,7 +197,10 @@ name = "benshi-store"
 version = "0.1.0"
 dependencies = [
  "benshi-core",
+ "humantime",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

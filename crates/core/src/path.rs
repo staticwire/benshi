@@ -33,6 +33,17 @@ impl RawPath {
         &self.0
     }
 
+    /// The path as text, in the form the serialised path quotes.
+    ///
+    /// Runs of valid UTF-8 are kept verbatim and every other byte becomes
+    /// `%XX`, the escape itself included: a name holding a per-cent sign
+    /// would otherwise decode as something else. A store writes this into a
+    /// column a person reads with `sqlite3`.
+    #[must_use]
+    pub fn escaped(&self) -> String {
+        escape(&self.0)
+    }
+
     /// Everything after the last `/`, or the whole path if there is none.
     ///
     /// Only `/` separates. A backslash does not, because 0x5C is the trailing
@@ -220,6 +231,22 @@ mod tests {
         let text = serde_json::to_string(&path).expect("serialise");
         let back: RawPath = serde_json::from_str(&text).expect("deserialise");
         assert_eq!(path, back);
+    }
+
+    #[test]
+    fn the_escaped_form_is_the_text_a_trace_writes() {
+        // The same text, reachable without going through serde: a store
+        // writes it into a column, and a person reads it back with sqlite3.
+        let path = RawPath::from_bytes(b"/anime/\xFF 100%.mkv".to_vec());
+
+        let escaped = path.escaped();
+
+        assert_eq!(escaped, "/anime/%FF 100%25.mkv");
+        assert_eq!(
+            serde_json::to_string(&path).expect("serialise"),
+            format!("{escaped:?}"),
+            "and it is what the serialised form quotes"
+        );
     }
 
     #[test]

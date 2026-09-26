@@ -18,6 +18,7 @@
 //! that is belongs to the layer that knows the platform.
 
 mod migrate;
+mod record;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 pub use migrate::SCHEMA_VERSION;
+pub use record::Viewing;
 
 /// Why the store could not be opened or written.
 ///
@@ -78,6 +80,16 @@ pub enum Error {
     /// version read that starts the migrations is one of them.
     #[error("the database could not be read or written: {0}")]
     Write(#[source] rusqlite::Error),
+    /// An instant the columns cannot hold: before 1970, or in the year 10000
+    /// or later, neither of which RFC 3339 text here can spell.
+    ///
+    /// A clock reading either is broken, and the answer is to say so rather
+    /// than to write a date that is not the one it read.
+    #[error("the clock reads {at:?}, which is before 1970 or past the year 9999")]
+    Instant {
+        /// What the clock read.
+        at: std::time::SystemTime,
+    },
 }
 
 /// One open database, at the current schema.
