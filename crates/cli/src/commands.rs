@@ -1,8 +1,8 @@
 //! What each command does, and what the process should exit with.
 //!
 //! A command opens a connection, sends a request and renders what comes back:
-//! one answer for `sources` and `policy`, and a stream for `watch` until the
-//! daemon or the user ends it. `record` wants both an answer and a stream, so
+//! one answer for `sources`, `policy` and `why`, and a stream for `watch` until
+//! the daemon or the user ends it. `record` wants both an answer and a stream, so
 //! it takes a second connection for the answer: a stream is the last thing a
 //! connection carries. What it records goes to a file, and only a summary of
 //! it to the terminal.
@@ -46,6 +46,14 @@ pub enum Command {
         /// What to do with its readings.
         policy: PolicyArgument,
     },
+
+    /// Explain the most recent recognition decision.
+    ///
+    /// Which player, which file, what its name spelled, and what recognition
+    /// answered: the title and the stage that decided it, the candidates it
+    /// could not choose between, how close the nearest candidate came, or that
+    /// there was nothing to compare the name against.
+    Why,
 
     // Every line below is what `benshi record --help` prints, so all of it is
     // written for someone at a terminal: no intra-doc links and no backticks,
@@ -130,6 +138,7 @@ async fn carry_out(command: Command, socket: &Path, out: &mut impl Write) -> Res
         Command::Sources => sources(&mut daemon, out).await,
         Command::Watch => watch(&mut daemon, out).await,
         Command::Policy { app, policy } => set_policy(&mut daemon, &app, policy.into()).await,
+        Command::Why => why(&mut daemon, out).await,
         Command::Record { duration, output } => {
             record(&mut daemon, socket, duration, &output, out).await
         }
@@ -217,6 +226,18 @@ async fn set_policy(daemon: &mut Daemon, app: &str, policy: Policy) -> Result<()
         Response::Ok => Ok(()),
         Response::Error { message } => bail!("{message}"),
         unexpected => bail!("the daemon answered a policy change with {unexpected:?}"),
+    }
+}
+
+/// Print the most recent decision and what it was decided by.
+async fn why(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::Why).await?;
+
+    match daemon.expect_answer().await? {
+        Response::Why(explained) => write!(out, "{}", render::why(explained.as_ref()))
+            .context("the explanation could not be printed"),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("the daemon answered why with {unexpected:?}"),
     }
 }
 
@@ -389,6 +410,7 @@ mod tests {
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
+    use benshi_daemon::recognition::{Decided, Decision, Recogniser};
     use benshi_daemon::supervisor::TaskError;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -484,6 +506,7 @@ mod tests {
         socket: PathBuf,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
+        decided: Decided,
         serving: JoinHandle<Result<(), TaskError>>,
     }
 
@@ -507,15 +530,36 @@ mod tests {
             let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
-            let server = Arc::new(Server::new(Arc::clone(&bus), Arc::clone(&policy), seen));
+            let decided = Decided::new();
+            let server = Arc::new(Server::new(
+                Arc::clone(&bus),
+                Arc::clone(&policy),
+                seen,
+                decided.clone(),
+            ));
 
             Self {
                 home,
                 socket,
                 bus,
                 policy,
+                decided,
                 serving: tokio::spawn(server.listen(Arc::new(listener))),
             }
+        }
+
+        /// Leave behind a decision about a file of this name, as a detection
+        /// round would.
+        fn has_decided(&self, name: &str) {
+            let path = RawPath::from_bytes(name.as_bytes().to_vec());
+            let (parsed, answer) = Recogniser::empty().decide(&path);
+
+            self.decided.record(Decision {
+                player: PlayerId(PLAYER.to_owned()),
+                media: MediaRef::LocalFile(path),
+                parsed,
+                answer,
+            });
         }
 
         /// Stop the daemon, as a restart or a kill would.
@@ -815,12 +859,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn why_prints_the_most_recent_decision() {
+        let daemon = Daemon::listening(vec![a_source(PLAYER, "mpv")]);
+        daemon.has_decided("/anime/[Group] Show Title - 03.mkv");
+
+        let (outcome, shown, complained) = go(Command::Why, &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(shown.contains(PLAYER), "{shown}");
+        assert!(shown.contains("\"Show Title\""), "{shown}");
+        assert!(shown.contains("unrecognised"), "{shown}");
+        assert!(complained.is_empty(), "{complained}");
+    }
+
+    #[tokio::test]
+    async fn why_says_so_when_nothing_has_been_decided() {
+        // Asking before the first reading is the ordinary case, and a client
+        // that printed nothing for it could not be told from one that failed.
+        let daemon = Daemon::listening(Vec::new());
+
+        let (outcome, shown, complained) = go(Command::Why, &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(shown.contains("nothing has been decided"), "{shown}");
+    }
+
+    #[tokio::test]
     async fn every_command_fails_when_no_daemon_is_listening() {
         let (_home, socket) = nowhere();
 
         for command in [
             Command::Sources,
             Command::Watch,
+            Command::Why,
             Command::Policy {
                 app: "mpv".to_owned(),
                 policy: super::PolicyArgument::Deny,

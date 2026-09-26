@@ -103,6 +103,16 @@ impl Key {
         &self.marks
     }
 
+    /// The season the key holds, where the text spelled one past the first.
+    pub(super) fn season(&self) -> Option<u32> {
+        self.season
+    }
+
+    /// The part the key holds, where the text spelled one past the first.
+    pub(super) fn part(&self) -> Option<u32> {
+        self.part
+    }
+
     /// The same key with nothing after its last letter.
     ///
     /// Spellings that differ only in the marks they end in reach the same one

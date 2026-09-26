@@ -25,16 +25,27 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::Key;
 use crate::recognise::parse::Parsed;
 
 /// One assignment, as the user made it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The text, and what its key holds that the text does not. An assignment made
+/// from a file takes its season and its part from the parser, which has
+/// already cut them out of the title, so the text alone does not tell a reader
+/// why a file of another season does not follow it. The three together do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
     /// The text they gave, kept verbatim so that it can be shown back to them
     /// and written to a store.
     pub spelled: String,
+    /// The season the assignment is bound to, where its key holds one.
+    pub season: Option<u32>,
+    /// The part the assignment is bound to, where its key holds one.
+    pub part: Option<u32>,
     /// The entry it names, as the corpus spells it.
     pub title: String,
 }
@@ -167,6 +178,8 @@ impl Altnames {
 
         let recorded = Assignment {
             spelled,
+            season: key.season(),
+            part: key.part(),
             title: title.to_owned(),
         };
         let replaced = self.named.insert(key, recorded.clone());
@@ -186,11 +199,9 @@ impl Altnames {
         self.named.values()
     }
 
-    /// The entry a key was named by hand, where one was.
-    pub(super) fn titled(&self, key: &Key) -> Option<&str> {
-        self.named
-            .get(key)
-            .map(|assignment| assignment.title.as_str())
+    /// The assignment a key was given by hand, where one was.
+    pub(super) fn assigned(&self, key: &Key) -> Option<&Assignment> {
+        self.named.get(key)
     }
 }
 
@@ -222,10 +233,61 @@ mod tests {
             named.recorded,
             Assignment {
                 spelled: "SnK".to_owned(),
+                season: None,
+                part: None,
                 title: "Shingeki no Kyojin".to_owned(),
             }
         );
         assert_eq!(named.replaced, None);
+    }
+
+    #[test]
+    fn an_assignment_made_from_a_file_carries_the_season_the_file_spelled() {
+        // The text alone cannot recreate the key it was filed under: the
+        // parser took `S03` out of the title, so the season is in the key and
+        // nowhere in the text. It travels on the assignment, where a store
+        // writing it down and an explanation showing it back can both read
+        // it, and a reader of either can see why a first-season file does not
+        // follow it.
+        let corpus: Corpus = [
+            "Kaguya-sama: Love is War",
+            "Kaguya-sama: Love is War -Ultra Romantic-",
+        ]
+        .into_iter()
+        .collect();
+        let third = named("Kaguya-sama.Love.is.War.S03E03.1080p.WEB-DL.mkv");
+        let mut altnames = Altnames::new();
+
+        let named = altnames
+            .name_as_parsed(&third, "Kaguya-sama: Love is War -Ultra Romantic-", &corpus)
+            .expect("the third season reaches no entry, so naming it takes nothing");
+
+        assert_eq!(
+            named.recorded,
+            Assignment {
+                spelled: "Kaguya-sama Love is War".to_owned(),
+                season: Some(3),
+                part: None,
+                title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_assignment_made_from_a_file_carries_the_part_the_file_spelled() {
+        // The part is the other thing a key holds that the text does not,
+        // and it is read back from after the season marker the parser cut.
+        let corpus: Corpus = ["Show Title", "Show Title Part 2"].into_iter().collect();
+        let second = named("[Group] Show Title (Season 1 Part 2) - 03.mkv");
+        let mut altnames = Altnames::new();
+
+        let named = altnames
+            .name_as_parsed(&second, "Show Title Part 2", &corpus)
+            .expect("the file's key reaches the part it names, so naming it takes nothing");
+
+        assert_eq!(named.recorded.spelled, "Show Title");
+        assert_eq!(named.recorded.season, None);
+        assert_eq!(named.recorded.part, Some(2));
     }
 
     #[test]
@@ -271,7 +333,9 @@ mod tests {
 
         assert!(altnames.name("Nisekoi", "Nisekoi:", &corpus).is_ok());
         assert_eq!(
-            altnames.titled(&Key::from_title("Nisekoi").unwrap()),
+            altnames
+                .assigned(&Key::from_title("Nisekoi").unwrap())
+                .map(|assignment| assignment.title.as_str()),
             Some("Nisekoi:")
         );
     }
@@ -328,6 +392,8 @@ mod tests {
             again.replaced,
             Some(Assignment {
                 spelled: "SnK".to_owned(),
+                season: None,
+                part: None,
                 title: "Show Title".to_owned(),
             })
         );
@@ -377,10 +443,16 @@ mod tests {
             .expect("the third season reaches no entry, so naming it takes nothing");
 
         assert_eq!(
-            altnames.titled(&Key::from_parsed(&third).unwrap()),
+            altnames
+                .assigned(&Key::from_parsed(&third).unwrap())
+                .map(|assignment| assignment.title.as_str()),
             Some("Kaguya-sama: Love is War -Ultra Romantic-")
         );
-        assert_eq!(altnames.titled(&Key::from_parsed(&first).unwrap()), None);
+        assert!(
+            altnames
+                .assigned(&Key::from_parsed(&first).unwrap())
+                .is_none()
+        );
     }
 
     #[test]

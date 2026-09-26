@@ -23,7 +23,8 @@ use tokio::task::JoinSet;
 
 use crate::bus::EventBus;
 use crate::detection::Seen;
-use crate::protocol::{Request, Response, SourceListing};
+use crate::protocol::{Explanation, Request, Response, SourceListing};
+use crate::recognition::Decided;
 use crate::supervisor::TaskError;
 
 /// The socket's name inside whichever directory holds it.
@@ -155,14 +156,26 @@ pub struct Server {
     bus: Arc<EventBus>,
     policy: Arc<RwLock<PolicyTable>>,
     seen: Seen,
+    decided: Decided,
 }
 
 impl Server {
     /// A server over the bus a `Watch` streams, the table a listing reads and a
-    /// policy is set in, and the record each detection round leaves behind.
+    /// policy is set in, and the two records each detection round leaves
+    /// behind: what it saw, and what it last decided.
     #[must_use]
-    pub fn new(bus: Arc<EventBus>, policy: Arc<RwLock<PolicyTable>>, seen: Seen) -> Self {
-        Self { bus, policy, seen }
+    pub fn new(
+        bus: Arc<EventBus>,
+        policy: Arc<RwLock<PolicyTable>>,
+        seen: Seen,
+        decided: Decided,
+    ) -> Self {
+        Self {
+            bus,
+            policy,
+            seen,
+            decided,
+        }
     }
 
     /// Accept connections until the listener fails.
@@ -258,6 +271,9 @@ impl Server {
                     self.policy.write().expect(POISONED).set(&app, policy);
                     Response::Ok
                 }
+                Ok(Request::Why) => {
+                    Response::Why(self.decided.latest().as_ref().map(Explanation::of))
+                }
                 // A stream rather than an answer, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
@@ -341,10 +357,12 @@ mod tests {
     use super::{Server, bind, socket_path_from};
     use crate::bus::{BusEvent, EventBus};
     use crate::detection::Seen;
-    use crate::protocol::{Request, Response};
+    use crate::protocol::{Outcome, Request, Response};
+    use crate::recognition::{Decided, Decision, Recogniser};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
+    use benshi_core::recognise::parse::Episode;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
@@ -391,11 +409,13 @@ mod tests {
         }
     }
 
-    /// A server over a bus and a table the test keeps hold of.
+    /// A server over a bus, a table and a record of decisions the test keeps
+    /// hold of.
     struct Daemon {
         server: Arc<Server>,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
+        decided: Decided,
     }
 
     impl Daemon {
@@ -409,12 +429,36 @@ mod tests {
             let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
+            let decided = Decided::new();
 
             Self {
-                server: Arc::new(Server::new(Arc::clone(&bus), Arc::clone(&policy), seen)),
+                server: Arc::new(Server::new(
+                    Arc::clone(&bus),
+                    Arc::clone(&policy),
+                    seen,
+                    decided.clone(),
+                )),
                 bus,
                 policy,
+                decided,
             }
+        }
+
+        /// Leave behind a decision about the file [`a_snapshot`] has open, as
+        /// a detection round would.
+        fn has_decided(&self) {
+            let snapshot = a_snapshot();
+            let MediaRef::LocalFile(path) = &snapshot.media else {
+                panic!("the snapshot has a file open");
+            };
+            let (parsed, answer) = Recogniser::empty().decide(path);
+
+            self.decided.record(Decision {
+                player: snapshot.player.clone(),
+                media: snapshot.media.clone(),
+                parsed,
+                answer,
+            });
         }
 
         /// Wait until a connection has subscribed, so what follows is not a race.
@@ -536,6 +580,36 @@ mod tests {
         client.ask(&Request::Sources).await;
 
         assert_eq!(client.answer().await, Response::Sources(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn why_answers_the_most_recent_decision() {
+        let daemon = Daemon::with(vec![a_source("mpv", "mpv")]);
+        daemon.has_decided();
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::Why).await;
+        let Response::Why(Some(explained)) = client.answer().await else {
+            panic!("expected an explanation");
+        };
+
+        assert_eq!(explained.player, PlayerId("mpv".to_owned()));
+        assert_eq!(explained.media, a_snapshot().media);
+        assert_eq!(explained.spelled.episode, Episode::Only(3));
+        assert_eq!(explained.outcome, Outcome::Unrecognised { best: None });
+    }
+
+    #[tokio::test]
+    async fn why_before_any_decision_is_nothing_rather_than_an_error() {
+        // A client can ask before a reading has been decided, the same way a
+        // listing can be asked for before the first round. Nothing decided
+        // is an answer, and the client says so in words.
+        let daemon = Daemon::with(Vec::new());
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::Why).await;
+
+        assert_eq!(client.answer().await, Response::Why(None));
     }
 
     #[tokio::test]

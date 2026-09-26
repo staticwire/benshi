@@ -21,7 +21,7 @@ pub mod normalise;
 pub mod parse;
 pub mod score;
 
-use crate::recognise::altname::Altnames;
+use crate::recognise::altname::{Altnames, Assignment};
 use crate::recognise::corpus::Corpus;
 use crate::recognise::index::Index;
 use crate::recognise::normalise::Key;
@@ -58,13 +58,17 @@ pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Ind
 /// A [`Match`] rather than a [`Recognition`]: this stage cannot be ambiguous,
 /// because one key names one entry, and it has no standing to refuse - a
 /// refusal is a fact about the corpus, and this stage never looked at one.
+///
+/// The match carries the assignment it was decided by, so that an explanation
+/// shows the decision that was made rather than looking the key up again
+/// against assignments that may have changed since.
 #[must_use]
 pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
-    let title = altnames.titled(&Key::from_parsed(parsed)?)?;
+    let assignment = altnames.assigned(&Key::from_parsed(parsed)?)?;
     Some(Match {
-        title: title.to_owned(),
+        title: assignment.title.clone(),
         episode: parsed.episode,
-        stage: Stage::Altname,
+        stage: Stage::Altname(assignment.clone()),
     })
 }
 
@@ -137,10 +141,16 @@ impl Score {
 /// In the order they are tried, and the order is the point: a manual assignment
 /// is the user overriding the program, so it is consulted before any heuristic
 /// rather than after everything else has failed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
-    /// A mapping the user made by hand.
-    Altname,
+    /// A mapping the user made by hand, and which one.
+    ///
+    /// The assignment travels inside the stage for the reason the score does:
+    /// it is what this stage decided by, and a stage that did not consult one
+    /// has none to carry. What an explanation shows for it is the text the
+    /// user gave and the season and part it was bound to, which is where a
+    /// file of another season fails to match it.
+    Altname(Assignment),
     /// An exact match on the normalised key.
     Key,
     /// The best candidate the scorer found, and how well it scored.
@@ -250,7 +260,7 @@ pub enum Recognition {
 mod tests {
     use super::{Ambiguity, Match, Recognition, Refusal, Score, Stage, by_key, decide};
     use crate::path::RawPath;
-    use crate::recognise::altname::Altnames;
+    use crate::recognise::altname::{Altnames, Assignment};
     use crate::recognise::corpus::Corpus;
     use crate::recognise::index::Index;
     use crate::recognise::parse::{Episode, Parsed, parse};
@@ -306,7 +316,12 @@ mod tests {
         // possible match, or one, which reads as a perfect comparison that
         // never happened. Neither is true, so the stage holds the score where
         // there is one and nothing where there is not.
-        let manual = Stage::Altname;
+        let manual = Stage::Altname(Assignment {
+            spelled: "SnK".to_owned(),
+            season: None,
+            part: None,
+            title: "Show".to_owned(),
+        });
         let exact = Stage::Key;
 
         assert_ne!(manual, exact);
@@ -481,7 +496,7 @@ mod tests {
         // answers something else, so the assignment is not a fallback for
         // where nothing matched. Two entries a filename cannot tell apart are
         // what a person settles by hand, and the answer names the stage that
-        // decided it.
+        // decided it and the assignment it decided by.
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
         let mut altnames = Altnames::new();
         altnames
@@ -498,7 +513,12 @@ mod tests {
             Recognition::Recognised(Match {
                 title: "Nisekoi:".to_owned(),
                 episode: Episode::Only(3),
-                stage: Stage::Altname,
+                stage: Stage::Altname(Assignment {
+                    spelled: "Nisekoi".to_owned(),
+                    season: None,
+                    part: None,
+                    title: "Nisekoi:".to_owned(),
+                }),
             })
         );
         assert_eq!(
@@ -516,6 +536,9 @@ mod tests {
         // file's key and in no text the file leaves behind. A stage looking an
         // assignment up by the title alone would miss the file it was made for
         // and catch the season before it, where the corpus was already right.
+        // The answer carries the assignment with the season it was bound to,
+        // which is what an explanation shows a user whose first-season file
+        // did not follow it.
         let corpus: Corpus = [
             "Kaguya-sama: Love is War",
             "Kaguya-sama: Love is War -Ultra Romantic-",
@@ -533,7 +556,12 @@ mod tests {
             Recognition::Recognised(Match {
                 title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 episode: Episode::Only(3),
-                stage: Stage::Altname,
+                stage: Stage::Altname(Assignment {
+                    spelled: "Kaguya-sama Love is War".to_owned(),
+                    season: Some(3),
+                    part: None,
+                    title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
+                }),
             })
         );
         assert_eq!(

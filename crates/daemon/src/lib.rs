@@ -27,6 +27,7 @@ use crate::bus::EventBus;
 use crate::detection::{Detection, Seen};
 #[cfg(unix)]
 use crate::ipc::Server;
+use crate::recognition::{Decided, Recogniser};
 #[cfg(unix)]
 use crate::supervisor::{Supervisor, TaskError, TaskRecord};
 
@@ -38,6 +39,8 @@ pub mod detection;
 pub mod ipc;
 
 pub mod protocol;
+
+pub mod recognition;
 
 pub mod supervisor;
 
@@ -80,10 +83,15 @@ where
     let bus = Arc::new(EventBus::new());
     let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
     let seen = Seen::new();
+    let decided = Decided::new();
+    // Nothing to match against until a list arrives, so every file is refused
+    // and `benshi why` says so.
+    let recogniser = Arc::new(Recogniser::empty());
     let server = Arc::new(Server::new(
         Arc::clone(&bus),
         Arc::clone(&policy),
         seen.clone(),
+        decided.clone(),
     ));
 
     let mut supervisor = Supervisor::new();
@@ -92,6 +100,8 @@ where
         let bus = Arc::clone(&bus);
         let policy = Arc::clone(&policy);
         let seen = seen.clone();
+        let recogniser = Arc::clone(&recogniser);
+        let decided = decided.clone();
         // Called here rather than awaited here: the body must return a future,
         // and this call is what a restart repeats.
         let building = start_watcher();
@@ -100,7 +110,8 @@ where
             let watcher = building
                 .await
                 .map_err(|unreachable| TaskError::Transient(unreachable.into()))?;
-            let mut detection = Detection::new(watcher, bus, policy, seen, period);
+            let mut detection =
+                Detection::new(watcher, bus, policy, seen, recogniser, decided, period);
 
             detection.run().await
         }

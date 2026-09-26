@@ -22,6 +22,7 @@ use benshi_core::trace::Trace;
 use benshi_core::{Known, PlayState, PlayerId, PlayerSnapshot};
 use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen};
+use benshi_daemon::recognition::{Decided, Recogniser};
 use benshi_detect::replay::ReplayWatcher;
 use tokio::time::timeout;
 
@@ -66,6 +67,8 @@ async fn replayed(trace: Trace) -> Vec<PlayerSnapshot> {
         Arc::clone(&bus),
         Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
         Seen::new(),
+        Arc::new(Recogniser::empty()),
+        Decided::new(),
         PERIOD,
     );
 
