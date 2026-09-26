@@ -34,24 +34,22 @@ use crate::recognise::score::by_score;
 /// and it wins where the program would have been right. Why the order is this
 /// one is written on [`Stage`].
 ///
-/// Ends in a refusal rather than in a best guess. Where the name spelled no
-/// title at all, the refusal names nothing, because there is nothing it could
-/// name. It carries no score: the scorer knows how close the best candidate
-/// came and this does not ask it.
+/// Ends in a refusal rather than in a best guess, and the refusal is the
+/// scorer's: it says how close the best candidate came, and nothing where there
+/// was no candidate to score. Where the name spelled no title at all, the
+/// refusal names nothing, because there is nothing it could name, and the
+/// index is not asked for candidates it could only find by a title.
 #[must_use]
 pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Index) -> Recognition {
     by_altname(parsed, altnames)
         .map(Recognition::Recognised)
         .or_else(|| by_key(parsed, corpus))
-        .or_else(|| {
-            let candidates = index.candidates(parsed.title.as_deref()?);
-            by_score(parsed, &candidates, corpus).map(Recognition::Recognised)
-        })
         .unwrap_or_else(|| {
-            Recognition::Unrecognised(Refusal {
-                parsed: parsed.title.clone().unwrap_or_default(),
-                best: None,
-            })
+            let candidates = parsed
+                .title
+                .as_deref()
+                .map_or_else(Vec::new, |title| index.candidates(title));
+            by_score(parsed, &candidates, corpus)
         })
 }
 
@@ -194,13 +192,15 @@ pub struct Refusal {
     pub parsed: String,
     /// How close the best candidate came, where there was one to compare.
     ///
-    /// Absent and low are different answers and lead different places. Absent is
-    /// reserved for the index having offered nothing to score at all, which
-    /// points at the corpus; a low score says the corpus was searched and
-    /// nothing in it was close, which points at the name or at a missing entry.
-    /// Reserved rather than enforced: nothing here can stop a caller writing
-    /// `None` after scoring, and [`decide`] writes `None` whatever the scorer
-    /// found.
+    /// Absent and low are different answers and lead different places. Absent
+    /// says nothing was scored, because the name spelled no title or because
+    /// the index left the scorer no candidate, which points at the list; a low
+    /// score says the corpus was searched and nothing in it was close, which
+    /// points at the name or at a missing entry. It says how close and never
+    /// why that was not enough: a candidate is refused below the scorer's
+    /// floor, and above it where the next candidate ran level. Reserved rather
+    /// than enforced, as the field is public and nothing here stops a caller
+    /// writing `None` after scoring.
     pub best: Option<Score>,
 }
 
@@ -567,9 +567,10 @@ mod tests {
 
     #[test]
     fn a_name_no_stage_answered_is_refused_rather_than_guessed_at() {
-        // The sequence ends in a refusal. Nothing below it may read that as a
-        // title, which is why it is a variant of its own carrying what the
-        // name spelled and no candidate at all.
+        // The sequence ends in a refusal, and the refusal is the scorer's.
+        // `Show Title` shares one word of the five between it and the name,
+        // and that is what travels: the score and not the entry, so nothing
+        // below can read a near miss as a title.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
         assert_eq!(
@@ -581,6 +582,48 @@ mod tests {
             ),
             Recognition::Unrecognised(Refusal {
                 parsed: "Some Other Show".to_owned(),
+                best: Some(a_score(0.4)),
+            })
+        );
+    }
+
+    #[test]
+    fn a_refusal_with_nothing_to_score_carries_no_score_rather_than_nought() {
+        // No entry shares a word with the name, so the index hands the scorer
+        // nothing and no comparison is made. Nought would say one was made
+        // and the closest entry shared nothing, which sends a reader to the
+        // name; an absence sends them to the list.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+
+        assert_eq!(
+            decide(
+                &named("Completely Different - 03.mkv"),
+                &Altnames::new(),
+                &corpus,
+                &Index::of(&corpus)
+            ),
+            Recognition::Unrecognised(Refusal {
+                parsed: "Completely Different".to_owned(),
+                best: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_spelling_no_title_is_refused_with_nothing_to_name() {
+        // A name the parser makes nothing of reaches the end of the sequence
+        // like any other and is refused there. It names nothing, because
+        // there is nothing it could name, and it scores nothing, because with
+        // no title the index is not asked and the scorer is handed no
+        // candidate.
+        let corpus: Corpus = ["Show Title"].into_iter().collect();
+        let nothing = named("");
+        assert_eq!(nothing.title, None);
+
+        assert_eq!(
+            decide(&nothing, &Altnames::new(), &corpus, &Index::of(&corpus)),
+            Recognition::Unrecognised(Refusal {
+                parsed: String::new(),
                 best: None,
             })
         );
