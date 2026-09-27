@@ -18,6 +18,7 @@
 //! that is belongs to the layer that knows the platform.
 
 mod migrate;
+pub mod queue;
 mod record;
 
 use std::fs;
@@ -80,6 +81,25 @@ pub enum Error {
     /// version read that starts the migrations is one of them.
     #[error("the database could not be read or written: {0}")]
     Write(#[source] rusqlite::Error),
+    /// A row in the queue that cannot be read as an operation.
+    #[error("operation {id} in the queue cannot be read: {cause}")]
+    Operation {
+        /// The row's `id` in `sync_queue`.
+        id: i64,
+        /// What the kind or the payload failed on.
+        #[source]
+        cause: serde_json::Error,
+    },
+    /// A row in the queue whose show is not in `shows`.
+    ///
+    /// Foreign keys keep one from being written through this crate.
+    /// `sqlite3` leaves them off unless it is asked, so a row written by
+    /// hand or a show deleted by hand leaves one.
+    #[error("operation {id} in the queue is for a show that is not there")]
+    Orphan {
+        /// The row's `id` in `sync_queue`.
+        id: i64,
+    },
     /// An instant the columns cannot hold: before 1970, or in the year 10000
     /// or later, neither of which RFC 3339 text here can spell.
     ///
