@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use benshi_core::path::RawPath;
 use humantime::format_rfc3339_seconds;
 use rusqlite::params;
-use serde_json::json;
 
+use crate::queue::{Kind, enqueue};
 use crate::{Error, Store};
 
 /// One viewing, as it reaches [`Store::record`].
@@ -57,7 +57,9 @@ impl Store {
     /// the error.
     pub fn record(&mut self, viewing: &Viewing) -> Result<(), Error> {
         let at = rfc3339(viewing.at).ok_or(Error::Instant { at: viewing.at })?;
-        let payload = json!({ "episode": viewing.episode }).to_string();
+        let seen = Kind::Progress {
+            episode: viewing.episode,
+        };
 
         let transaction = self.connection.transaction().map_err(Error::Write)?;
         transaction
@@ -80,13 +82,7 @@ impl Store {
                 params![show, viewing.episode, at, viewing.media.escaped()],
             )
             .map_err(Error::Write)?;
-        transaction
-            .execute(
-                "INSERT INTO sync_queue (show, kind, payload, created_at) \
-                 VALUES (?1, 'progress', ?2, ?3)",
-                params![show, payload, at],
-            )
-            .map_err(Error::Write)?;
+        enqueue(&transaction, show, &seen, &at)?;
         transaction.commit().map_err(Error::Write)
     }
 }
