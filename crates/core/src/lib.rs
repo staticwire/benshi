@@ -14,6 +14,7 @@ pub mod encoding;
 pub mod path;
 pub mod policy;
 pub mod recognise;
+pub mod session;
 pub mod timeline;
 pub mod trace;
 
