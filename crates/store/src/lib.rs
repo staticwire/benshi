@@ -20,6 +20,7 @@
 mod migrate;
 pub mod queue;
 mod record;
+pub mod watching;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,15 @@ pub enum Error {
         /// The row's `id` in `sync_queue`.
         id: i64,
     },
+    /// A row of `watching` whose media is not a path as this crate writes
+    /// one: a per-cent sign with no two hexadecimal digits after it.
+    #[error("the media of row {id} in `watching` is not an escaped path: {text:?}")]
+    Media {
+        /// The row's `id` in `watching`.
+        id: i64,
+        /// The text the column holds.
+        text: String,
+    },
     /// An instant the columns cannot hold: before 1970, or in the year 10000
     /// or later, neither of which RFC 3339 text here can spell.
     ///
@@ -177,6 +187,18 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("user_version is in the header of every SQLite file")
     }
+}
+
+/// File a show under its title where it is not filed, and answer its row.
+pub(crate) fn filed(connection: &Connection, title: &str) -> Result<i64, Error> {
+    connection
+        .execute("INSERT OR IGNORE INTO shows (title) VALUES (?1)", [title])
+        .map_err(Error::Write)?;
+    connection
+        .query_row("SELECT id FROM shows WHERE title = ?1", [title], |row| {
+            row.get(0)
+        })
+        .map_err(Error::Write)
 }
 
 /// Make sure the database's directory exists, private where this call is what

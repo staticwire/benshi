@@ -7,6 +7,11 @@
 //! operation would be an episode no list ever hears of, and an operation
 //! without its row would be a list told of an episode that was never
 //! recorded. The transaction rules out both.
+//!
+//! The mark on the episode's total in `watching` is made in the same
+//! transaction. Made after it, a process killed between the two would leave
+//! an episode recorded and a total that does not say so, and the episode
+//! would register a second time.
 
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +21,8 @@ use humantime::format_rfc3339_seconds;
 use rusqlite::params;
 
 use crate::queue::{Kind, enqueue};
-use crate::{Error, Store};
+use crate::watching::registered;
+use crate::{Error, Store, filed};
 
 /// One viewing, as it reaches [`Store::record`].
 ///
@@ -47,7 +53,8 @@ impl Store {
     /// The show is filed under its title the first time an episode of it is
     /// recorded. Instants are written as RFC 3339 text with whole seconds,
     /// and the media as the path's escaped form, so that `sqlite3` shows
-    /// rows a person can read.
+    /// rows a person can read. Where a total is kept for the episode, it is
+    /// marked registered.
     ///
     /// # Errors
     ///
@@ -62,19 +69,7 @@ impl Store {
         };
 
         let transaction = self.connection.transaction().map_err(Error::Write)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO shows (title) VALUES (?1)",
-                [&viewing.title],
-            )
-            .map_err(Error::Write)?;
-        let show: i64 = transaction
-            .query_row(
-                "SELECT id FROM shows WHERE title = ?1",
-                [&viewing.title],
-                |row| row.get(0),
-            )
-            .map_err(Error::Write)?;
+        let show = filed(&transaction, &viewing.title)?;
         transaction
             .execute(
                 "INSERT INTO episodes_seen (show, episode, seen_at, media) \
@@ -83,6 +78,7 @@ impl Store {
             )
             .map_err(Error::Write)?;
         enqueue(&transaction, show, &seen, &at)?;
+        registered(&transaction, show, viewing.episode)?;
         transaction.commit().map_err(Error::Write)
     }
 }
@@ -94,7 +90,7 @@ impl Store {
 /// formatting error for a year past 9999, which `to_string` would turn into
 /// a panic as well. Both are checked here, so that a broken clock is an
 /// error the caller reads rather than the end of the task.
-fn rfc3339(at: SystemTime) -> Option<String> {
+pub(crate) fn rfc3339(at: SystemTime) -> Option<String> {
     at.duration_since(UNIX_EPOCH).ok()?;
     let mut text = String::new();
     write!(text, "{}", format_rfc3339_seconds(at)).ok()?;

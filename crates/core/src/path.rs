@@ -44,6 +44,17 @@ impl RawPath {
         escape(&self.0)
     }
 
+    /// The path an escaped form stands for, or nothing where the text is
+    /// not one.
+    ///
+    /// A per-cent sign begins an escape wherever it stands, so text with one
+    /// that two hexadecimal digits do not follow was not written by
+    /// [`RawPath::escaped`].
+    #[must_use]
+    pub fn from_escaped(escaped: &str) -> Option<Self> {
+        unescape(escaped).ok().map(Self)
+    }
+
     /// Everything after the last `/`, or the whole path if there is none.
     ///
     /// Only `/` separates. A backslash does not, because 0x5C is the trailing
@@ -247,6 +258,27 @@ mod tests {
             format!("{escaped:?}"),
             "and it is what the serialised form quotes"
         );
+    }
+
+    #[test]
+    fn a_path_comes_back_from_its_escaped_form() {
+        let path = RawPath::from_bytes(b"/anime/\xFF 100%.mkv".to_vec());
+
+        assert_eq!(RawPath::from_escaped(&path.escaped()), Some(path));
+        assert_eq!(
+            RawPath::from_escaped("/anime/%FF 100%25.mkv").map(|path| path.as_bytes().to_vec()),
+            Some(b"/anime/\xFF 100%.mkv".to_vec())
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_an_escaped_path_is_nothing() {
+        // A per-cent sign in the escaped form is always the start of an
+        // escape, so one with no two hexadecimal digits after it was written
+        // by something else.
+        for text in ["/anime/100% - 03.mkv", "/anime/100%", "/anime/100%2"] {
+            assert_eq!(RawPath::from_escaped(text), None, "{text:?}");
+        }
     }
 
     #[test]
