@@ -34,7 +34,8 @@ use crate::{Known, MediaRef, PlayState, PlayerSnapshot};
 pub struct Progress {
     /// Where playback is, as the source reported it.
     pub position: Known<Duration>,
-    /// How much of the media has been watched, accumulated over the readings.
+    /// How much of the media has been watched, accumulated over the readings
+    /// on top of the total the timeline resumed, where it resumed one.
     pub watched: Duration,
     /// How long the media is, as far as it can be known.
     ///
@@ -96,9 +97,9 @@ pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 /// reaches for them twice. A machine suspended to memory produces no gap,
 /// because [`Instant`](std::time::Instant) reads `CLOCK_MONOTONIC` on Linux and
 /// that clock does not count suspended time. A restarted daemon produces none
-/// either, because a new timeline has no earlier reading at all and its first
-/// one is a first reading rather than the far end of a gap - though that one
-/// becomes real as soon as this state outlives the process.
+/// either, because a timeline that begins has no earlier reading at all,
+/// whether or not it resumes a total, and its first one is a first reading
+/// rather than the far end of a gap.
 ///
 /// **A gap is discarded even when the position resumes exactly where playing
 /// through it would have left it**, and that is the point rather than a
@@ -430,8 +431,8 @@ impl Previous {
     /// Whether the interval up to `reading` is short enough to have been seen.
     ///
     /// Compared against [`OBSERVED_LIMIT`], and not strictly: an interval of
-    /// exactly the limit is a daemon under load rather than one that was not
-    /// running.
+    /// exactly the limit is a source that was slow to answer rather than one
+    /// that stopped answering.
     fn observed(self, reading: &PlayerSnapshot) -> bool {
         reading.observed_at.since(self.observed_at) <= OBSERVED_LIMIT
     }
@@ -446,7 +447,8 @@ impl Previous {
 /// goes on adding to one total.
 #[derive(Debug, Default)]
 pub struct Timeline {
-    /// Watched time accumulated over every reading so far.
+    /// Watched time accumulated over every reading so far, on top of the
+    /// total the timeline resumed, where it resumed one.
     watched: Duration,
     /// The reading this one will be measured against, absent until the first.
     previous: Option<Previous>,
@@ -456,7 +458,9 @@ pub struct Timeline {
     /// by: one interval of ordinary reporting settles it, whether or not the
     /// position ever made it up.
     stalled: Duration,
-    /// What the readings so far were about, absent until the first of them.
+    /// What the readings so far were about. Absent until the first of them,
+    /// except in a timeline that resumes a total, which brings what was open
+    /// with it.
     ///
     /// Held here rather than on [`Previous`], which is [`Copy`] while a
     /// [`MediaRef`] owns a path or a string.
@@ -472,6 +476,29 @@ impl Timeline {
             previous: None,
             stalled: Duration::ZERO,
             open: None,
+        }
+    }
+
+    /// A timeline that goes on from a total kept earlier, for the media the
+    /// total was kept for.
+    ///
+    /// The media comes with the total because the total belongs to it. A
+    /// timeline that resumes nothing takes what is open from its first
+    /// reading and starts again only when a later one differs, so a total
+    /// handed over alone would go to whatever the first reading has open.
+    /// With the media beside it, a first reading of anything else starts
+    /// from nothing.
+    ///
+    /// No earlier reading is restored. The first reading after a resume is
+    /// measured against nothing and adds nothing, as the first reading of
+    /// any timeline does.
+    #[must_use]
+    pub const fn resuming(media: MediaRef, watched: Duration) -> Self {
+        Self {
+            watched,
+            previous: None,
+            stalled: Duration::ZERO,
+            open: Some(media),
         }
     }
 
@@ -578,9 +605,10 @@ impl Timeline {
         if matches!(&self.open, Some(open) if *open != reading.media) {
             *self = Self::new();
         }
-        // Nothing is open on the first reading and nothing is open after the
-        // reset above, so one branch answers both. The clone costs one
-        // allocation each time what is open changes, and none in between.
+        // Nothing is open on the first reading of a timeline that resumes
+        // nothing, and nothing is open after the reset above, so one branch
+        // answers both. The clone costs one allocation each time what is
+        // open changes, and none in between.
         if self.open.is_none() {
             self.open = Some(reading.media.clone());
         }
@@ -1372,13 +1400,12 @@ mod tests {
 
     #[test]
     fn a_gap_nobody_watched_counts_as_nothing_watched() {
-        // The daemon was restarted, or the machine slept, or the source stopped
-        // answering for a minute. The position resumes exactly where a minute
-        // of playback would have left it, which is also exactly where a minute
-        // forward on the seek bar would have left it, and the two cannot be
-        // told apart. Counting it would let one drag of the bar mark an
-        // episode, which is the whole reason a position and a watched time are
-        // two fields and not one.
+        // The source stopped answering for a minute. The position resumes
+        // exactly where a minute of playback would have left it, which is
+        // also exactly where a minute forward on the seek bar would have left
+        // it, and the two cannot be told apart. Counting it would let one
+        // drag of the bar mark an episode, which is the whole reason a
+        // position and a watched time are two fields and not one.
         // The position after the gap is derived from the gap and not written
         // as a literal: the point of the run is that playing through the gap
         // and dragging the bar across it end in the same place, and a literal
@@ -1399,7 +1426,7 @@ mod tests {
         // The other half, and the reason the gap is judged before the break
         // is: over an unobserved minute the position can be anywhere at all,
         // and a timeline that called that a seek would report one every time a
-        // player was left running while the daemon was not.
+        // source that had stopped answering answered again.
         let gap = readings(&[
             (SECOND, PlayState::Playing, a_position(10)),
             (A_GAP, PlayState::Playing, a_position(500)),
@@ -1412,9 +1439,9 @@ mod tests {
     #[test]
     fn an_interval_of_exactly_the_limit_was_still_observed() {
         // The boundary, and the only thing keeping the comparison from becoming
-        // a strict one. A run of intervals each exactly at the limit is a daemon
-        // under load rather than a daemon that was not running, and every second
-        // of it is counted.
+        // a strict one. A run of intervals each exactly at the limit is a source
+        // that is slow to answer rather than one that stopped answering, and
+        // every second of it is counted.
         let slow = readings(&[
             (SECOND, PlayState::Playing, a_position(10)),
             (OBSERVED_LIMIT, PlayState::Playing, a_position(20)),
@@ -1552,6 +1579,82 @@ mod tests {
         ]);
 
         assert_eq!(watched_over(&run), SECOND * 4);
+    }
+
+    /// What an earlier sitting left: nine minutes and twenty-one seconds.
+    const AN_EARLIER_SITTING: Duration = Duration::from_secs(561);
+
+    /// The watched time after each reading of a run, folded through a
+    /// timeline that resumes [`AN_EARLIER_SITTING`] for `resumed`.
+    fn watched_resuming(resumed: MediaRef, run: &[PlayerSnapshot]) -> Vec<Duration> {
+        let mut timeline = Timeline::resuming(resumed, AN_EARLIER_SITTING);
+        run.iter()
+            .map(|reading| timeline.advance(reading).watched)
+            .collect()
+    }
+
+    #[test]
+    fn a_timeline_resuming_a_total_goes_on_from_it() {
+        // The first reading after a resume is a first reading: nothing is
+        // known about the interval between the last total kept and it, so it
+        // adds nothing, and every interval after it adds what it spanned.
+        let run = readings(&[
+            (SECOND, PlayState::Playing, a_position(600)),
+            (SECOND, PlayState::Playing, a_position(601)),
+            (SECOND, PlayState::Playing, a_position(602)),
+        ]);
+
+        let watched = watched_resuming(run[0].media.clone(), &run);
+
+        assert_eq!(
+            watched,
+            [
+                AN_EARLIER_SITTING,
+                AN_EARLIER_SITTING + SECOND,
+                AN_EARLIER_SITTING + SECOND * 2
+            ]
+        );
+    }
+
+    #[test]
+    fn a_total_resumed_for_one_file_is_not_given_to_another() {
+        // A total belongs to what was open when it was earned. Resumed for a
+        // file that is not the one playing, it is dropped at the first
+        // reading, as the total of any file is when another opens.
+        let run = readings(&[
+            (SECOND, PlayState::Playing, a_position(600)),
+            (SECOND, PlayState::Playing, a_position(601)),
+            (SECOND, PlayState::Playing, a_position(602)),
+        ]);
+        let another = MediaRef::LocalFile(RawPath::from_bytes(b"/anime/show-04.mkv".to_vec()));
+
+        let watched = watched_resuming(another, &run);
+
+        assert_eq!(watched, [Duration::ZERO, SECOND, SECOND * 2]);
+    }
+
+    #[test]
+    fn two_sittings_cross_together_a_threshold_neither_crosses_alone() {
+        // An episode of twenty-four minutes, registered at half of it, which
+        // is 720 seconds. The earlier sitting is 561 of them and this one is
+        // 200, so neither reaches the threshold and the two together pass it.
+        let length = Duration::from_mins(24);
+        let run = playing_for(length, 201);
+        let policy = WatchedPolicy::default();
+
+        let alone = progress_over(&run);
+        let mut timeline = Timeline::resuming(run[0].media.clone(), AN_EARLIER_SITTING);
+        let mut together = None;
+        for reading in &run {
+            together = Some(timeline.advance(reading));
+        }
+        let together = together.expect("the run holds readings");
+
+        assert_eq!(alone.watched, SECOND * 200);
+        assert_eq!(together.watched, AN_EARLIER_SITTING + SECOND * 200);
+        assert!(!policy.counts_as_watched(&alone));
+        assert!(!policy.counts_as_watched(&progress(AN_EARLIER_SITTING, Known::Value(length))));
+        assert!(policy.counts_as_watched(&together));
     }
 
     /// The answer a caller holds, with everything the decision ignores fixed.
