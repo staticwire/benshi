@@ -38,6 +38,8 @@ pub mod detection;
 #[cfg(unix)]
 pub mod ipc;
 
+pub mod paths;
+
 pub mod protocol;
 
 pub mod recognition;
