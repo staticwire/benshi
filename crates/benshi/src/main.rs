@@ -104,6 +104,11 @@ async fn serve() -> ExitCode {
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
 
     let socket = benshi_daemon::ipc::socket_path();
+    // The XDG Base Directory Specification asks for a warning where the
+    // runtime directory is replaced.
+    if let Some(fallback) = benshi_daemon::ipc::fallback() {
+        eprintln!("benshi: {fallback}");
+    }
     let listener = match benshi_daemon::ipc::bind(&socket) {
         Ok(listener) => Arc::new(listener),
         Err(unbound) => {

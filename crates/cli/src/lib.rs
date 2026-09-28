@@ -62,6 +62,14 @@ impl Cli {
 #[must_use]
 pub fn main(arguments: Cli) -> ExitCode {
     let socket = arguments.socket();
+    // The XDG Base Directory Specification asks for a warning where the
+    // runtime directory is replaced. A socket named on the command line is
+    // looked for where it was named, whatever the session sets.
+    if arguments.socket.is_none()
+        && let Some(fallback) = benshi_daemon::ipc::fallback()
+    {
+        eprintln!("benshi: {fallback}");
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

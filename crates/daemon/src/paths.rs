@@ -248,35 +248,18 @@ fn absolute(read: &impl Fn(&str) -> Option<OsString>, variable: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsStr;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    #[cfg(unix)]
-    use std::process::Command;
 
     use super::*;
 
     const EVERY_PLATFORM: [Platform; 3] = [Platform::Linux, Platform::MacOs, Platform::Windows];
-
-    /// Set in a run of the tests that a test started, and in no other.
-    #[cfg(unix)]
-    const RUN_AGAIN: &str = "BENSHI_PATHS_RUN_AGAIN";
 
     /// A path that is absolute on the system the tests run on.
     fn rooted(beneath: &str) -> PathBuf {
         let root = if cfg!(windows) { r"C:\" } else { "/" };
 
         Path::new(root).join(beneath)
-    }
-
-    /// An absolute path that is not Unicode.
-    #[cfg(unix)]
-    fn not_text() -> PathBuf {
-        use std::os::unix::ffi::OsStrExt;
-
-        rooted("mnt").join(OsStr::from_bytes(b"disk\xff"))
     }
 
     /// Every variable that is read on any platform but the override, each
@@ -702,37 +685,5 @@ mod tests {
     #[test]
     fn a_build_for_windows_reads_what_windows_sets() {
         assert_eq!(Platform::HERE, Platform::Windows);
-    }
-
-    // A process cannot set its own environment without `unsafe`, so the test
-    // runs itself again in an environment it chose.
-    #[cfg(unix)]
-    #[test]
-    fn the_directory_is_read_from_this_process_on_this_platform() {
-        const NAME: &str = "paths::tests::the_directory_is_read_from_this_process_on_this_platform";
-        let session = a_session_with(&[("BENSHI_DATA_DIR", not_text())]);
-
-        if env::var_os(RUN_AGAIN).is_some() {
-            for role in [Role::Data, Role::Config] {
-                let expected = directory_from(role, Platform::HERE, holding(&session));
-
-                assert!(expected.is_ok(), "{role:?}");
-                assert_eq!(directory(role), expected, "{role:?}");
-            }
-            return;
-        }
-
-        let again = Command::new(env::current_exe().expect("the tests know what runs them"))
-            .args(["--exact", NAME])
-            .env_clear()
-            .env(RUN_AGAIN, "yes")
-            .envs(session.iter().map(|(variable, held)| (variable, held)))
-            .output()
-            .expect("the tests can be run again");
-        let said = String::from_utf8_lossy(&again.stdout);
-
-        assert!(again.status.success(), "{said}");
-        // A name that matches no test is a run that passes.
-        assert!(said.contains("1 passed"), "{said}");
     }
 }

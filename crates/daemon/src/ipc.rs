@@ -9,6 +9,7 @@
 //! Windows will need has to supply only its own binding and accept loop.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{Error, ErrorKind, Result};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -27,11 +28,18 @@ use crate::protocol::{Explanation, Request, Response, SourceListing};
 use crate::recognition::Decided;
 use crate::supervisor::TaskError;
 
+/// The variable a session names its runtime directory in.
+const RUNTIME: &str = "XDG_RUNTIME_DIR";
+
 /// The socket's name inside whichever directory holds it.
 const SOCKET_NAME: &str = "benshi.sock";
 
 /// The directory the fallback puts the socket in, beneath the temporary one.
 const FALLBACK_DIRECTORY: &str = "benshi";
+
+/// The temporary directory taken where the one the session gives is no
+/// absolute path.
+const LAST_RESORT: &str = "/tmp";
 
 /// The mode the socket's directory must have: reachable by its owner and by
 /// nobody else.
@@ -40,34 +48,123 @@ const PRIVATE: u32 = 0o700;
 /// What is said when the policy table cannot be trusted.
 const POISONED: &str = "the policy table was poisoned by a panic in another task";
 
+/// The way in which a session names no runtime directory the socket can go in.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NoRuntimeDirectory {
+    /// The variable is not set.
+    #[error("`{RUNTIME}` is not set")]
+    NotSet,
+    /// The variable is set and holds nothing.
+    #[error("`{RUNTIME}` is empty")]
+    Empty,
+    /// The variable holds a relative path.
+    #[error("`{RUNTIME}` holds `{}`, which is a relative path", .0.display())]
+    Relative(PathBuf),
+}
+
+/// The socket in the fallback, and what put it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    /// The way in which the session names no runtime directory.
+    pub why: NoRuntimeDirectory,
+    /// The socket's path, beneath a temporary directory.
+    pub socket: PathBuf,
+}
+
+// Written so that it reads as a warning after the name of the program.
+impl fmt::Display for Fallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}, so the socket is {}",
+            self.why,
+            self.socket.display()
+        )
+    }
+}
+
 /// Where the daemon listens.
 ///
-/// `$XDG_RUNTIME_DIR` when the session sets one, which every session managed by
-/// systemd-logind does. It is the right place: per-user, mode 0700, usually a
-/// tmpfs, and emptied when the user's last session ends, so a socket cannot
-/// outlive the login it belonged to.
+/// `$XDG_RUNTIME_DIR` when the session sets it to an absolute path, which every
+/// session managed by systemd-logind does. It is the right place: per-user,
+/// mode 0700, usually a tmpfs, and emptied when the user's last session ends,
+/// so a socket cannot outlive the login it belonged to.
+///
+/// The path is absolute whatever the session sets. The client works the same
+/// path out in a process of its own, and a relative one names another socket
+/// for every directory the two are started in.
 #[must_use]
 pub fn socket_path() -> PathBuf {
-    socket_path_from(
-        env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        &env::temp_dir(),
-    )
+    socket_path_from(env::var_os(RUNTIME).map(PathBuf::from), &env::temp_dir())
+}
+
+/// The fallback the socket is in, where it is in one.
+///
+/// The XDG Base Directory Specification asks an application that falls back on
+/// a replacement for the runtime directory to print a warning, and a
+/// [`Fallback`] reads as one. `None` where the socket is in the runtime
+/// directory.
+#[must_use]
+pub fn fallback() -> Option<Fallback> {
+    fallback_from(env::var_os(RUNTIME).map(PathBuf::from), &env::temp_dir())
 }
 
 /// Where the daemon listens, given a session's directories.
-///
-/// Without a runtime directory the socket goes into a directory of its own
-/// beneath the temporary one rather than straight into it. A temporary
-/// directory is usually `/tmp`, which every user on the machine can write to,
-/// so a name both users compute the same is a name either of them may create
-/// first: whoever loses cannot bind, and a client asking for that name has no
-/// way to tell whose daemon answers. One directory, mode 0700, closes both: the
-/// second user cannot enter it and finds out at once rather than by accident.
 fn socket_path_from(runtime_dir: Option<PathBuf>, temporary_dir: &Path) -> PathBuf {
-    runtime_dir.map_or_else(
-        || temporary_dir.join(FALLBACK_DIRECTORY).join(SOCKET_NAME),
+    runtime_directory(runtime_dir).map_or_else(
+        |_| in_the_fallback(temporary_dir),
         |dir| dir.join(SOCKET_NAME),
     )
+}
+
+/// The fallback the socket is in, given a session's directories.
+fn fallback_from(runtime_dir: Option<PathBuf>, temporary_dir: &Path) -> Option<Fallback> {
+    let why = runtime_directory(runtime_dir).err()?;
+
+    Some(Fallback {
+        why,
+        socket: in_the_fallback(temporary_dir),
+    })
+}
+
+/// The runtime directory a session names, or the way in which it names none.
+///
+/// A runtime directory counts where it is an absolute path. The XDG Base
+/// Directory Specification requires the paths in its variables to be absolute
+/// and asks that a relative one is ignored as invalid. It does not say what to
+/// do with an empty `$XDG_RUNTIME_DIR`. An empty one is passed over as one
+/// never set is, which is what the specification prescribes for each of its
+/// other variables.
+fn runtime_directory(named: Option<PathBuf>) -> std::result::Result<PathBuf, NoRuntimeDirectory> {
+    match named {
+        None => Err(NoRuntimeDirectory::NotSet),
+        Some(dir) if dir.is_absolute() => Ok(dir),
+        Some(dir) if dir.as_os_str().is_empty() => Err(NoRuntimeDirectory::Empty),
+        Some(dir) => Err(NoRuntimeDirectory::Relative(dir)),
+    }
+}
+
+/// The socket's path in the fallback.
+///
+/// The socket goes into a directory of its own beneath the temporary one
+/// rather than straight into it. A temporary directory is usually `/tmp`,
+/// which every user on the machine can write to, so a name both users compute
+/// the same is a name either of them may create first: whoever loses cannot
+/// bind, and a client asking for that name has no way to tell whose daemon
+/// answers. One directory, mode 0700, closes both: the second user cannot enter
+/// it and finds out at once rather than by accident.
+///
+/// A temporary directory counts where it is an absolute path too, because
+/// `env::temp_dir` answers with `TMPDIR` as it was set. `/tmp` stands in for
+/// one that is not.
+fn in_the_fallback(temporary_dir: &Path) -> PathBuf {
+    let temporary_dir = if temporary_dir.is_absolute() {
+        temporary_dir
+    } else {
+        Path::new(LAST_RESORT)
+    };
+
+    temporary_dir.join(FALLBACK_DIRECTORY).join(SOCKET_NAME)
 }
 
 /// Whether something is still listening on a socket that already exists.
@@ -354,7 +451,7 @@ fn client_left(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, bind, socket_path_from};
+    use super::{Fallback, NoRuntimeDirectory, Server, bind, fallback_from, socket_path_from};
     use crate::bus::{BusEvent, EventBus};
     use crate::detection::Seen;
     use crate::protocol::{Outcome, Request, Response};
@@ -904,6 +1001,149 @@ mod tests {
             path.parent(),
             Some(Path::new("/tmp")),
             "the socket must not sit directly in a shared directory"
+        );
+    }
+
+    #[test]
+    fn a_runtime_directory_that_is_empty_is_read_as_one_never_set() {
+        let path = socket_path_from(Some(PathBuf::new()), Path::new("/nowhere/tmp"));
+
+        assert_eq!(path, PathBuf::from("/nowhere/tmp/benshi/benshi.sock"));
+    }
+
+    #[test]
+    fn a_runtime_directory_that_is_relative_is_passed_over() {
+        let path = socket_path_from(
+            Some(PathBuf::from("run/user/1000")),
+            Path::new("/nowhere/tmp"),
+        );
+
+        assert_eq!(path, PathBuf::from("/nowhere/tmp/benshi/benshi.sock"));
+    }
+
+    #[test]
+    fn a_runtime_directory_is_used_whatever_the_temporary_one_is() {
+        // Directories that exist nowhere: the path is worked out from what the
+        // session names, and nothing is looked up.
+        for runtime in ["/nowhere/run/1000", "/nowhere/run/1001"] {
+            for temporary in ["", "tmp/here", "/nowhere/tmp"] {
+                let path = socket_path_from(Some(PathBuf::from(runtime)), Path::new(temporary));
+
+                assert_eq!(
+                    path,
+                    Path::new(runtime).join("benshi.sock"),
+                    "{runtime:?} and {temporary:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_temporary_directory_that_is_absolute_is_the_one_used() {
+        let path = socket_path_from(None, Path::new("/nowhere/tmp"));
+
+        assert_eq!(path, PathBuf::from("/nowhere/tmp/benshi/benshi.sock"));
+    }
+
+    #[test]
+    fn a_temporary_directory_that_is_empty_or_relative_gives_way_to_the_shared_one() {
+        for runtime in [None, Some(""), Some("run/user/1000")] {
+            for temporary in ["", "tmp/here"] {
+                let path = socket_path_from(runtime.map(PathBuf::from), Path::new(temporary));
+
+                assert_eq!(
+                    path,
+                    PathBuf::from("/tmp/benshi/benshi.sock"),
+                    "{runtime:?} and {temporary:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_socket_in_the_runtime_directory_is_no_fallback() {
+        for temporary in ["", "tmp/here", "/nowhere/tmp"] {
+            let fallback = fallback_from(
+                Some(PathBuf::from("/nowhere/run/1000")),
+                Path::new(temporary),
+            );
+
+            assert_eq!(fallback, None, "{temporary:?}");
+        }
+    }
+
+    #[test]
+    fn a_fallback_says_which_way_the_runtime_directory_was_missing() {
+        let missing = [
+            (None, NoRuntimeDirectory::NotSet),
+            (Some(""), NoRuntimeDirectory::Empty),
+            (
+                Some("run/user/1000"),
+                NoRuntimeDirectory::Relative(PathBuf::from("run/user/1000")),
+            ),
+        ];
+
+        for (runtime, why) in missing {
+            let fallback = fallback_from(runtime.map(PathBuf::from), Path::new("/nowhere/tmp"));
+
+            assert_eq!(
+                fallback,
+                Some(Fallback {
+                    why,
+                    socket: PathBuf::from("/nowhere/tmp/benshi/benshi.sock"),
+                }),
+                "{runtime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fallback_names_the_socket_where_the_path_puts_it() {
+        for runtime in [None, Some(""), Some("run/user/1000")] {
+            for temporary in ["", "tmp/here", "/nowhere/tmp"] {
+                let runtime = runtime.map(PathBuf::from);
+                let path = socket_path_from(runtime.clone(), Path::new(temporary));
+                let fallback = fallback_from(runtime.clone(), Path::new(temporary));
+
+                assert_eq!(
+                    fallback.map(|fallback| fallback.socket),
+                    Some(path),
+                    "{runtime:?} and {temporary:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fallback_reads_as_the_warning_it_is_printed_as() {
+        let said = |runtime: Option<&str>| {
+            fallback_from(runtime.map(PathBuf::from), Path::new("/nowhere/tmp"))
+                .map(|fallback| fallback.to_string())
+        };
+
+        assert_eq!(
+            said(None),
+            Some(
+                "`XDG_RUNTIME_DIR` is not set, so the socket is \
+                 /nowhere/tmp/benshi/benshi.sock"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            said(Some("")),
+            Some(
+                "`XDG_RUNTIME_DIR` is empty, so the socket is \
+                 /nowhere/tmp/benshi/benshi.sock"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            said(Some("run/user/1000")),
+            Some(
+                "`XDG_RUNTIME_DIR` holds `run/user/1000`, which is a relative path, so the \
+                 socket is /nowhere/tmp/benshi/benshi.sock"
+                    .to_owned()
+            )
         );
     }
 }
