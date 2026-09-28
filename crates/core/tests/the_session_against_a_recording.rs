@@ -78,11 +78,7 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
     for reading in &readings {
         for effect in session.advance(reading, Some(&decided(reading))) {
             match effect {
-                Effect::Resume {
-                    player,
-                    title,
-                    episode,
-                } => session.resumed(&player, &title, episode, None),
+                Effect::Resume { question, .. } => session.resumed(question, None),
                 Effect::Keep { watched, .. } => kept.push(watched),
                 Effect::Record { .. } => recorded += 1,
                 Effect::Close { .. } => panic!("the recording plays one file to its end"),
