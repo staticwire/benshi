@@ -22,4 +22,5 @@ workspace = true
 
 [dev-dependencies]
 benshi-detect = { path = "../detect" }
+benshi-store = { path = "../store" }
 tempfile = "3.27.0"

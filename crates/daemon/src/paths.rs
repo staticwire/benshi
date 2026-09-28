@@ -53,6 +53,9 @@ const MARK: &str = "~";
 /// The directory every default ends in.
 const OURS: &str = "benshi";
 
+/// The name of the database in the data directory.
+pub const DATABASE: &str = "benshi.db";
+
 /// What a directory is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {

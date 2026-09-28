@@ -15,16 +15,17 @@
 //! escape past is not a limiter.
 
 use std::future::Future;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use benshi_core::policy::PolicyTable;
 use benshi_detect::{PlayerWatcher, WatchError};
+use benshi_store::Store;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
 use crate::bus::EventBus;
-use crate::detection::{Detection, Seen};
+use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
 use crate::ipc::Server;
 use crate::recognition::{Decided, Recogniser};
@@ -70,11 +71,20 @@ pub mod supervisor;
 /// listening there - and that answer belongs before anything starts, rather
 /// than inside a task that would quietly retry it.
 ///
+/// The store is opened by the caller for the same reason, and it outlives a
+/// restart of detection: a detection task that is started again knows nothing
+/// of the one before it and goes on from what that one kept. `recogniser` is
+/// what a file's name is decided against, and `now` reads the time of day the
+/// store writes beside what it keeps.
+///
 /// Returns once no task is left running, which for a daemon means every one of
 /// them stopped permanently. What stopped each is in its [`TaskRecord`].
 pub async fn run<W, B, F>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
+    recogniser: Recogniser,
+    store: Arc<Mutex<Store>>,
+    now: fn() -> SystemTime,
     period: Duration,
 ) -> Vec<TaskRecord>
 where
@@ -82,28 +92,27 @@ where
     F: Future<Output = Result<W, WatchError>> + Send + 'static,
     W: PlayerWatcher + Send + 'static,
 {
-    let bus = Arc::new(EventBus::new());
-    let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
-    let seen = Seen::new();
-    let decided = Decided::new();
-    // Nothing to match against until a list arrives, so every file is refused
-    // and `benshi why` says so.
-    let recogniser = Arc::new(Recogniser::empty());
+    let wiring = Wiring {
+        bus: Arc::new(EventBus::new()),
+        policy: Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
+        seen: Seen::new(),
+        recogniser: Arc::new(recogniser),
+        decided: Decided::new(),
+        store,
+        now,
+        period,
+    };
     let server = Arc::new(Server::new(
-        Arc::clone(&bus),
-        Arc::clone(&policy),
-        seen.clone(),
-        decided.clone(),
+        Arc::clone(&wiring.bus),
+        Arc::clone(&wiring.policy),
+        wiring.seen.clone(),
+        wiring.decided.clone(),
     ));
 
     let mut supervisor = Supervisor::new();
 
     supervisor.supervise("detection", move || {
-        let bus = Arc::clone(&bus);
-        let policy = Arc::clone(&policy);
-        let seen = seen.clone();
-        let recogniser = Arc::clone(&recogniser);
-        let decided = decided.clone();
+        let wiring = wiring.clone();
         // Called here rather than awaited here: the body must return a future,
         // and this call is what a restart repeats.
         let building = start_watcher();
@@ -112,10 +121,8 @@ where
             let watcher = building
                 .await
                 .map_err(|unreachable| TaskError::Transient(unreachable.into()))?;
-            let mut detection =
-                Detection::new(watcher, bus, policy, seen, recogniser, decided, period);
 
-            detection.run().await
+            Detection::new(watcher, wiring).run().await
         }
     });
 

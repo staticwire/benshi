@@ -1,10 +1,10 @@
 //! What the daemon decided a file was, kept for `benshi why`.
 //!
 //! Recognition is pure logic in `benshi-core` and decides against a corpus the
-//! caller supplies. Until a list arrives there is nothing to supply, so the
-//! [`Recogniser`] here holds an empty corpus and no assignments, and every name
-//! reaches the end of the sequence and is refused. The plumbing is what exists:
-//! a round decides, the decision is left here, and a client reads it.
+//! caller supplies. A [`Recogniser`] holds one, with its index and the names
+//! the user gave. Against [`Recogniser::empty`] every name reaches the end of
+//! the sequence and is refused. A round decides, the decision is left here,
+//! and a client reads it.
 //!
 //! One decision is kept, the most recent, the way
 //! [`Seen`](crate::detection::Seen) keeps the most recent listing and for the
@@ -35,16 +35,22 @@ pub struct Recogniser {
 impl Recogniser {
     /// Nothing to match against: an empty corpus and no assignments.
     ///
-    /// Every name is refused with nothing scored. A list arriving changes what
-    /// this holds and not what a round does with it.
+    /// Every name is refused with nothing scored.
     #[must_use]
     pub fn empty() -> Self {
-        let corpus = Corpus::default();
+        Self::of(Corpus::default(), Altnames::new())
+    }
+
+    /// A list to match against, and the names the user gave.
+    ///
+    /// The index is built here from the list, so the two cannot disagree.
+    #[must_use]
+    pub fn of(corpus: Corpus, altnames: Altnames) -> Self {
         let index = Index::of(&corpus);
         Self {
             corpus,
             index,
-            altnames: Altnames::new(),
+            altnames,
         }
     }
 
@@ -115,12 +121,19 @@ impl Decided {
 mod tests {
     use super::{Decided, Decision, Recogniser};
     use benshi_core::path::RawPath;
+    use benshi_core::recognise::altname::Altnames;
+    use benshi_core::recognise::corpus::Corpus;
     use benshi_core::recognise::parse::Episode;
-    use benshi_core::recognise::{Recognition, Refusal};
+    use benshi_core::recognise::{Match, Recognition, Refusal, Stage};
     use benshi_core::{MediaRef, PlayerId};
 
     fn a_path(name: &str) -> RawPath {
         RawPath::from_bytes(name.as_bytes().to_vec())
+    }
+
+    /// A list of these titles, each spelled one way.
+    fn a_list_of(titles: &[&str]) -> Corpus {
+        titles.iter().collect()
     }
 
     #[test]
@@ -165,10 +178,76 @@ mod tests {
     }
 
     #[test]
+    fn a_name_the_list_holds_is_recognised_as_the_list_spells_it() {
+        let recogniser = Recogniser::of(a_list_of(&["Show Title", "A Film"]), Altnames::new());
+
+        let (_parsed, answer) =
+            recogniser.decide(&a_path("/anime/[Group] Show Title - 03 [1080p].mkv"));
+
+        assert_eq!(
+            answer,
+            Recognition::Recognised(Match {
+                title: "Show Title".to_owned(),
+                episode: Episode::Only(3),
+                stage: Stage::Key,
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_the_user_gave_is_read_before_the_list() {
+        let list = a_list_of(&["Show Title", "Another Show"]);
+        let mut named = Altnames::new();
+        named
+            .name("ShoTi", "Show Title", &list)
+            .expect("text that reaches no entry can be named");
+        let recogniser = Recogniser::of(list, named);
+
+        let (_parsed, answer) = recogniser.decide(&a_path("/anime/[Group] ShoTi - 03.mkv"));
+
+        assert!(
+            matches!(
+                &answer,
+                Recognition::Recognised(Match {
+                    title,
+                    episode: Episode::Only(3),
+                    stage: Stage::Altname(_),
+                }) if title == "Show Title"
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_the_key_misses_is_found_through_an_index_of_the_list() {
+        // The name spells more than either title, so no key reaches it, and
+        // the scorer is handed the candidates the index narrowed the list to.
+        let recogniser = Recogniser::of(
+            a_list_of(&["Show Title", "Show Title Cour 2 The Subtitle"]),
+            Altnames::new(),
+        );
+
+        let (_parsed, answer) =
+            recogniser.decide(&a_path("/anime/Show Title Cour 2 - The Subtitle - 03.mkv"));
+
+        assert!(
+            matches!(
+                &answer,
+                Recognition::Recognised(Match {
+                    title,
+                    episode: Episode::Only(3),
+                    stage: Stage::Scored(_),
+                }) if title == "Show Title Cour 2 The Subtitle"
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
     fn with_nothing_to_match_against_every_name_is_refused() {
-        // Until a list arrives there is nothing to match against, and a
-        // refusal with nothing scored is the honest answer rather than a
-        // guess. It is what an explanation has to show for every file.
+        // With nothing to match against, a refusal with nothing scored is the
+        // honest answer rather than a guess. It is what an explanation has to
+        // show for every file.
         let (_parsed, answer) = Recogniser::empty().decide(&a_path("[Group] Show Title - 03.mkv"));
 
         assert!(

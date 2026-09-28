@@ -95,13 +95,18 @@ fn daemon(tray: bool) -> ExitCode {
     runtime.block_on(serve())
 }
 
-/// Bind the socket, supervise the daemon's tasks, and report what stopped them.
+/// Bind the socket, open the database, supervise the daemon's tasks, and
+/// report what stopped them.
 #[cfg(target_os = "linux")]
 async fn serve() -> ExitCode {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
 
     use benshi_core::clock::SystemClock;
+    use benshi_daemon::paths::{DATABASE, Role, directory};
+    use benshi_daemon::recognition::Recogniser;
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
+    use benshi_store::Store;
 
     let socket = benshi_daemon::ipc::socket_path();
     // The XDG Base Directory Specification asks for a warning where the
@@ -109,6 +114,10 @@ async fn serve() -> ExitCode {
     if let Some(fallback) = benshi_daemon::ipc::fallback() {
         eprintln!("benshi: {fallback}");
     }
+    // The socket is what says a daemon is running, so it is bound ahead of
+    // the database. A second daemon that works out the same socket ends here,
+    // and the database of the first is not brought to the schema of another
+    // build while it is written to.
     let listener = match benshi_daemon::ipc::bind(&socket) {
         Ok(listener) => Arc::new(listener),
         Err(unbound) => {
@@ -116,13 +125,33 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let database = match directory(Role::Data) {
+        Ok(data) => data.join(DATABASE),
+        Err(nowhere) => {
+            eprintln!("benshi: {nowhere}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = match Store::open(&database) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(unopened) => {
+            eprintln!("benshi: {} cannot be used: {unopened}", database.display());
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("benshi: listening on {}", socket.display());
+    eprintln!("benshi: recording in {}", database.display());
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
     let stopped = benshi_daemon::run(
         || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
         listener,
+        // No list to match a name against, so every file is refused and
+        // `benshi why` says so.
+        Recogniser::empty(),
+        store,
+        SystemTime::now,
         POLL_INTERVAL,
     )
     .await;
