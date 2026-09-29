@@ -44,9 +44,10 @@ fn the_daemon_says_that_detection_is_started_again() {
 
 #[test]
 fn a_daemon_that_cannot_say_it_goes_on_running() {
-    // A daemon outlives the terminal it was started from, and what it writes
-    // there after that fails. It is read here for its two lines and the
-    // first it says of detection, and the second is the one it cannot write.
+    // A daemon that outlives the terminal it was started from writes to a
+    // terminal that has gone, and the write fails. This one is read for its
+    // two lines and the first it says of detection, and the second is the
+    // one it cannot write.
     let temporary = Directory::of("t-unheard");
     let runtime = temporary.path().join("run");
     let data = temporary.path().join("data");

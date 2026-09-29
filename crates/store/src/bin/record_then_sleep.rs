@@ -5,6 +5,10 @@
 //! is printed and then reads what the file holds. It is not a command anybody
 //! runs by hand.
 
+// `println!` panics where the line cannot be written. The test reads the
+// line, and fails where this ends without it.
+#![allow(clippy::print_stdout)]
+
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime};

@@ -3,6 +3,10 @@
 //! The smallest program that observes the real world, kept because every later
 //! question about an adapter starts with "what does it actually see?".
 
+// `println!` panics where the line cannot be written. This is run by hand to
+// be read, and has nothing to go on to where it cannot print.
+#![allow(clippy::print_stdout)]
+
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

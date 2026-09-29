@@ -500,6 +500,54 @@ mod tests {
         }
     }
 
+    /// A stream that cannot be written to, as a pipe cannot whose reader has
+    /// gone.
+    struct Unwritable;
+
+    impl Write for Unwritable {
+        fn write(&mut self, _written: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// A stream that takes what is written to it and cannot be flushed.
+    struct Unflushable;
+
+    impl Write for Unflushable {
+        fn write(&mut self, written: &[u8]) -> std::io::Result<usize> {
+            Ok(written.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// A stream that takes one line and cannot be written to after it.
+    #[derive(Default)]
+    struct WritableForALine {
+        taken: bool,
+    }
+
+    impl Write for WritableForALine {
+        fn write(&mut self, written: &[u8]) -> std::io::Result<usize> {
+            if self.taken {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.taken = written.contains(&b'\n');
+
+            Ok(written.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A daemon listening on a socket of its own.
     struct Daemon {
         home: TempDir,
@@ -1204,5 +1252,158 @@ mod tests {
         let (_outcome, _shown, complained) = go(Command::Sources, &socket).await;
 
         assert!(complained.ends_with('\n'), "got {complained:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_cannot_be_said_is_a_failure_all_the_same() {
+        let (_home, socket) = nowhere();
+        let mut out = Shared::default();
+
+        let outcome = run(Command::Sources, &socket, &mut out, &mut Unwritable).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(out.text().is_empty(), "printed {:?}", out.text());
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_cannot_be_printed_is_a_failure_that_says_so() {
+        let daemon = Daemon::listening(vec![a_source(PLAYER, "mpv")]);
+        let mut err = Shared::default();
+
+        let outcome = run(Command::Sources, &daemon.socket, &mut Unwritable, &mut err).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            err.text(),
+            "benshi: the listing could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explanation_that_cannot_be_printed_is_a_failure_that_says_so() {
+        let daemon = Daemon::listening(Vec::new());
+        let mut err = Shared::default();
+
+        let outcome = run(Command::Why, &daemon.socket, &mut Unwritable, &mut err).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            err.text(),
+            "benshi: the explanation could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_that_cannot_be_printed_ends_the_stream_as_a_failure_that_says_so() {
+        let daemon = Daemon::listening(Vec::new());
+        let err = Shared::default();
+        let socket = daemon.socket.clone();
+        let watching = tokio::spawn({
+            let mut err = err.clone();
+            async move { run(Command::Watch, &socket, &mut Unwritable, &mut err).await }
+        });
+        daemon.subscribed().await;
+
+        daemon.bus.publish(BusEvent::SourcesChanged {
+            sources: vec![PlayerId(PLAYER.to_owned())],
+        });
+
+        let outcome = timeout(PATIENCE, watching)
+            .await
+            .expect("the stream ended")
+            .expect("the stream did not panic");
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            err.text(),
+            "benshi: the stream could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_that_cannot_be_flushed_ends_the_stream_as_a_failure_that_says_so() {
+        let daemon = Daemon::listening(Vec::new());
+        let err = Shared::default();
+        let socket = daemon.socket.clone();
+        let watching = tokio::spawn({
+            let mut err = err.clone();
+            async move { run(Command::Watch, &socket, &mut Unflushable, &mut err).await }
+        });
+        daemon.subscribed().await;
+
+        daemon.bus.publish(BusEvent::SourcesChanged {
+            sources: vec![PlayerId(PLAYER.to_owned())],
+        });
+
+        let outcome = timeout(PATIENCE, watching)
+            .await
+            .expect("the stream ended")
+            .expect("the stream did not panic");
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            err.text(),
+            "benshi: the stream could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_line_of_a_summary_that_cannot_be_printed_is_a_failure_that_says_so() {
+        // No source is declared, so the one reading comes from a source that
+        // outran the listing, and the summary has a second line to say so.
+        let daemon = Daemon::listening(Vec::new());
+        let err = Shared::default();
+        let output = daemon.home.path().join("trace.jsonl");
+        let socket = daemon.socket.clone();
+        let command = Command::Record {
+            duration: Duration::from_secs(60),
+            output: output.clone(),
+        };
+        let running = tokio::spawn({
+            let mut err = err.clone();
+            async move {
+                let mut out = WritableForALine::default();
+                run(command, &socket, &mut out, &mut err).await
+            }
+        });
+        daemon.subscribed().await;
+        let recording = Recording {
+            running,
+            output,
+            out: Shared::default(),
+            err,
+        };
+
+        daemon.bus.publish(BusEvent::Snapshot(a_reading(0)));
+        recording.holding(1).await;
+        daemon.goes_away();
+        let (outcome, _shown, complained) = recording.until_it_stops().await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            complained,
+            "benshi: the summary could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_that_cannot_be_printed_is_a_failure_that_says_so() {
+        let daemon = Daemon::listening(Vec::new());
+        let mut err = Shared::default();
+        let recording = Command::Record {
+            duration: Duration::from_millis(1),
+            output: daemon.home.path().join("trace.jsonl"),
+        };
+
+        let outcome = timeout(
+            PATIENCE,
+            run(recording, &daemon.socket, &mut Unwritable, &mut err),
+        )
+        .await
+        .expect("the recording ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(
+            err.text(),
+            "benshi: the summary could not be printed: broken pipe\n"
+        );
     }
 }
