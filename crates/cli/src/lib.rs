@@ -20,6 +20,8 @@ pub mod commands;
 
 pub mod render;
 
+use std::fmt;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -53,6 +55,15 @@ impl Cli {
     }
 }
 
+/// Says a line on stderr, and goes on where it cannot be written.
+///
+/// `eprintln!` panics where the write fails, as one does to a pipe whose
+/// reader has gone. A client that ended there would answer nothing, and
+/// would end with the code of a panic where it had failed.
+fn say(line: fmt::Arguments<'_>) {
+    drop(writeln!(io::stderr(), "benshi: {line}"));
+}
+
 /// Run the client from a process that has no runtime yet.
 ///
 /// A current-thread runtime, because a client is one connection awaited one
@@ -68,15 +79,15 @@ pub fn main(arguments: Cli) -> ExitCode {
     if arguments.socket.is_none()
         && let Some(fallback) = benshi_daemon::ipc::fallback()
     {
-        eprintln!("benshi: {fallback}");
+        say(format_args!("{fallback}"));
     }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(failure) => {
-            eprintln!("benshi: {failure}");
+        Err(unbuilt) => {
+            say(format_args!("the runtime could not be started: {unbuilt}"));
             return ExitCode::FAILURE;
         }
     };
@@ -84,8 +95,8 @@ pub fn main(arguments: Cli) -> ExitCode {
     runtime.block_on(commands::run(
         arguments.command,
         &socket,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
+        &mut io::stdout(),
+        &mut io::stderr(),
     ))
 }
 

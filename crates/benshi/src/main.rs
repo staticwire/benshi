@@ -9,6 +9,8 @@
 //! to a non-interactive session, which rules out running as a system service.
 
 use std::ffi::OsStr;
+use std::fmt;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use benshi_cli::Cli;
@@ -53,6 +55,17 @@ impl Invocation {
     }
 }
 
+/// Says a line on stderr, and goes on where it cannot be written.
+///
+/// A daemon that outlives the terminal it was started from writes to a
+/// terminal that has gone, and the write fails. So does one to a pipe whose
+/// reader has gone and to a file on a disk that is full. `eprintln!` panics
+/// over each of them, which ends a daemon over a line nobody was there to
+/// read, and ends a run that failed with the code of a panic.
+fn say(line: fmt::Arguments<'_>) {
+    drop(writeln!(io::stderr(), "benshi: {line}"));
+}
+
 fn main() -> ExitCode {
     match Invocation::of(std::env::args_os()) {
         Invocation::Daemon { tray } => daemon(tray),
@@ -78,7 +91,7 @@ fn daemon(tray: bool) -> ExitCode {
         // Said rather than passed over. A tray that was asked for and is
         // silently absent looks exactly like a tray that failed to appear, and
         // the two are fixed differently.
-        eprintln!("benshi: there is no tray yet, running without one");
+        say(format_args!("there is no tray yet, running without one"));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -87,7 +100,7 @@ fn daemon(tray: bool) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(unbuilt) => {
-            eprintln!("benshi: the runtime could not be started: {unbuilt}");
+            say(format_args!("the runtime could not be started: {unbuilt}"));
             return ExitCode::FAILURE;
         }
     };
@@ -99,7 +112,6 @@ fn daemon(tray: bool) -> ExitCode {
 /// report what stopped them.
 #[cfg(target_os = "linux")]
 async fn serve() -> ExitCode {
-    use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
 
@@ -113,7 +125,7 @@ async fn serve() -> ExitCode {
     // The XDG Base Directory Specification asks for a warning where the
     // runtime directory is replaced.
     if let Some(fallback) = benshi_daemon::ipc::fallback() {
-        eprintln!("benshi: {fallback}");
+        say(format_args!("{fallback}"));
     }
     // The socket is what says a daemon is running, so it is bound ahead of
     // the database. A second daemon that works out the same socket ends here,
@@ -122,26 +134,32 @@ async fn serve() -> ExitCode {
     let listener = match benshi_daemon::ipc::bind(&socket) {
         Ok(listener) => Arc::new(listener),
         Err(unbound) => {
-            eprintln!("benshi: {} cannot be used: {unbound}", socket.display());
+            say(format_args!(
+                "{} cannot be used: {unbound}",
+                socket.display()
+            ));
             return ExitCode::FAILURE;
         }
     };
     let database = match directory(Role::Data) {
         Ok(data) => data.join(DATABASE),
         Err(nowhere) => {
-            eprintln!("benshi: {nowhere}");
+            say(format_args!("{nowhere}"));
             return ExitCode::FAILURE;
         }
     };
     let store = match Store::open(&database) {
         Ok(store) => Arc::new(Mutex::new(store)),
         Err(unopened) => {
-            eprintln!("benshi: {} cannot be used: {unopened}", database.display());
+            say(format_args!(
+                "{} cannot be used: {unopened}",
+                database.display()
+            ));
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("benshi: listening on {}", socket.display());
-    eprintln!("benshi: recording in {}", database.display());
+    say(format_args!("listening on {}", socket.display()));
+    say(format_args!("recording in {}", database.display()));
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
@@ -156,12 +174,7 @@ async fn serve() -> ExitCode {
         POLL_INTERVAL,
         // Said as it happens: the socket goes on answering once detection
         // has stopped, and the process does not end to say so.
-        |notice| {
-            // A daemon outlives the terminal it was started from. A line
-            // that cannot be written there has nobody to read it, and
-            // `eprintln!` would end the daemon over it.
-            drop(writeln!(io::stderr(), "benshi: {notice}"));
-        },
+        |notice| say(format_args!("{notice}")),
     )
     .await;
 
@@ -178,7 +191,7 @@ async fn serve() -> ExitCode {
 /// failed rather than that this platform has no daemon yet.
 #[cfg(not(target_os = "linux"))]
 fn daemon(_tray: bool) -> ExitCode {
-    eprintln!("benshi: this platform has no detection adapter yet");
+    say(format_args!("this platform has no detection adapter yet"));
 
     ExitCode::FAILURE
 }

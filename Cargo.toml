@@ -27,3 +27,9 @@ unsafe_code = "deny"
 pedantic = { level = "warn", priority = -1 }
 # Discarding a Result must be caught by a lint rather than by review.
 let_underscore_must_use = "deny"
+# `println!`, `eprintln!` and `dbg!` panic where the write fails, over a line
+# nobody was there to read. A program that prints says so where it does,
+# with what a failed write costs it.
+dbg_macro = "deny"
+print_stderr = "deny"
+print_stdout = "deny"

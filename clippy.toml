@@ -6,3 +6,8 @@ msrv = "1.98"
 # code because of their internal capitals. They are prose, not identifiers, so
 # backticking them would be wrong. ".." keeps clippy's own default list.
 doc-valid-idents = ["AniList", "MyAnimeList", "SQLite", "MPRIS", "SMTC", "WinRT", ".."]
+
+# clippy::print_stdout, clippy::print_stderr and clippy::dbg_macro are denied
+# for the panic where the write fails. In a test that panic fails the test.
+allow-dbg-in-tests = true
+allow-print-in-tests = true
