@@ -99,6 +99,7 @@ fn daemon(tray: bool) -> ExitCode {
 /// report what stopped them.
 #[cfg(target_os = "linux")]
 async fn serve() -> ExitCode {
+    use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
 
@@ -144,7 +145,7 @@ async fn serve() -> ExitCode {
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
-    let stopped = benshi_daemon::run(
+    benshi_daemon::run(
         || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
         listener,
         // No list to match a name against, so every file is refused and
@@ -153,15 +154,20 @@ async fn serve() -> ExitCode {
         store,
         SystemTime::now,
         POLL_INTERVAL,
+        // Said as it happens: the socket goes on answering once detection
+        // has stopped, and the process does not end to say so.
+        |notice| {
+            // A daemon outlives the terminal it was started from. A line
+            // that cannot be written there has nobody to read it, and
+            // `eprintln!` would end the daemon over it.
+            drop(writeln!(io::stderr(), "benshi: {notice}"));
+        },
     )
     .await;
 
     // Reached only when nothing is left running, which for a daemon is a
-    // failure however tidily each task arrived at it.
-    for task in &stopped {
-        eprintln!("benshi: {} {}", task.name, task.stopped_by);
-    }
-
+    // failure however tidily each task arrived at it. What stopped each
+    // task was said as it stopped.
     ExitCode::FAILURE
 }
 

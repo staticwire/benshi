@@ -40,9 +40,16 @@
 //! records nothing.
 //!
 //! **A store that refuses a call stops the task for good.** Detecting on
-//! while nothing is recorded looks the same as working. The supervisor
-//! records why the task stopped, and [`run`](crate::run) returns that record
-//! only once every task has stopped.
+//! while nothing is recorded looks the same as working. The supervisor tells
+//! of the task stopping as it stops, which is while the socket goes on
+//! answering.
+//!
+//! **A database in use is the one refusal that passes.** Another connection
+//! that writes to the file keeps a write here waiting, and the store gives up
+//! after a second. The task is started again after a wait, asks the store
+//! what it holds, which in WAL a connection that writes does not keep
+//! waiting, and goes on from there once a total can be kept. What was played
+//! in between is not counted.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
@@ -144,6 +151,30 @@ fn classify(error: WatchError) -> TaskError {
     }
 }
 
+/// Which class a call the store refused belongs to.
+///
+/// A database in use is free again once the connection that has it gives it
+/// up, so that one is transient, and the task that is started again goes on
+/// from what the store holds. Every other is permanent. The match is
+/// exhaustive so that a variant the store gains has to state its own answer
+/// here.
+fn refused(error: benshi_store::Error) -> TaskError {
+    use benshi_store::Error;
+
+    match error {
+        Error::Busy(_) => TaskError::Transient(error.into()),
+        Error::Directory { .. }
+        | Error::Open { .. }
+        | Error::Migrate { .. }
+        | Error::FromTheFuture { .. }
+        | Error::Write(_)
+        | Error::Operation { .. }
+        | Error::Orphan { .. }
+        | Error::Media { .. }
+        | Error::Instant { .. } => TaskError::Permanent(error.into()),
+    }
+}
+
 /// What a detection task is wired to: everything it reads and writes that
 /// outlives it.
 ///
@@ -179,8 +210,9 @@ pub struct Wiring {
 ///
 /// # Errors
 ///
-/// [`TaskError::Permanent`] when the store refuses the call, saying what the
-/// store said.
+/// [`TaskError::Transient`] when the database is in use, and
+/// [`TaskError::Permanent`] when the store refuses the call for any other
+/// reason. Both say what the store said.
 ///
 /// # Panics
 ///
@@ -199,7 +231,7 @@ where
     });
 
     match called.await {
-        Ok(answered) => answered.map_err(|refused| TaskError::Permanent(refused.into())),
+        Ok(answered) => answered.map_err(refused),
         // Nothing aborts this handle, and a runtime cancels a blocking call
         // only by shutting down before the call starts. The daemon's runtime
         // shuts down after its last task has ended, so a call that did not
@@ -275,10 +307,11 @@ impl<W: PlayerWatcher> Detection<W> {
     /// # Errors
     ///
     /// Returns [`TaskError::Transient`] when a round cannot reach the
-    /// platform. The supervisor retries with backoff, which for a session bus
-    /// that went away is the right answer and the only one. Returns
-    /// [`TaskError::Permanent`] when the store refuses a call, and the
-    /// supervisor leaves the task stopped.
+    /// platform, and when the database is in use. The supervisor retries
+    /// with backoff, which for a session bus that went away is the right
+    /// answer and the only one. Returns [`TaskError::Permanent`] when the
+    /// store refuses a call for any other reason, and the supervisor leaves
+    /// the task stopped.
     pub async fn run(&mut self) -> Result<(), TaskError> {
         let mut ticker = tokio::time::interval(self.period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -692,6 +725,18 @@ mod tests {
                 .expect("the file opens for writing")
                 .execute_batch(statements)
                 .expect("the statements run");
+        }
+
+        /// Another connection that has taken the write lock, and holds it
+        /// for as long as it lives.
+        fn a_writer(&self) -> rusqlite::Connection {
+            let writer =
+                rusqlite::Connection::open(&self.path).expect("the file opens a second time");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the write lock is free");
+
+            writer
         }
 
         /// Have the store refuse every statement of this kind on this table.
@@ -2045,6 +2090,50 @@ mod tests {
         assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
         assert!(
             failure.to_string().contains("refused by the test"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clock_the_store_cannot_write_stops_detection_for_good() {
+        // A clock that reads a time before 1970 is broken, and goes on being
+        // broken however often detection is started again.
+        fn before_1970() -> SystemTime {
+            UNIX_EPOCH - Duration::from_secs(1)
+        }
+
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=1));
+        let wiring = Wiring {
+            recogniser: Arc::new(a_list()),
+            now: before_1970,
+            ..wired_to(&database)
+        };
+        let mut detection = Detection::new(watcher, wiring);
+
+        let failure = stopped_after(&mut detection, 1).await;
+
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(failure.to_string().contains("before 1970"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_total_the_store_is_too_busy_to_keep_is_a_fault_that_passes() {
+        // Detection that is started again goes on from what the store holds,
+        // once the connection that has the database has given it up. The
+        // round waits the second the store waits for the lock.
+        let database = Database::new();
+        let _writer = database.a_writer();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=1));
+        let mut detection = recording(watcher, &database);
+
+        let failure = stopped_after(&mut detection, 1).await;
+
+        assert!(matches!(failure, TaskError::Transient(_)), "{failure:?}");
+        assert!(
+            failure.to_string().contains("in use by another connection"),
             "{failure}"
         );
     }

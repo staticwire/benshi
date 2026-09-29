@@ -59,27 +59,28 @@ impl Store {
     /// # Errors
     ///
     /// [`Error::Instant`] for a clock reading before 1970 or past the year
-    /// 9999, before anything is written. [`Error::Write`] when any statement
-    /// fails. Nothing is left behind: the transaction is rolled back with
-    /// the error.
+    /// 9999, before anything is written. [`Error::Busy`] when another
+    /// connection has the database, and [`Error::Write`] when any statement
+    /// fails for any other reason. Nothing is left behind: the transaction
+    /// is rolled back with the error.
     pub fn record(&mut self, viewing: &Viewing) -> Result<(), Error> {
         let at = rfc3339(viewing.at).ok_or(Error::Instant { at: viewing.at })?;
         let seen = Kind::Progress {
             episode: viewing.episode,
         };
 
-        let transaction = self.connection.transaction().map_err(Error::Write)?;
+        let transaction = self.connection.transaction()?;
         let show = filed(&transaction, &viewing.title)?;
-        transaction
-            .execute(
-                "INSERT INTO episodes_seen (show, episode, seen_at, media) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![show, viewing.episode, at, viewing.media.escaped()],
-            )
-            .map_err(Error::Write)?;
+        transaction.execute(
+            "INSERT INTO episodes_seen (show, episode, seen_at, media) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![show, viewing.episode, at, viewing.media.escaped()],
+        )?;
         enqueue(&transaction, show, &seen, &at)?;
         registered(&transaction, show, viewing.episode)?;
-        transaction.commit().map_err(Error::Write)
+        transaction.commit()?;
+
+        Ok(())
     }
 }
 

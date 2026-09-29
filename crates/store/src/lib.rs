@@ -32,10 +32,10 @@ pub use record::Viewing;
 
 /// Why the store could not be opened or written.
 ///
-/// Every one of these is permanent rather than transient: a database that
-/// cannot be opened is reported before anything starts, and a statement that
-/// fails stops the task that ran it rather than letting the daemon go on
-/// detecting while it records nothing.
+/// Every one of these but [`Error::Busy`] is permanent rather than
+/// transient: a database that cannot be opened is reported before anything
+/// starts, and a statement that fails stops the task that ran it rather than
+/// letting the daemon go on detecting while it records nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The directory for the database could not be made.
@@ -78,8 +78,17 @@ pub enum Error {
         /// The schema this build brings a file to.
         known: u32,
     },
-    /// A statement failed on a database that is already open. The schema
-    /// version read that starts the migrations is one of them.
+    /// A statement failed because the database is in use by another
+    /// connection, which SQLite answers with `SQLITE_BUSY`.
+    ///
+    /// The one failure here that can pass on its own: the statement
+    /// succeeds when it is made again after the connection that has the
+    /// file has given it up.
+    #[error("the database is in use by another connection: {0}")]
+    Busy(#[source] rusqlite::Error),
+    /// A statement failed on a database that is already open, and the
+    /// database was not busy. The schema version read that starts the
+    /// migrations is one of them.
     #[error("the database could not be read or written: {0}")]
     Write(#[source] rusqlite::Error),
     /// A row in the queue that cannot be read as an operation.
@@ -122,6 +131,18 @@ pub enum Error {
     },
 }
 
+/// What a statement failed with on a database that is open: [`Error::Busy`]
+/// where SQLite answered that the database is busy, and [`Error::Write`]
+/// for everything else.
+impl From<rusqlite::Error> for Error {
+    fn from(cause: rusqlite::Error) -> Self {
+        match cause.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy) => Self::Busy(cause),
+            _ => Self::Write(cause),
+        }
+    }
+}
+
 /// One open database, at the current schema.
 #[derive(Debug)]
 pub struct Store {
@@ -152,6 +173,8 @@ impl Store {
     /// [`Error::Directory`] and [`Error::Open`] for what the filesystem and
     /// SQLite refuse, [`Error::Migrate`] for a migration that did not apply,
     /// and [`Error::FromTheFuture`] for a file a newer build wrote.
+    /// [`Error::Busy`] and [`Error::Write`] where the schema the file is at
+    /// cannot be read.
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(directory) = path.parent() {
             private_directory(directory).map_err(|cause| Error::Directory {
@@ -191,14 +214,12 @@ impl Store {
 
 /// File a show under its title where it is not filed, and answer its row.
 pub(crate) fn filed(connection: &Connection, title: &str) -> Result<i64, Error> {
-    connection
-        .execute("INSERT OR IGNORE INTO shows (title) VALUES (?1)", [title])
-        .map_err(Error::Write)?;
-    connection
-        .query_row("SELECT id FROM shows WHERE title = ?1", [title], |row| {
-            row.get(0)
-        })
-        .map_err(Error::Write)
+    connection.execute("INSERT OR IGNORE INTO shows (title) VALUES (?1)", [title])?;
+    let show = connection.query_row("SELECT id FROM shows WHERE title = ?1", [title], |row| {
+        row.get(0)
+    })?;
+
+    Ok(show)
 }
 
 /// Make sure the database's directory exists, private where this call is what
@@ -242,12 +263,15 @@ fn prepare(connection: &Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use benshi_core::path::RawPath;
     use tempfile::TempDir;
 
-    use super::{Error, Store};
+    use super::{Error, Store, Viewing};
     use crate::migrate::SCHEMA_VERSION;
+    use crate::watching::Total;
 
     /// A directory of our own, and a path two levels under it that does not
     /// exist yet, so that opening has to create the directory as well as the
@@ -385,6 +409,163 @@ mod tests {
         let store = Store::open(&database).expect("a fresh database opens");
 
         assert_eq!(pragma::<u32>(&store, "busy_timeout"), 1000);
+    }
+
+    const MEDIA: &[u8] = b"/anime/[Group] Show Title - 03.mkv";
+
+    fn an_instant() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+    }
+
+    fn a_total() -> Total {
+        Total {
+            title: "Show Title".to_owned(),
+            episode: Some(3),
+            media: RawPath::from_bytes(MEDIA.to_vec()),
+            watched: Duration::from_mins(9),
+            at: an_instant(),
+        }
+    }
+
+    fn a_viewing() -> Viewing {
+        Viewing {
+            title: "Show Title".to_owned(),
+            episode: Some(3),
+            media: RawPath::from_bytes(MEDIA.to_vec()),
+            at: an_instant(),
+        }
+    }
+
+    /// A store that waits a twentieth of a second for a lock, where one a
+    /// daemon opens waits a second. What it answers once it has waited is
+    /// the same, and a test of that need not take the second.
+    fn a_store_in_a_hurry(database: &Path) -> Store {
+        let store = Store::open(database).expect("a fresh database opens");
+        store
+            .connection
+            .pragma_update(None, "busy_timeout", 50)
+            .expect("the wait is writable");
+
+        store
+    }
+
+    /// Another connection that has taken the write lock, and holds it for as
+    /// long as it lives.
+    fn a_writer(database: &Path) -> rusqlite::Connection {
+        let writer = rusqlite::Connection::open(database).expect("the file opens a second time");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the write lock is free");
+
+        writer
+    }
+
+    #[test]
+    fn a_total_kept_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.keep(&a_total());
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn an_episode_recorded_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.record(&a_viewing());
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn an_episode_closed_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.close("Show Title", Some(3));
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn a_question_asked_while_another_connection_writes_is_answered() {
+        // In WAL a reader waits for nobody, so a store that cannot keep a
+        // total can still say what it holds.
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        store.keep(&a_total()).expect("the total is kept");
+        let _writer = a_writer(&database);
+
+        let asked = store.resume("Show Title", Some(3));
+
+        assert!(matches!(asked, Ok(Some(_))), "got {asked:?}");
+    }
+
+    /// A store whose file is kept in a rollback journal, as one that cannot
+    /// take WAL is. There a connection that has the file to itself keeps a
+    /// reader out as well.
+    fn a_store_without_wal(database: &Path) -> Store {
+        let store = a_store_in_a_hurry(database);
+        store
+            .connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("the mode is writable");
+        assert_eq!(pragma::<String>(&store, "journal_mode"), "delete");
+
+        store
+    }
+
+    /// Another connection that has the file to itself, and keeps it for as
+    /// long as it lives.
+    fn a_connection_with_the_file_to_itself(database: &Path) -> rusqlite::Connection {
+        let alone = rusqlite::Connection::open(database).expect("the file opens a second time");
+        alone
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("the file is free");
+
+        alone
+    }
+
+    #[test]
+    fn a_question_asked_of_a_file_another_connection_has_to_itself_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let store = a_store_without_wal(&database);
+        let _alone = a_connection_with_the_file_to_itself(&database);
+
+        let refused = store.resume("Show Title", Some(3));
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn a_queue_read_from_a_file_another_connection_has_to_itself_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let store = a_store_without_wal(&database);
+        let _alone = a_connection_with_the_file_to_itself(&database);
+
+        let refused = store.queued();
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn a_busy_database_says_that_it_is_in_use() {
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.keep(&a_total()).expect_err("the lock is held");
+
+        assert_eq!(
+            refused.to_string(),
+            "the database is in use by another connection: database is locked"
+        );
     }
 
     #[cfg(unix)]
