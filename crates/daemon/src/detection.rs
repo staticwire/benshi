@@ -1,5 +1,5 @@
 //! The detection task: what the platform reports, filtered by policy, on the
-//! bus.
+//! bus and in the store.
 //!
 //! This is where the adapter, the policy table and the event bus meet, and the
 //! only place the adapter meets either of the others. The adapter decides
@@ -20,14 +20,42 @@
 //! And a round decides what each admitted reading has open, leaving the last
 //! decision in [`Decided`] for a client asking why. Recognition itself is pure
 //! logic in `benshi-core`; what is here is the moment it is asked.
+//!
+//! **What was decided is what gets recorded.** Every admitted reading goes to
+//! a [`Session`] with the decision about it, and what the session answers is
+//! carried out in the store: what was watched of an episode is kept, an
+//! episode watched far enough is recorded, and an episode is closed when the
+//! last player that had it open has left it.
+//!
+//! **A player has left what it had open when a round hears nothing of it
+//! that says otherwise.** A reading that policy admitted says otherwise. So
+//! does a failure to answer, and so does a reading that came without a
+//! description of its source: in neither can the round tell what the player
+//! has open. That leaves a player no longer listed, one listed with nothing
+//! open, and one policy stopped admitting.
+//!
+//! **A task that stops closes nothing.** Its session goes with it, and an
+//! episode open in it that had registered keeps its marked total in the
+//! store. The next sitting of that episode goes on from that total and
+//! records nothing.
+//!
+//! **A store that refuses a call stops the task for good.** Detecting on
+//! while nothing is recorded looks the same as working. The supervisor
+//! records why the task stopped, and [`run`](crate::run) returns that record
+//! only once every task has stopped.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use benshi_core::policy::PolicyTable;
+use benshi_core::recognise::Recognition;
+use benshi_core::session::{Effect, Resumed, Session};
+use benshi_core::timeline::WatchedPolicy;
 use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
+use benshi_store::watching::Total;
+use benshi_store::{Store, Viewing};
 use tokio::time::MissedTickBehavior;
 
 use crate::bus::{BusEvent, EventBus};
@@ -47,14 +75,17 @@ const POISONED: &str = "the policy table was poisoned by a panic in another task
 /// What is said when the record of what was seen cannot be trusted.
 const POISONED_SEEN: &str = "what was last seen was poisoned by a panic in another task";
 
+/// What is said when the store cannot be trusted.
+const POISONED_STORE: &str = "the store was poisoned by a panic in a call into it";
+
 /// Every source the last round was able to describe.
 ///
 /// Written by the detection task at the end of each round that reached the
-/// platform, and read by a client asking for a listing, so that `benshi
-/// sources` shows what the daemon is acting on. Looking at the platform a
-/// second time would be fresher and could disagree with what detection is
-/// publishing, and for a command whose whole job is to explain the daemon,
-/// agreeing matters more than being current.
+/// platform and had no call refused by the store. Read by a client asking for
+/// a listing, so that `benshi sources` shows what the daemon is acting on.
+/// Looking at the platform a second time would be fresher and could disagree
+/// with what detection is publishing, and for a command whose whole job is to
+/// explain the daemon, agreeing matters more than being current.
 ///
 /// A source that did not answer is not here, because there is nothing to
 /// describe. It stays in the membership the bus publishes, which is where a
@@ -113,7 +144,72 @@ fn classify(error: WatchError) -> TaskError {
     }
 }
 
-/// Readings from a platform, filtered by policy, published to the bus.
+/// What a detection task is wired to: everything it reads and writes that
+/// outlives it.
+///
+/// A task that is started again builds a watcher and a [`Detection`] of its
+/// own and is handed this again, so what one attempt left is there for the
+/// next. Cloning shares every part but `now` and `period`, which are copied.
+#[derive(Debug, Clone)]
+pub struct Wiring {
+    /// Where readings and the membership are published.
+    pub bus: Arc<EventBus>,
+    /// Which sources a reading is admitted from. Shared rather than copied,
+    /// so that setting a policy changes what a running loop publishes without
+    /// restarting it.
+    pub policy: Arc<RwLock<PolicyTable>>,
+    /// Where each round leaves the sources it described.
+    pub seen: Seen,
+    /// What a reading's file is decided against.
+    pub recogniser: Arc<Recogniser>,
+    /// Where each round leaves its last decision.
+    pub decided: Decided,
+    /// Where what was watched is kept and an episode is recorded.
+    pub store: Arc<Mutex<Store>>,
+    /// The time of day, which the store writes beside what it keeps.
+    pub now: fn() -> SystemTime,
+    /// How long a round is from the one before it.
+    pub period: Duration,
+}
+
+/// Make one call into the store, on a thread that may block.
+///
+/// The store is locked on that thread and for the one call, so the lock is
+/// never held across an await.
+///
+/// # Errors
+///
+/// [`TaskError::Permanent`] when the store refuses the call, saying what the
+/// store said.
+///
+/// # Panics
+///
+/// If the call panicked, or if a panic in an earlier call poisoned the store.
+/// Either is a bug, and the supervisor records the panic and restarts the
+/// task. A poisoned store stays poisoned, so a restarted task panics again at
+/// its first call into it.
+async fn ask<T, C>(store: Arc<Mutex<Store>>, call: C) -> Result<T, TaskError>
+where
+    T: Send + 'static,
+    C: FnOnce(&mut Store) -> Result<T, benshi_store::Error> + Send + 'static,
+{
+    let called = tokio::task::spawn_blocking(move || {
+        let mut store = store.lock().expect(POISONED_STORE);
+        call(&mut store)
+    });
+
+    match called.await {
+        Ok(answered) => answered.map_err(|refused| TaskError::Permanent(refused.into())),
+        // Nothing aborts this handle, and a runtime cancels a blocking call
+        // only by shutting down before the call starts. The daemon's runtime
+        // shuts down after its last task has ended, so a call that did not
+        // come back panicked, and the panic is handed on as it was raised.
+        Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
+    }
+}
+
+/// Readings from a platform, filtered by policy, published to the bus and
+/// recorded in the store.
 #[derive(Debug)]
 pub struct Detection<W> {
     watcher: W,
@@ -122,28 +218,35 @@ pub struct Detection<W> {
     seen: Seen,
     recogniser: Arc<Recogniser>,
     decided: Decided,
+    store: Arc<Mutex<Store>>,
+    now: fn() -> SystemTime,
     period: Duration,
     listed: BTreeSet<PlayerId>,
+    session: Session,
+    /// The players the session was handed a reading of and has not been
+    /// told have left.
+    heard: BTreeSet<PlayerId>,
 }
 
 impl<W: PlayerWatcher> Detection<W> {
-    /// Detection over one platform, reading one policy table.
+    /// Detection over one platform, wired to what outlives it.
     ///
-    /// The table is shared rather than copied, so that setting a policy changes
-    /// what a running loop publishes without restarting it. `seen` and
-    /// `decided` are the other direction: what each round found and what it
-    /// decided, left where a client can read them. `recogniser` is what a
-    /// reading's file is decided against.
+    /// Nothing is open in the session it begins with. What was watched
+    /// before it began comes back from the store, at the first reading of
+    /// each episode.
     #[must_use]
-    pub fn new(
-        watcher: W,
-        bus: Arc<EventBus>,
-        policy: Arc<RwLock<PolicyTable>>,
-        seen: Seen,
-        recogniser: Arc<Recogniser>,
-        decided: Decided,
-        period: Duration,
-    ) -> Self {
+    pub fn new(watcher: W, wiring: Wiring) -> Self {
+        let Wiring {
+            bus,
+            policy,
+            seen,
+            recogniser,
+            decided,
+            store,
+            now,
+            period,
+        } = wiring;
+
         Self {
             watcher,
             bus,
@@ -151,8 +254,12 @@ impl<W: PlayerWatcher> Detection<W> {
             seen,
             recogniser,
             decided,
+            store,
+            now,
             period,
             listed: BTreeSet::new(),
+            session: Session::new(WatchedPolicy::default()),
+            heard: BTreeSet::new(),
         }
     }
 
@@ -169,7 +276,9 @@ impl<W: PlayerWatcher> Detection<W> {
     ///
     /// Returns [`TaskError::Transient`] when a round cannot reach the
     /// platform. The supervisor retries with backoff, which for a session bus
-    /// that went away is the right answer and the only one.
+    /// that went away is the right answer and the only one. Returns
+    /// [`TaskError::Permanent`] when the store refuses a call, and the
+    /// supervisor leaves the task stopped.
     pub async fn run(&mut self) -> Result<(), TaskError> {
         let mut ticker = tokio::time::interval(self.period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -180,7 +289,8 @@ impl<W: PlayerWatcher> Detection<W> {
         }
     }
 
-    /// One round: read the platform, apply policy, publish.
+    /// One round: read the platform, apply policy, record and publish what
+    /// was admitted, and let go of whoever has left.
     async fn round(&mut self) -> Result<(), TaskError> {
         let PollOutcome {
             sources,
@@ -202,7 +312,13 @@ impl<W: PlayerWatcher> Detection<W> {
             .collect();
         self.publish_membership(&listed);
 
+        // Whoever the session was handed a reading of may have an episode
+        // open, and has left it unless this round hears otherwise. A player
+        // that did not answer has not left: it failed to speak.
+        let mut quiet = self.heard.clone();
+
         for (player, reason) in failures {
+            quiet.remove(&player);
             self.bus.publish(BusEvent::SourceFailed {
                 player,
                 reason: reason.to_string(),
@@ -216,15 +332,31 @@ impl<W: PlayerWatcher> Detection<W> {
 
         for snapshot in snapshots {
             if admitted.contains(&snapshot.player) {
-                self.decide(&snapshot);
+                quiet.remove(&snapshot.player);
+                if !self.heard.contains(&snapshot.player) {
+                    self.heard.insert(snapshot.player.clone());
+                }
+                let decision = self.decide(&snapshot);
+                let effects = self.session.advance(&snapshot, decision.as_ref());
+                self.carry_out(effects).await?;
                 self.bus.publish(BusEvent::Snapshot(snapshot));
             } else if !described.contains(&snapshot.player) {
+                // The round cannot tell what this player has open, so the
+                // player is kept in.
+                quiet.remove(&snapshot.player);
                 self.bus.publish(BusEvent::SourceFailed {
                     player: snapshot.player,
                     reason: UNDESCRIBED.to_owned(),
                 });
             }
         }
+
+        // After the readings, so that a player let go here does not close an
+        // episode that another player opened in this round.
+        self.heard.retain(|player| !quiet.contains(player));
+        let quiet: Vec<PlayerId> = quiet.into_iter().collect();
+        let effects = self.session.gone(&quiet);
+        self.carry_out(effects).await?;
 
         self.seen.record(sources);
 
@@ -245,17 +377,18 @@ impl<W: PlayerWatcher> Detection<W> {
         }
     }
 
-    /// Decide what an admitted reading has open, and leave the decision where a
-    /// client can read it.
+    /// Decide what an admitted reading has open, leave the decision where a
+    /// client can read it, and answer with it.
     ///
     /// A file and nothing else. An address names no file on this machine, and
     /// a title with nothing underneath it is what a browser publishes;
-    /// recognition reads filenames, and neither is one. Every admitted reading
-    /// of a file is decided, every round, so that what a client reads is the
-    /// decision about the reading the daemon last acted on.
-    fn decide(&self, snapshot: &PlayerSnapshot) {
+    /// recognition reads filenames, and neither is one, so neither is answered
+    /// for. Every admitted reading of a file is decided, every round, so that
+    /// what a client reads is the decision about the reading the daemon last
+    /// acted on.
+    fn decide(&self, snapshot: &PlayerSnapshot) -> Option<Recognition> {
         let MediaRef::LocalFile(path) = &snapshot.media else {
-            return;
+            return None;
         };
         let (parsed, answer) = self.recogniser.decide(path);
 
@@ -263,8 +396,75 @@ impl<W: PlayerWatcher> Detection<W> {
             player: snapshot.player.clone(),
             media: snapshot.media.clone(),
             parsed,
-            answer,
+            answer: answer.clone(),
         });
+
+        Some(answer)
+    }
+
+    /// Carry out what the session answered, in the order it answered, and
+    /// bring the answer to a question back to it before anything else.
+    ///
+    /// The time of day is read for each call that writes one, as the call is
+    /// made.
+    async fn carry_out(&mut self, effects: Vec<Effect>) -> Result<(), TaskError> {
+        for effect in effects {
+            match effect {
+                Effect::Resume {
+                    question,
+                    title,
+                    episode,
+                } => {
+                    let kept = ask(Arc::clone(&self.store), move |store| {
+                        store.resume(&title, episode)
+                    })
+                    .await?;
+                    self.session.resumed(
+                        question,
+                        kept.map(|kept| Resumed {
+                            watched: kept.watched,
+                            registered: kept.registered,
+                        }),
+                    );
+                }
+                Effect::Keep {
+                    title,
+                    episode,
+                    media,
+                    watched,
+                } => {
+                    let total = Total {
+                        title,
+                        episode,
+                        media,
+                        watched,
+                        at: (self.now)(),
+                    };
+                    ask(Arc::clone(&self.store), move |store| store.keep(&total)).await?;
+                }
+                Effect::Record {
+                    title,
+                    episode,
+                    media,
+                } => {
+                    let viewing = Viewing {
+                        title,
+                        episode,
+                        media,
+                        at: (self.now)(),
+                    };
+                    ask(Arc::clone(&self.store), move |store| store.record(&viewing)).await?;
+                }
+                Effect::Close { title, episode } => {
+                    ask(Arc::clone(&self.store), move |store| {
+                        store.close(&title, episode)
+                    })
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Which of this round's sources policy admits readings from.
@@ -296,21 +496,30 @@ impl<W: PlayerWatcher> Detection<W> {
 // nothing to await, rather than being spelled out as the future it desugars to.
 #[allow(clippy::unused_async_trait_impl)]
 mod tests {
-    use super::{Detection, Seen};
+    use super::{Detection, Seen, Wiring};
     use crate::bus::{BusEvent, EventBus};
     use crate::recognition::{Decided, Recogniser};
-    use benshi_core::clock::Timestamp;
+    use crate::supervisor::TaskError;
+    use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognise::Recognition;
+    use benshi_core::recognise::altname::Altnames;
     use benshi_core::recognise::parse::Episode;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
     use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
-    use std::collections::VecDeque;
-    use std::sync::{Arc, RwLock};
-    use std::time::Duration;
+    use benshi_store::queue::{Kind, Operation};
+    use benshi_store::watching::{Kept, Total};
+    use benshi_store::{Store, Viewing};
+    use std::collections::{BTreeSet, VecDeque};
+    use std::ops::RangeInclusive;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
     use tokio::sync::broadcast::Receiver;
 
     /// The period a test drives the loop at.
@@ -318,6 +527,37 @@ mod tests {
     /// Every test that lets the loop tick pauses the clock, so this is virtual
     /// time and no test waits for it.
     const INTERVAL: Duration = Duration::from_millis(100);
+
+    /// The length the readings of [`playing`] report.
+    const LENGTH: Duration = Duration::from_mins(4);
+
+    /// The interval between two readings that are a step apart.
+    const STEP: Duration = Duration::from_secs(5);
+
+    /// The reading at which half of [`LENGTH`] has been watched, counted
+    /// from nought.
+    ///
+    /// The first reading of a sitting adds nothing and each one after it adds
+    /// a [`STEP`], so two minutes are watched at the twenty-fourth after it.
+    const HALF_AT: u32 = 24;
+
+    /// The title the list holds for the series.
+    const SERIES: &str = "Show Title";
+
+    /// The title the list holds for the film.
+    const FILM: &str = "A Film";
+
+    const THIRD: &str = "/anime/[Group] Show Title - 03 [1080p].mkv";
+    const NOT_LISTED: &str = "/anime/[Group] Some Other Show - 03 [1080p].mkv";
+
+    /// What [`the_time`] reads, as a store writes it.
+    const THE_TIME: &str = "2033-05-18T03:33:20Z";
+
+    /// The time of day in every test here, which a store writes beside what
+    /// it keeps.
+    fn the_time() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(2_000_000_000)
+    }
 
     fn a_source(identity: &str, app: &str) -> SourceInfo {
         SourceInfo {
@@ -359,26 +599,155 @@ mod tests {
         )
     }
 
+    /// A database in a directory of its own, which goes when this does.
+    struct Database {
+        _home: TempDir,
+        path: PathBuf,
+        store: Arc<Mutex<Store>>,
+    }
+
+    /// One row of `episodes_seen`, as `sqlite3` shows it.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Viewed {
+        title: String,
+        episode: Option<u32>,
+        media: String,
+        at: String,
+    }
+
+    impl Database {
+        fn new() -> Self {
+            let home = tempfile::tempdir().expect("a directory of our own");
+            let path = home.path().join("data").join("benshi.db");
+            let store = Store::open(&path).expect("the database opens");
+
+            Self {
+                _home: home,
+                path,
+                store: Arc::new(Mutex::new(store)),
+            }
+        }
+
+        /// What the store holds of an episode.
+        fn kept(&self, title: &str, episode: Option<u32>) -> Option<Kept> {
+            self.store
+                .lock()
+                .expect("the store")
+                .resume(title, episode)
+                .expect("the total reads")
+        }
+
+        /// Every operation in the queue.
+        fn queued(&self) -> Vec<Operation> {
+            self.store
+                .lock()
+                .expect("the store")
+                .queued()
+                .expect("the queue reads")
+        }
+
+        /// The rows a query answers, read from the file as `sqlite3` reads
+        /// it.
+        fn rows<T>(
+            &self,
+            query: &str,
+            read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        ) -> Vec<T> {
+            let connection =
+                rusqlite::Connection::open(&self.path).expect("the file opens for reading");
+            let mut statement = connection.prepare(query).expect("a query SQLite takes");
+            statement
+                .query_map([], read)
+                .expect("the query runs")
+                .collect::<Result<_, _>>()
+                .expect("every row reads")
+        }
+
+        /// Every episode recorded as seen, in the order they were recorded.
+        fn seen(&self) -> Vec<Viewed> {
+            self.rows(
+                "SELECT shows.title, episode, media, seen_at \
+                 FROM episodes_seen JOIN shows ON shows.id = episodes_seen.show \
+                 ORDER BY episodes_seen.id",
+                |row| {
+                    Ok(Viewed {
+                        title: row.get(0)?,
+                        episode: row.get(1)?,
+                        media: row.get(2)?,
+                        at: row.get(3)?,
+                    })
+                },
+            )
+        }
+
+        /// How many rows a table holds.
+        fn count_of(&self, table: &str) -> Vec<u32> {
+            self.rows(&format!("SELECT count(*) FROM {table}"), |row| row.get(0))
+        }
+
+        /// Change the file from outside the daemon, as a person with
+        /// `sqlite3` can.
+        fn by_hand(&self, statements: &str) {
+            rusqlite::Connection::open(&self.path)
+                .expect("the file opens for writing")
+                .execute_batch(statements)
+                .expect("the statements run");
+        }
+
+        /// Have the store refuse every statement of this kind on this table.
+        fn refusing(&self, what: &str, table: &str) {
+            self.by_hand(&format!(
+                "CREATE TRIGGER refused BEFORE {what} ON {table} \
+                 BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;"
+            ));
+        }
+    }
+
+    /// Two series and a film, each spelled one way, and nothing named by
+    /// hand.
+    fn a_list() -> Recogniser {
+        Recogniser::of(
+            [SERIES, "Second Series", FILM].into_iter().collect(),
+            Altnames::new(),
+        )
+    }
+
+    /// Wiring to this database and [`the_time`], with the table a user starts
+    /// with, nothing to match a name against, and records of its own.
+    fn wired_to(database: &Database) -> Wiring {
+        Wiring {
+            bus: Arc::new(EventBus::new()),
+            policy: Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
+            seen: Seen::new(),
+            recogniser: Arc::new(Recogniser::empty()),
+            decided: Decided::new(),
+            store: Arc::clone(&database.store),
+            now: the_time,
+            period: INTERVAL,
+        }
+    }
+
     /// Detection over these rounds, against this policy table, leaving what it
     /// saw in `seen`.
     ///
-    /// Nothing to match a name against, and no decision read back: a test that
-    /// reads one takes [`deciding`] instead.
+    /// Nothing to match a name against, so nothing reaches the database it is
+    /// handed back with, and no decision read back: a test that reads one
+    /// takes [`deciding`] instead.
     fn detecting(
         watcher: ScriptedWatcher,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
         seen: Seen,
-    ) -> Detection<ScriptedWatcher> {
-        Detection::new(
-            watcher,
+    ) -> (Database, Detection<ScriptedWatcher>) {
+        let database = Database::new();
+        let wiring = Wiring {
             bus,
             policy,
             seen,
-            Arc::new(Recogniser::empty()),
-            Decided::new(),
-            INTERVAL,
-        )
+            ..wired_to(&database)
+        };
+
+        (database, Detection::new(watcher, wiring))
     }
 
     /// Detection over these rounds, leaving its decisions in `decided`.
@@ -386,16 +755,127 @@ mod tests {
         watcher: ScriptedWatcher,
         bus: Arc<EventBus>,
         decided: Decided,
-    ) -> Detection<ScriptedWatcher> {
-        Detection::new(
-            watcher,
+    ) -> (Database, Detection<ScriptedWatcher>) {
+        let database = Database::new();
+        let wiring = Wiring {
             bus,
-            Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
-            Seen::new(),
-            Arc::new(Recogniser::empty()),
             decided,
-            INTERVAL,
+            ..wired_to(&database)
+        };
+
+        (database, Detection::new(watcher, wiring))
+    }
+
+    /// Detection over these rounds that decides against [`a_list`] and
+    /// records in this database, with `policy` to say who is admitted.
+    fn recording_under(
+        watcher: ScriptedWatcher,
+        database: &Database,
+        policy: Arc<RwLock<PolicyTable>>,
+    ) -> Detection<ScriptedWatcher> {
+        let wiring = Wiring {
+            policy,
+            recogniser: Arc::new(a_list()),
+            ..wired_to(database)
+        };
+
+        Detection::new(watcher, wiring)
+    }
+
+    /// Detection over these rounds that decides against [`a_list`] and
+    /// records in this database.
+    fn recording(watcher: ScriptedWatcher, database: &Database) -> Detection<ScriptedWatcher> {
+        recording_under(
+            watcher,
+            database,
+            Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
         )
+    }
+
+    /// The instant this many steps after the first reading of a test.
+    ///
+    /// Every clock made here starts at one epoch and is moved once, so the
+    /// instants compare as the instants of one clock do.
+    fn after(steps: u32) -> Timestamp {
+        let clock = TestClock::new();
+        clock.advance(STEP * steps);
+
+        clock.now()
+    }
+
+    /// A reading of this file being played, this many steps into a test.
+    ///
+    /// No position, because nothing here is about one: watched time is
+    /// counted from the instants and the states.
+    fn playing(source: &SourceInfo, name: &str, steps: u32) -> PlayerSnapshot {
+        PlayerSnapshot {
+            player: source.player.clone(),
+            media: MediaRef::LocalFile(a_path(name)),
+            state: PlayState::Playing,
+            position: Known::NotReported,
+            duration: Known::Value(LENGTH),
+            observed_at: after(steps),
+        }
+    }
+
+    /// A round that described these sources and took these readings.
+    fn a_round_of(sources: &[&SourceInfo], snapshots: Vec<PlayerSnapshot>) -> PollOutcome {
+        PollOutcome {
+            sources: sources.iter().copied().cloned().collect(),
+            snapshots,
+            failures: Vec::new(),
+        }
+    }
+
+    /// A round in which this source was listed and did not answer.
+    fn a_round_without_an_answer_from(source: &SourceInfo) -> PollOutcome {
+        PollOutcome {
+            sources: Vec::new(),
+            snapshots: Vec::new(),
+            failures: vec![(
+                source.player.clone(),
+                WatchError::Timeout {
+                    player: source.player.clone(),
+                    deadline: Duration::from_millis(500),
+                },
+            )],
+        }
+    }
+
+    /// Rounds a step apart, in each of which this source plays this file.
+    fn watching(
+        source: &SourceInfo,
+        name: &str,
+        steps: RangeInclusive<u32>,
+    ) -> Vec<Result<PollOutcome, WatchError>> {
+        steps
+            .map(|step| Ok(a_round_of(&[source], vec![playing(source, name, step)])))
+            .collect()
+    }
+
+    /// Take this many rounds, every one of which has to go well.
+    async fn rounds(detection: &mut Detection<ScriptedWatcher>, count: u32) {
+        for round in 0..count {
+            detection
+                .round()
+                .await
+                .unwrap_or_else(|failure| panic!("round {round} failed: {failure}"));
+        }
+    }
+
+    /// What detection stops with in the round after this many went well.
+    async fn stopped_after(detection: &mut Detection<ScriptedWatcher>, count: u32) -> TaskError {
+        rounds(detection, count).await;
+
+        detection
+            .round()
+            .await
+            .expect_err("the round the store refused in")
+    }
+
+    /// The path a store answers with for a file named here.
+    fn a_path(name: &str) -> RawPath {
+        RawPath::from_bytes(name.as_bytes().to_vec())
     }
 
     /// A round in which every source answered and had something open.
@@ -502,7 +982,7 @@ mod tests {
             a_source("mpv.instance1701", "mpv"),
             a_source("vlc", "vlc"),
         ]))]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
 
@@ -524,7 +1004,7 @@ mod tests {
             a_source("firefox.instance30062", "firefox"),
             a_source("mpv", "mpv"),
         ]))]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -559,7 +1039,7 @@ mod tests {
             "chromium.instance16481",
             "chromium",
         )]))]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
 
@@ -580,7 +1060,7 @@ mod tests {
             snapshots: vec![a_reading(&stranger)],
             failures: Vec::new(),
         })]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -614,7 +1094,7 @@ mod tests {
                 },
             )],
         })]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("a round");
         let published = drain(&mut events);
@@ -664,7 +1144,7 @@ mod tests {
                 failures: vec![silent()],
             }),
         ]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round it went quiet in");
@@ -691,7 +1171,7 @@ mod tests {
             ])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
         ]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, seen.clone());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, seen.clone());
 
         assert!(
             seen.sources().is_empty(),
@@ -724,7 +1204,7 @@ mod tests {
             "firefox.instance30062",
             "firefox",
         )]))]);
-        let mut detection = detecting(watcher, bus, policy, seen.clone());
+        let (_database, mut detection) = detecting(watcher, bus, policy, seen.clone());
 
         detection.round().await.expect("a round");
 
@@ -749,7 +1229,7 @@ mod tests {
             ])),
             Ok(a_round(vec![a_source("mpv", "mpv")])),
         ]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the round after vlc closed");
@@ -771,7 +1251,7 @@ mod tests {
             Ok(a_round(vec![a_source("mpv", "mpv")])),
             Ok(a_round(vec![a_source("vlc", "vlc")])),
         ]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -790,7 +1270,7 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -819,7 +1299,7 @@ mod tests {
             )],
             failures: Vec::new(),
         })]);
-        let mut detection = deciding(watcher, bus, decided.clone());
+        let (_database, mut detection) = deciding(watcher, bus, decided.clone());
 
         detection.round().await.expect("a round");
 
@@ -865,7 +1345,7 @@ mod tests {
                 failures: Vec::new(),
             }),
         ]);
-        let mut detection = deciding(watcher, bus, decided.clone());
+        let (_database, mut detection) = deciding(watcher, bus, decided.clone());
 
         detection.round().await.expect("the first round");
         detection.round().await.expect("the second round");
@@ -897,7 +1377,7 @@ mod tests {
             )],
             failures: Vec::new(),
         })]);
-        let mut detection = deciding(watcher, bus, decided.clone());
+        let (_database, mut detection) = deciding(watcher, bus, decided.clone());
 
         detection.round().await.expect("a round");
 
@@ -923,7 +1403,7 @@ mod tests {
             ],
             failures: Vec::new(),
         })]);
-        let mut detection = deciding(watcher, bus, decided.clone());
+        let (_database, mut detection) = deciding(watcher, bus, decided.clone());
 
         detection.round().await.expect("a round");
 
@@ -941,7 +1421,7 @@ mod tests {
         let watcher = ScriptedWatcher::of(vec![Err(WatchError::Transport(Box::new(
             std::io::Error::other("the session bus is gone"),
         )))]);
-        let mut detection = detecting(watcher, bus, policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, bus, policy, Seen::new());
 
         let failure = detection.round().await.expect_err("the round fails");
 
@@ -960,7 +1440,8 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), Arc::clone(&policy), Seen::new());
+        let (_database, mut detection) =
+            detecting(watcher, Arc::clone(&bus), Arc::clone(&policy), Seen::new());
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL / 2).await;
@@ -993,7 +1474,7 @@ mod tests {
         let mut events = bus.subscribe();
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, Arc::clone(&bus), policy, Seen::new());
 
         let running = tokio::spawn(async move { detection.run().await });
         tokio::time::sleep(INTERVAL * 3 + INTERVAL / 2).await;
@@ -1023,7 +1504,7 @@ mod tests {
         assert!(panicked.is_err(), "the thread did not panic");
 
         let watcher = ScriptedWatcher::repeating(vec![a_source("mpv", "mpv")]);
-        let mut detection = detecting(watcher, bus, policy, Seen::new());
+        let (_database, mut detection) = detecting(watcher, bus, policy, Seen::new());
 
         let read = tokio::spawn(async move { detection.round().await });
 
@@ -1054,5 +1535,548 @@ mod tests {
             )))),
             crate::supervisor::TaskError::Transient(_)
         ));
+    }
+
+    /// What `episodes_seen` holds where nothing was recorded, named because
+    /// an empty array otherwise needs its element type spelt out.
+    const NOTHING_SEEN: [Viewed; 0] = [];
+
+    /// The third episode as the store holds it once `watched` of it is kept.
+    fn the_third(watched: Duration, registered: bool) -> Kept {
+        Kept {
+            media: a_path(THIRD),
+            watched,
+            registered,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_episode_is_recorded_at_the_reading_that_has_half_of_it_watched() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, HALF_AT).await;
+        assert_eq!(
+            database.seen(),
+            NOTHING_SEEN,
+            "recorded a reading short of half"
+        );
+
+        rounds(&mut detection, 1).await;
+        assert_eq!(
+            database.seen(),
+            [Viewed {
+                title: SERIES.to_owned(),
+                episode: Some(3),
+                media: THIRD.to_owned(),
+                at: THE_TIME.to_owned(),
+            }]
+        );
+        assert_eq!(
+            database.queued(),
+            [Operation {
+                id: 1,
+                title: SERIES.to_owned(),
+                kind: Kind::Progress { episode: Some(3) },
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn what_was_watched_is_kept_with_its_file_and_the_time() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=3));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, 4).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * 3, false))
+        );
+        assert_eq!(
+            database.rows("SELECT updated_at FROM watching", |row| row
+                .get::<_, String>(0)),
+            [THE_TIME]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_time_written_is_the_time_the_write_is_made_at() {
+        /// How many times the clock of this test has been read.
+        static READ: AtomicU64 = AtomicU64::new(0);
+
+        /// A clock a second further on at each reading of it.
+        fn a_second_on() -> SystemTime {
+            the_time() + Duration::from_secs(READ.fetch_add(1, Ordering::SeqCst))
+        }
+
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let wiring = Wiring {
+            recogniser: Arc::new(a_list()),
+            now: a_second_on,
+            ..wired_to(&database)
+        };
+        let mut detection = Detection::new(watcher, wiring);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        // A total is kept at each of the twenty-four readings that add to
+        // it, and the episode is recorded after the last of them.
+        assert_eq!(
+            database.rows("SELECT updated_at FROM watching", |row| row
+                .get::<_, String>(0)),
+            ["2033-05-18T03:33:43Z"]
+        );
+        assert_eq!(
+            database.rows("SELECT seen_at FROM episodes_seen", |row| row
+                .get::<_, String>(0)),
+            ["2033-05-18T03:33:44Z"]
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_started_again_counts_on_from_what_was_kept() {
+        // A detection task that is started again knows nothing of the one
+        // before it. What that one watched comes back from the store.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let half_way = HALF_AT / 2;
+
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=half_way));
+        let mut first = recording(watcher, &database);
+        rounds(&mut first, half_way + 1).await;
+        drop(first);
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * half_way, false))
+        );
+
+        // The first reading of the second adds nothing, so `half_way` readings
+        // of it leave the total a step short of half.
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, half_way + 1..=HALF_AT + 1));
+        let mut second = recording(watcher, &database);
+        rounds(&mut second, half_way).await;
+        assert_eq!(
+            database.seen(),
+            NOTHING_SEEN,
+            "recorded a reading short of half"
+        );
+
+        rounds(&mut second, 1).await;
+        assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_episode_the_store_holds_as_registered_is_not_recorded_again() {
+        let database = Database::new();
+        {
+            let mut store = database.store.lock().expect("the store");
+            store
+                .keep(&Total {
+                    title: SERIES.to_owned(),
+                    episode: Some(3),
+                    media: a_path(THIRD),
+                    watched: STEP * HALF_AT,
+                    at: the_time(),
+                })
+                .expect("the total is kept");
+            store
+                .record(&Viewing {
+                    title: SERIES.to_owned(),
+                    episode: Some(3),
+                    media: a_path(THIRD),
+                    at: the_time(),
+                })
+                .expect("the episode is recorded");
+        }
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
+    }
+
+    /// Detection in which `source` has watched the third episode to where it
+    /// registered, with `next` as the round after that.
+    ///
+    /// The total is looked at before the detection is handed back. A test of
+    /// a close reads the row going, and a row that was never there is gone
+    /// as well.
+    async fn registered_under(
+        database: &Database,
+        policy: Arc<RwLock<PolicyTable>>,
+        source: &SourceInfo,
+        next: PollOutcome,
+    ) -> Detection<ScriptedWatcher> {
+        let mut script = watching(source, THIRD, 0..=HALF_AT);
+        script.push(Ok(next));
+        let mut detection = recording_under(ScriptedWatcher::of(script), database, policy);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true)),
+            "the episode registered before the round under test"
+        );
+
+        detection
+    }
+
+    /// [`registered_under`] the policy table a user starts with.
+    async fn registered(
+        database: &Database,
+        source: &SourceInfo,
+        next: PollOutcome,
+    ) -> Detection<ScriptedWatcher> {
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
+
+        registered_under(database, policy, source, next).await
+    }
+
+    #[tokio::test]
+    async fn a_player_that_is_no_longer_listed_closes_its_episode() {
+        // The store drops the total of an episode that registered when the
+        // episode is closed, so the row going is the close arriving.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let mut detection = registered(&database, &mpv, a_round_of(&[], Vec::new())).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(database.kept(SERIES, Some(3)), None);
+    }
+
+    #[tokio::test]
+    async fn an_episode_that_did_not_register_keeps_its_total_when_its_player_leaves() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let mut script = watching(&mpv, THIRD, 0..=3);
+        script.push(Ok(a_round_of(&[], Vec::new())));
+        let mut detection = recording(ScriptedWatcher::of(script), &database);
+
+        rounds(&mut detection, 5).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * 3, false))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_player_with_nothing_open_closes_its_episode() {
+        // A player that closed its file is still listed and sends no reading
+        // to say so.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let nothing_open = a_round_of(&[&mpv], Vec::new());
+        let mut detection = registered(&database, &mpv, nothing_open).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(database.kept(SERIES, Some(3)), None);
+    }
+
+    #[tokio::test]
+    async fn a_player_that_did_not_answer_keeps_its_episode_open() {
+        // Failing to answer is not closing. A player that timed out once
+        // would otherwise end a sitting it is still in.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let silent = a_round_without_an_answer_from(&mpv);
+        let mut detection = registered(&database, &mpv, silent).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reading_without_a_description_keeps_its_player_in() {
+        // The round cannot tell what that player has open. Closed here, an
+        // episode that registered would lose its total and be recorded a
+        // second time.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let undescribed = a_round_of(&[], vec![playing(&mpv, THIRD, HALF_AT + 1)]);
+        let mut detection = registered(&database, &mpv, undescribed).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_player_kept_in_by_a_round_is_let_go_by_the_first_that_hears_nothing_of_it() {
+        // Neither round that kept the player in lists it, so a rule that let
+        // go of whoever the round before listed would hold its episode open
+        // for good.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        for kept_in_by in [
+            a_round_of(&[], vec![playing(&mpv, THIRD, HALF_AT + 1)]),
+            a_round_without_an_answer_from(&mpv),
+        ] {
+            let mut detection = registered(&database, &mpv, kept_in_by).await;
+
+            rounds(&mut detection, 2).await;
+
+            assert_eq!(database.kept(SERIES, Some(3)), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_player_that_was_let_go_is_forgotten() {
+        // Kept note of, it would be let go again in every round after the
+        // one it left in.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let mut detection = registered(&database, &mpv, a_round_of(&[], Vec::new())).await;
+        assert_eq!(detection.heard, BTreeSet::from([id("mpv")]));
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(detection.heard, BTreeSet::new());
+    }
+
+    #[tokio::test]
+    async fn a_player_policy_stopped_admitting_closes_its_episode() {
+        // Its readings stop reaching the session, and a player that held an
+        // episode open by being denied would hold it open for every other.
+        let database = Database::new();
+        let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
+        let mpv = a_source("mpv", "mpv");
+        let denied = a_round_of(&[&mpv], vec![playing(&mpv, THIRD, HALF_AT + 1)]);
+        let mut detection = registered_under(&database, Arc::clone(&policy), &mpv, denied).await;
+
+        policy
+            .write()
+            .expect("the policy table")
+            .set(&app("mpv"), Policy::Deny);
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(database.kept(SERIES, Some(3)), None);
+    }
+
+    #[tokio::test]
+    async fn a_player_that_opens_a_file_nobody_recognised_closes_its_episode() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let moved_on = a_round_of(&[&mpv], vec![playing(&mpv, NOT_LISTED, HALF_AT + 1)]);
+        let mut detection = registered(&database, &mpv, moved_on).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(database.kept(SERIES, Some(3)), None);
+    }
+
+    #[tokio::test]
+    async fn a_player_that_opens_what_names_no_file_closes_its_episode() {
+        // Recognition is not asked about an address, and the session is
+        // still handed the reading: it is how the player says it moved on.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let moved_on = a_round_of(
+            &[&mpv],
+            vec![PlayerSnapshot {
+                media: MediaRef::Remote("https://example.invalid/stream".to_owned()),
+                ..playing(&mpv, THIRD, HALF_AT + 1)
+            }],
+        );
+        let mut detection = registered(&database, &mpv, moved_on).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(database.kept(SERIES, Some(3)), None);
+    }
+
+    #[tokio::test]
+    async fn an_episode_handed_to_another_player_in_one_round_stays_open() {
+        // The readings of a round are taken before anybody is let go. Taken
+        // after, the episode would be closed and its total dropped before the
+        // player that has it open now was heard.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let vlc = a_source("vlc", "vlc");
+        let handed_over = a_round_of(&[&vlc], vec![playing(&vlc, THIRD, HALF_AT + 1)]);
+        let mut detection = registered(&database, &mpv, handed_over).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_total_is_kept_before_its_episode_is_recorded() {
+        // A file of ten seconds is watched at its second reading, so the
+        // total kept there is the first the store holds of it. Recording
+        // marks the total the store holds, and marks nothing where it holds
+        // none.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let short = |steps| PlayerSnapshot {
+            duration: Known::Value(Duration::from_secs(10)),
+            ..playing(&mpv, THIRD, steps)
+        };
+        let watcher = ScriptedWatcher::of(vec![
+            Ok(a_round_of(&[&mpv], vec![short(0)])),
+            Ok(a_round_of(&[&mpv], vec![short(2)])),
+        ]);
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, 2).await;
+
+        assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * 2, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_nobody_recognised_reaches_no_table() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, NOT_LISTED, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        for table in ["shows", "watching", "episodes_seen", "sync_queue"] {
+            assert_eq!(database.count_of(table), [0], "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_total_the_store_refuses_stops_detection_for_good() {
+        // Detecting on while nothing is recorded looks the same as working.
+        let database = Database::new();
+        database.refusing("INSERT", "watching");
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=1));
+        let mut detection = recording(watcher, &database);
+
+        let failure = stopped_after(&mut detection, 1).await;
+
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(
+            failure.to_string().contains("refused by the test"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_episode_the_store_refuses_stops_detection_for_good() {
+        let database = Database::new();
+        database.refusing("INSERT", "episodes_seen");
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        let failure = stopped_after(&mut detection, HALF_AT).await;
+
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(
+            failure.to_string().contains("refused by the test"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_the_store_cannot_answer_stops_detection_for_good() {
+        let database = Database::new();
+        database
+            .store
+            .lock()
+            .expect("the store")
+            .keep(&Total {
+                title: SERIES.to_owned(),
+                episode: Some(3),
+                media: a_path(THIRD),
+                watched: STEP,
+                at: the_time(),
+            })
+            .expect("the total is kept");
+        database.by_hand("UPDATE watching SET media = '%zz'");
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=0));
+        let mut detection = recording(watcher, &database);
+
+        let failure = stopped_after(&mut detection, 0).await;
+
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(
+            failure.to_string().contains("is not an escaped path"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_the_store_refuses_stops_detection_for_good() {
+        let database = Database::new();
+        database.refusing("DELETE", "watching");
+        let mpv = a_source("mpv", "mpv");
+        let mut script = watching(&mpv, THIRD, 0..=HALF_AT);
+        script.push(Ok(a_round_of(&[], Vec::new())));
+        let mut detection = recording(ScriptedWatcher::of(script), &database);
+
+        let failure = stopped_after(&mut detection, HALF_AT + 1).await;
+
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(
+            failure.to_string().contains("refused by the test"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_a_panic_left_poisoned_is_not_written() {
+        // A poisoned store means a call into it panicked, which is a bug, and
+        // the supervisor is what records one.
+        let database = Database::new();
+        let poisoner = Arc::clone(&database.store);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("the store");
+            panic!("a bug in another task");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread did not panic");
+
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=0));
+        let mut detection = recording(watcher, &database);
+
+        let asked = tokio::spawn(async move { detection.round().await });
+
+        // The panic is what the supervisor records, so it has to arrive
+        // saying what was wrong and not that a thread ended.
+        let panic = asked
+            .await
+            .expect_err("a poisoned store was used as though it were trustworthy")
+            .into_panic();
+        let said = panic
+            .downcast_ref::<String>()
+            .expect("a panic that says something");
+        assert!(said.starts_with("the store was poisoned"), "{said}");
     }
 }

@@ -10,94 +10,12 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::ffi::OsStr;
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
-/// How long a test waits for the daemon to say something before calling it
-/// silent. Only ever spent on a failure.
-const PATIENCE: Duration = Duration::from_secs(10);
-
-/// A session bus that is not there, so that a daemon under test reaches no
-/// player of the person running the tests.
-const NO_BUS: &str = "unix:path=/nowhere/bus";
-
-/// A directory of one test in one run of the tests, gone when the test is
-/// over.
-///
-/// Named by the process as well as by the test, so that two runs of the tests
-/// at once do not bind in one directory.
-struct Directory(PathBuf);
-
-impl Directory {
-    fn of(test: &str) -> Self {
-        let directory =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{test}-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("the directory can be made");
-
-        Self(directory)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        // Whatever is left in it is a socket of a daemon that was stopped.
-        // A directory that stays behind fails nothing, so a failure to remove
-        // it is not worth a panic inside a panic.
-        drop(fs::remove_dir_all(&self.0));
-    }
-}
-
-/// What the daemon says in this session up to the line that says it listens,
-/// that line included.
-fn the_daemon_says(session: &[(&str, &OsStr)]) -> Vec<String> {
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_benshi"))
-        .arg("--no-tray")
-        .env_clear()
-        .envs(session.iter().copied())
-        .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the binary runs");
-    let said = daemon.stderr.take().expect("what it says is piped");
-    let (lines, heard) = mpsc::channel();
-    // Read on a thread of its own, so that a daemon that says nothing fails
-    // the test where it would otherwise hold it for ever.
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(said).lines().map_while(Result::ok) {
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut said = Vec::new();
-    while let Ok(line) = heard.recv_timeout(PATIENCE) {
-        let listening = line.starts_with("benshi: listening on ");
-        said.push(line);
-        if listening {
-            break;
-        }
-    }
-
-    daemon.kill().expect("the daemon can be stopped");
-    daemon.wait().expect("the daemon has stopped");
-    drop(heard);
-    reader.join().expect("the reader has finished");
-
-    said
-}
+use common::{Directory, the_daemon_says};
 
 /// What the client says in this session, asked for the sources.
 fn the_client_says(session: &[(&str, &OsStr)], arguments: &[&OsStr]) -> Vec<String> {
@@ -120,8 +38,12 @@ fn the_client_says(session: &[(&str, &OsStr)], arguments: &[&OsStr]) -> Vec<Stri
 fn the_daemon_says_that_the_runtime_directory_is_not_set() {
     let temporary = Directory::of("d-none");
     let socket = temporary.path().join("benshi").join("benshi.sock");
+    let data = temporary.path().join("data");
 
-    let said = the_daemon_says(&[("TMPDIR", temporary.path().as_os_str())]);
+    let (said, _ended) = the_daemon_says(&[
+        ("TMPDIR", temporary.path().as_os_str()),
+        ("BENSHI_DATA_DIR", data.as_os_str()),
+    ]);
 
     assert_eq!(
         said,
@@ -131,6 +53,7 @@ fn the_daemon_says_that_the_runtime_directory_is_not_set() {
                 socket.display()
             ),
             format!("benshi: listening on {}", socket.display()),
+            format!("benshi: recording in {}", data.join("benshi.db").display()),
         ]
     );
 }
@@ -139,10 +62,12 @@ fn the_daemon_says_that_the_runtime_directory_is_not_set() {
 fn the_daemon_says_what_is_wrong_with_the_runtime_directory_it_was_given() {
     let temporary = Directory::of("d-relative");
     let socket = temporary.path().join("benshi").join("benshi.sock");
+    let data = temporary.path().join("data");
 
-    let said = the_daemon_says(&[
+    let (said, _ended) = the_daemon_says(&[
         ("TMPDIR", temporary.path().as_os_str()),
         ("XDG_RUNTIME_DIR", OsStr::new("run/1000")),
+        ("BENSHI_DATA_DIR", data.as_os_str()),
     ]);
 
     assert_eq!(
@@ -154,6 +79,7 @@ fn the_daemon_says_what_is_wrong_with_the_runtime_directory_it_was_given() {
                 socket.display()
             ),
             format!("benshi: listening on {}", socket.display()),
+            format!("benshi: recording in {}", data.join("benshi.db").display()),
         ]
     );
 }
@@ -162,18 +88,23 @@ fn the_daemon_says_what_is_wrong_with_the_runtime_directory_it_was_given() {
 fn the_daemon_says_nothing_of_a_runtime_directory_it_uses() {
     let temporary = Directory::of("d-runtime");
     let runtime = temporary.path().join("run");
+    let data = temporary.path().join("data");
 
-    let said = the_daemon_says(&[
+    let (said, _ended) = the_daemon_says(&[
         ("TMPDIR", temporary.path().as_os_str()),
         ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+        ("BENSHI_DATA_DIR", data.as_os_str()),
     ]);
 
     assert_eq!(
         said,
-        [format!(
-            "benshi: listening on {}",
-            runtime.join("benshi.sock").display()
-        )]
+        [
+            format!(
+                "benshi: listening on {}",
+                runtime.join("benshi.sock").display()
+            ),
+            format!("benshi: recording in {}", data.join("benshi.db").display()),
+        ]
     );
 }
 

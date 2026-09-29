@@ -17,6 +17,7 @@ benshi-cli = { path = "../cli" }
 benshi-core = { version = "0.1.0", path = "../core" }
 benshi-daemon = { path = "../daemon" }
 benshi-detect = { version = "0.1.0", path = "../detect" }
+benshi-store = { version = "0.1.0", path = "../store" }
 benshi-tray = { path = "../tray" }
 clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }

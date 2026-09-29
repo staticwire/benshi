@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use benshi_cli::commands::{Command, PolicyArgument, run};
 use benshi_core::clock::Timestamp;
@@ -25,10 +25,11 @@ use benshi_core::path::RawPath;
 use benshi_core::policy::PolicyTable;
 use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
 use benshi_daemon::bus::{BusEvent, EventBus};
-use benshi_daemon::detection::{Detection, Seen};
+use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
 use benshi_daemon::recognition::{Decided, Recogniser};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
+use benshi_store::Store;
 use tempfile::TempDir;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::timeout;
@@ -120,19 +121,25 @@ impl Daemon {
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
         let decided = Decided::new();
+        let home = tempfile::tempdir().expect("a directory of our own");
+        let database = home.path().join("data").join("benshi.db");
+        let store = Store::open(&database).expect("the database opens");
 
         let mut detection = Detection::new(
             platform.clone(),
-            Arc::clone(&bus),
-            Arc::clone(&policy),
-            seen.clone(),
-            Arc::new(Recogniser::empty()),
-            decided.clone(),
-            PERIOD,
+            Wiring {
+                bus: Arc::clone(&bus),
+                policy: Arc::clone(&policy),
+                seen: seen.clone(),
+                recogniser: Arc::new(Recogniser::empty()),
+                decided: decided.clone(),
+                store: Arc::new(Mutex::new(store)),
+                now: SystemTime::now,
+                period: PERIOD,
+            },
         );
         drop(tokio::spawn(async move { detection.run().await }));
 
-        let home = tempfile::tempdir().expect("a directory of our own");
         let socket = home.path().join("run").join("benshi.sock");
         let listener = bind(&socket).expect("the socket binds");
         let server = Arc::new(Server::new(Arc::clone(&bus), policy, seen, decided));

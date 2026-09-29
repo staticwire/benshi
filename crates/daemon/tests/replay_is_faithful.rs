@@ -14,16 +14,17 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use benshi_core::policy::PolicyTable;
 use benshi_core::trace::Trace;
 use benshi_core::{Known, PlayState, PlayerId, PlayerSnapshot};
 use benshi_daemon::bus::{BusEvent, EventBus};
-use benshi_daemon::detection::{Detection, Seen};
+use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::recognition::{Decided, Recogniser};
 use benshi_detect::replay::ReplayWatcher;
+use benshi_store::Store;
 use tokio::time::timeout;
 
 /// The recording under test, taken on 2026-09-18 from a live session bus.
@@ -60,16 +61,22 @@ async fn replayed(trace: Trace) -> Vec<PlayerSnapshot> {
     let expected = trace.snapshots.len();
     let watcher = ReplayWatcher::new(trace).expect("the fixture is replayable");
 
+    let home = tempfile::tempdir().expect("a directory of our own");
+    let store = Store::open(&home.path().join("benshi.db")).expect("the database opens");
     let bus = Arc::new(EventBus::new());
     let mut events = bus.subscribe();
     let mut detection = Detection::new(
         watcher,
-        Arc::clone(&bus),
-        Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
-        Seen::new(),
-        Arc::new(Recogniser::empty()),
-        Decided::new(),
-        PERIOD,
+        Wiring {
+            bus: Arc::clone(&bus),
+            policy: Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
+            seen: Seen::new(),
+            recogniser: Arc::new(Recogniser::empty()),
+            decided: Decided::new(),
+            store: Arc::new(Mutex::new(store)),
+            now: SystemTime::now,
+            period: PERIOD,
+        },
     );
 
     let running = tokio::spawn(async move { detection.run().await });

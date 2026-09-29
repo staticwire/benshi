@@ -24,5 +24,6 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "syn
 workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt", "test-util"] }
