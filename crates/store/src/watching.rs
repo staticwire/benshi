@@ -63,41 +63,43 @@ impl Store {
     /// # Errors
     ///
     /// [`Error::Instant`] for a clock reading before 1970 or past the year
-    /// 9999, before anything is written. [`Error::Write`] when a statement
-    /// fails, and the transaction is rolled back with it.
+    /// 9999, before anything is written. [`Error::Busy`] when another
+    /// connection has the database, and [`Error::Write`] when a statement
+    /// fails for any other reason. The transaction is rolled back with
+    /// either.
     pub fn keep(&mut self, total: &Total) -> Result<(), Error> {
         let at = rfc3339(total.at).ok_or(Error::Instant { at: total.at })?;
         let media = total.media.escaped();
         let watched = i64::try_from(total.watched.as_millis()).unwrap_or(i64::MAX);
 
-        let transaction = self.connection.transaction().map_err(Error::Write)?;
+        let transaction = self.connection.transaction()?;
         let show = filed(&transaction, &total.title)?;
-        let kept = transaction
-            .execute(
-                "UPDATE watching SET media = ?3, watched_ms = ?4, updated_at = ?5 \
-                 WHERE show = ?1 AND episode IS ?2",
-                params![show, total.episode, media, watched, at],
-            )
-            .map_err(Error::Write)?;
+        let kept = transaction.execute(
+            "UPDATE watching SET media = ?3, watched_ms = ?4, updated_at = ?5 \
+             WHERE show = ?1 AND episode IS ?2",
+            params![show, total.episode, media, watched, at],
+        )?;
         if kept == 0 {
-            transaction
-                .execute(
-                    "INSERT INTO watching (show, episode, media, watched_ms, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![show, total.episode, media, watched, at],
-                )
-                .map_err(Error::Write)?;
+            transaction.execute(
+                "INSERT INTO watching (show, episode, media, watched_ms, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![show, total.episode, media, watched, at],
+            )?;
         }
-        transaction.commit().map_err(Error::Write)
+        transaction.commit()?;
+
+        Ok(())
     }
 
     /// What was kept for an episode, or nothing where none was.
     ///
     /// # Errors
     ///
-    /// [`Error::Write`] when the row cannot be read, a total below nought
-    /// included. [`Error::Media`] for a row whose media is not a path as
-    /// this store writes one.
+    /// [`Error::Busy`] when the database cannot be read because another
+    /// connection has it, which in WAL a connection that writes to it does
+    /// not cause. [`Error::Write`] when the row cannot be read for any other
+    /// reason, a total below nought included. [`Error::Media`] for a row
+    /// whose media is not a path as this store writes one.
     pub fn resume(&self, title: &str, episode: Option<u32>) -> Result<Option<Kept>, Error> {
         let row = self
             .connection
@@ -115,8 +117,7 @@ impl Store {
                     ))
                 },
             )
-            .optional()
-            .map_err(Error::Write)?;
+            .optional()?;
         let Some((id, text, watched, registered)) = row else {
             return Ok(None);
         };
@@ -140,16 +141,15 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::Write`] when the statement fails.
+    /// [`Error::Busy`] when another connection has the database, and
+    /// [`Error::Write`] when the statement fails for any other reason.
     pub fn close(&self, title: &str, episode: Option<u32>) -> Result<(), Error> {
-        self.connection
-            .execute(
-                "DELETE FROM watching \
-                 WHERE registered = 1 AND episode IS ?2 \
-                 AND show = (SELECT id FROM shows WHERE title = ?1)",
-                params![title, episode],
-            )
-            .map_err(Error::Write)?;
+        self.connection.execute(
+            "DELETE FROM watching \
+             WHERE registered = 1 AND episode IS ?2 \
+             AND show = (SELECT id FROM shows WHERE title = ?1)",
+            params![title, episode],
+        )?;
         Ok(())
     }
 }
@@ -164,12 +164,10 @@ pub(crate) fn registered(
     show: i64,
     episode: Option<u32>,
 ) -> Result<(), Error> {
-    connection
-        .execute(
-            "UPDATE watching SET registered = 1 WHERE show = ?1 AND episode IS ?2",
-            params![show, episode],
-        )
-        .map_err(Error::Write)?;
+    connection.execute(
+        "UPDATE watching SET registered = 1 WHERE show = ?1 AND episode IS ?2",
+        params![show, episode],
+    )?;
     Ok(())
 }
 

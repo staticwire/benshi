@@ -146,32 +146,29 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::Write`] when the queue cannot be read. [`Error::Orphan`] for
-    /// a row whose show is not there and [`Error::Operation`] for a row that
-    /// cannot be read as an operation, each naming the row: the reading
-    /// fails whole rather than answering without it.
+    /// [`Error::Busy`] when the queue cannot be read because another
+    /// connection has the database, and [`Error::Write`] when it cannot be
+    /// read for any other reason. [`Error::Orphan`] for a row whose show is
+    /// not there and [`Error::Operation`] for a row that cannot be read as
+    /// an operation, each naming the row: the reading fails whole rather
+    /// than answering without it.
     pub fn queued(&self) -> Result<Vec<Operation>, Error> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT sync_queue.id, shows.title, sync_queue.kind, sync_queue.payload \
-                 FROM sync_queue LEFT JOIN shows ON shows.id = sync_queue.show \
-                 ORDER BY sync_queue.id",
-            )
-            .map_err(Error::Write)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(Error::Write)?;
+        let mut statement = self.connection.prepare(
+            "SELECT sync_queue.id, shows.title, sync_queue.kind, sync_queue.payload \
+             FROM sync_queue LEFT JOIN shows ON shows.id = sync_queue.show \
+             ORDER BY sync_queue.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
 
         rows.map(|row| {
-            let (id, title, kind, payload) = row.map_err(Error::Write)?;
+            let (id, title, kind, payload) = row?;
             let title = title.ok_or(Error::Orphan { id })?;
             let kind = Kind::from_columns(&kind, &payload)
                 .map_err(|cause| Error::Operation { id, cause })?;
@@ -219,7 +216,8 @@ impl Kind {
 ///
 /// # Errors
 ///
-/// [`Error::Write`] when the row cannot be written.
+/// [`Error::Busy`] when another connection has the database, and
+/// [`Error::Write`] when the row cannot be written for any other reason.
 pub(crate) fn enqueue(
     connection: &Connection,
     show: i64,
@@ -232,13 +230,11 @@ pub(crate) fn enqueue(
     let (kind, payload) = kind
         .to_columns()
         .map_err(|cause| Error::Write(rusqlite::Error::ToSqlConversionFailure(cause.into())))?;
-    connection
-        .execute(
-            "INSERT INTO sync_queue (show, kind, payload, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![show, kind, payload, at],
-        )
-        .map_err(Error::Write)?;
+    connection.execute(
+        "INSERT INTO sync_queue (show, kind, payload, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![show, kind, payload, at],
+    )?;
     Ok(())
 }
 

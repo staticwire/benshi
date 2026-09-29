@@ -64,6 +64,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn start(session: &[(&str, &OsStr)]) -> Self {
+        Self::heard_for(session, usize::MAX)
+    }
+
+    /// A daemon that is read for this many lines and no more. The pipe is
+    /// let go of after the last of them, so a line the daemon writes after
+    /// that is one it cannot write.
+    pub fn heard_for(session: &[(&str, &OsStr)], limit: usize) -> Self {
         let mut running = Command::new(env!("CARGO_BIN_EXE_benshi"))
             .arg("--no-tray")
             .env_clear()
@@ -79,7 +86,8 @@ impl Daemon {
         // Read on a thread of its own, so that a daemon that says nothing
         // fails the test where it would otherwise hold it for ever.
         let reader = thread::spawn(move || {
-            for line in BufReader::new(said).lines().map_while(Result::ok) {
+            let read = BufReader::new(said).lines().map_while(Result::ok);
+            for line in read.take(limit) {
                 if lines.send(line).is_err() {
                     break;
                 }
@@ -97,7 +105,7 @@ impl Daemon {
     /// it records, and every line it says where it ends before that one.
     pub fn says(&self) -> Vec<String> {
         let mut said = Vec::new();
-        while let Ok(line) = self.heard.recv_timeout(PATIENCE) {
+        while let Some(line) = self.says_next() {
             let started = line.starts_with(STARTED);
             said.push(line);
             if started {
@@ -108,12 +116,25 @@ impl Daemon {
         said
     }
 
+    /// The next line it says, and nothing where it says none in time.
+    pub fn says_next(&self) -> Option<String> {
+        self.heard.recv_timeout(PATIENCE).ok()
+    }
+
     /// How it ended, and nothing where it is still running.
+    // Dead in a test binary that stops every daemon it starts.
+    #[allow(dead_code)]
     pub fn ended(&mut self) -> Option<ExitStatus> {
+        self.ends_within(PATIENCE)
+    }
+
+    /// How it ended where it ended within `patience`, and nothing where it
+    /// was still running by then.
+    pub fn ends_within(&mut self, patience: Duration) -> Option<ExitStatus> {
         let waited_from = Instant::now();
         loop {
             let ended = self.running.try_wait().expect("the daemon can be asked");
-            if ended.is_some() || waited_from.elapsed() > PATIENCE {
+            if ended.is_some() || waited_from.elapsed() > patience {
                 return ended;
             }
             thread::sleep(Duration::from_millis(10));
@@ -136,6 +157,8 @@ impl Drop for Daemon {
 
 /// What a daemon says as it starts in this session, and how it ended where
 /// it did not start.
+// Dead in a test binary that reads on after a daemon has started.
+#[allow(dead_code)]
 pub fn the_daemon_says(session: &[(&str, &OsStr)]) -> (Vec<String>, Option<ExitStatus>) {
     let mut daemon = Daemon::start(session);
     let said = daemon.says();

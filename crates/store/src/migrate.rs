@@ -61,9 +61,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
 ///
 /// A database ahead of the list is refused rather than written into.
 pub(crate) fn apply(connection: &mut Connection, migrations: &[&str]) -> Result<(), Error> {
-    let found: u32 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(Error::Write)?;
+    let found: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let known = u32::try_from(migrations.len()).unwrap_or(u32::MAX);
     if found > known {
         return Err(Error::FromTheFuture { found, known });

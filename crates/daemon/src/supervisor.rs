@@ -12,6 +12,12 @@
 //! panic arrives as a join failure on the handle, so it cannot be returned,
 //! ignored, or caught by a task that would rather not mention it.
 //!
+//! **What happens to a task is told as it happens**, to whatever
+//! [`Supervisor::telling`] was handed: a [`Notice`] for a task that is started
+//! again and for one that stopped. [`Supervisor::run`] returns its records
+//! only once every task has stopped, and the tasks of a daemon do not all
+//! stop.
+//!
 //! This module reads the time from `tokio::time` rather than from an injected
 //! `benshi_core::clock::Clock`, and it is the only place in the workspace that
 //! does. It has to sleep on the same clock it measures with, and a `Clock`
@@ -54,8 +60,8 @@ pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// task asleep for hours after an outage it has long recovered from.
 pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 
-/// How long a task must run before a panic counts as new trouble rather than
-/// the continuation of a crash loop.
+/// How long a task must run before a failure counts as new trouble rather
+/// than the continuation of the trouble before it.
 ///
 /// [`RESTART_LIMIT`] counts consecutive failures, and consecutive has to mean
 /// something in time. An attempt that ran this long did work, so the panic
@@ -63,6 +69,12 @@ pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 /// millisecond spend the entire budget - a panic is restarted with no delay -
 /// and the task never runs again however long the process lives, which is the
 /// opposite of what a restart limit is for.
+///
+/// The same holds for the wait before a retry, which doubles over
+/// consecutive transient failures. A failure that ends an attempt which ran
+/// this long waits [`BACKOFF_BASE`], as the first did. Counted over the life
+/// of a task, every failure from the seventh on would wait
+/// [`BACKOFF_CEILING`], however long the task had worked in between.
 ///
 /// A minute, because the shortest-lived thing this will supervise polls once a
 /// second, so a minute is sixty rounds of real work.
@@ -103,11 +115,10 @@ pub enum Stopped {
     Exhausted(String),
 }
 
-// Written so that the binary's last line before it exits reads as a sentence.
-// Without this, `{:?}` is the only formatting that compiles and a user's final
-// word from the daemon was `detection stopped: Exhausted("...")` - a variant
-// name and a quoted string, which is a debugger's view of a value rather than
-// an account of what happened.
+// Written so that what the binary says of a task that stopped reads as a
+// sentence. `{:?}` would say `Exhausted("...")`: a variant name and a quoted
+// string, which is a debugger's view of a value rather than an account of what
+// happened.
 impl fmt::Display for Stopped {
     fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -129,13 +140,61 @@ pub struct TaskRecord {
     pub stopped_by: Stopped,
 }
 
+/// What the supervisor tells of a task, as it happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// The task failed in a way that is expected to pass, and is started
+    /// again after a wait.
+    Retried {
+        /// The name the task is supervised under.
+        name: String,
+        /// How long the task waits before it starts.
+        after: Duration,
+        /// What the task failed with, rendered for a person.
+        why: String,
+    },
+    /// The task panicked, and is started again at once.
+    Restarted {
+        /// The name the task is supervised under.
+        name: String,
+        /// What the panic said.
+        why: String,
+    },
+    /// The task is no longer running and is not started again.
+    Stopped(TaskRecord),
+}
+
+// Each is a line of its own on a terminal, after the name of the program.
+impl fmt::Display for Notice {
+    fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retried { name, after, why } => {
+                write!(
+                    into,
+                    "{name} failed and is started again in {after:?}: {why}"
+                )
+            }
+            Self::Restarted { name, why } => {
+                write!(into, "{name} panicked and is started again: {why}")
+            }
+            Self::Stopped(record) => write!(into, "{} {}", record.name, record.stopped_by),
+        }
+    }
+}
+
 /// One task's body, ready to be run again.
 type TaskFuture = Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send>>;
 
 /// A set of tasks whose handles are owned here and nowhere else.
-#[derive(Default)]
 pub struct Supervisor {
     tasks: Vec<Supervised>,
+    tell: Box<dyn FnMut(&Notice) + Send>,
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::telling(|_notice| {})
+    }
 }
 
 /// One task and what has happened to it so far.
@@ -143,28 +202,49 @@ struct Supervised {
     name: String,
     body: Box<dyn FnMut() -> TaskFuture + Send>,
     restarts: u32,
+    /// Panics in a row. A panic that ends an attempt which worked for
+    /// [`PROGRESS_INTERVAL`] is the first of a new row.
     panics: u32,
+    /// Transient failures in a row, by the same rule.
+    faults: u32,
     /// When the current attempt was spawned, and how much of that it spent
     /// asleep before starting. The difference is how long it actually ran,
-    /// which is what decides whether a panic continues a crash loop.
+    /// which is what decides whether a failure continues the row before it.
     last_start: Option<Instant>,
     last_delay: Duration,
     /// `None` for as long as it is still running.
     stopped_by: Option<Stopped>,
 }
 
-/// How long to wait before the `restarts`-th restart of a transient failure.
+impl Supervised {
+    /// Whether the attempt that has just ended ran for long enough to have
+    /// got work done.
+    ///
+    /// The wait before it started is taken off, because waiting is not
+    /// working. Absent a start time nothing has run, which counts as no
+    /// work.
+    fn worked(&self) -> bool {
+        let ran_for = self
+            .last_start
+            .map(|start| start.elapsed().saturating_sub(self.last_delay))
+            .unwrap_or_default();
+
+        ran_for >= PROGRESS_INTERVAL
+    }
+}
+
+/// How long to wait after the `faults`-th transient failure in a row.
 ///
 /// Doubling, from [`BACKOFF_BASE`] and never past [`BACKOFF_CEILING`]. Only a
 /// transient failure is delayed: it is retried without limit, so it needs the
 /// throttle. A panic is retried at most [`RESTART_LIMIT`] times, and a bounded
 /// retry cannot run away.
-fn backoff(restarts: u32) -> Duration {
-    // `restarts` is unbounded for a transient failure, and an exponent large
-    // enough to overflow would wrap to a short delay, turning the throttle into
-    // its opposite. The clamp is what prevents that; the saturating forms only
-    // keep it prevented if the constants above ever change.
-    let doubling = 2_u32.saturating_pow(restarts.saturating_sub(1).min(16));
+fn backoff(faults: u32) -> Duration {
+    // `faults` is unbounded, and an exponent large enough to overflow would
+    // wrap to a short delay, turning the throttle into its opposite. The
+    // clamp is what prevents that; the saturating forms only keep it
+    // prevented if the constants above ever change.
+    let doubling = 2_u32.saturating_pow(faults.saturating_sub(1).min(16));
 
     BACKOFF_BASE.saturating_mul(doubling).min(BACKOFF_CEILING)
 }
@@ -206,10 +286,25 @@ fn start(
 }
 
 impl Supervisor {
-    /// A supervisor with nothing to supervise yet.
+    /// A supervisor with nothing to supervise yet, which tells nobody of its
+    /// tasks.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A supervisor with nothing to supervise yet, which tells `tell` of a
+    /// task as the task is started again and as it stops.
+    ///
+    /// `tell` is called from [`Supervisor::run`] itself. A task that ends
+    /// while `tell` is at work is started again, or recorded as stopped, only
+    /// once `tell` has returned.
+    #[must_use]
+    pub fn telling(tell: impl FnMut(&Notice) + Send + 'static) -> Self {
+        Self {
+            tasks: Vec::new(),
+            tell: Box::new(tell),
+        }
     }
 
     /// Take a task, to be started when the supervisor runs.
@@ -227,6 +322,7 @@ impl Supervisor {
             body: Box::new(move || Box::pin(body())),
             restarts: 0,
             panics: 0,
+            faults: 0,
             last_start: None,
             last_delay: Duration::ZERO,
             stopped_by: None,
@@ -245,11 +341,15 @@ impl Supervisor {
     /// ends without a reason being written down. Both are bugs in this file and
     /// neither is reachable from a task: a task that panics is caught and
     /// recorded, which is the point of owning the handle.
-    pub async fn run(mut self) -> Vec<TaskRecord> {
+    pub async fn run(self) -> Vec<TaskRecord> {
+        let Self {
+            mut tasks,
+            mut tell,
+        } = self;
         let mut set = JoinSet::new();
         let mut owners = HashMap::new();
 
-        for (index, task) in self.tasks.iter_mut().enumerate() {
+        for (index, task) in tasks.iter_mut().enumerate() {
             start(&mut set, &mut owners, task, index, Duration::ZERO);
         }
 
@@ -261,50 +361,65 @@ impl Supervisor {
             // Every handle was recorded as it was spawned, so a handle with no
             // owner is a bug in this file rather than a failure of a task.
             let index = index.expect("a joined handle was spawned here");
-            let task = &mut self.tasks[index];
+            let task = &mut tasks[index];
 
-            match outcome {
-                Ok(Ok(())) => task.stopped_by = Some(Stopped::Finished),
+            // A task that is started again is told of before it is started.
+            let stopped_by = match outcome {
+                Ok(Ok(())) => Some(Stopped::Finished),
                 Ok(Err(TaskError::Permanent(reason))) => {
-                    task.stopped_by = Some(Stopped::Permanent(reason.to_string()));
+                    Some(Stopped::Permanent(reason.to_string()))
                 }
-                Ok(Err(TaskError::Transient(_))) => {
+                Ok(Err(TaskError::Transient(reason))) => {
+                    if task.worked() {
+                        task.faults = 0;
+                    }
+                    task.faults += 1;
                     task.restarts += 1;
-                    let delay = backoff(task.restarts);
+                    let delay = backoff(task.faults);
+                    tell(&Notice::Retried {
+                        name: task.name.clone(),
+                        after: delay,
+                        why: reason.to_string(),
+                    });
                     start(&mut set, &mut owners, task, index, delay);
+                    None
                 }
                 Err(failure) if failure.is_panic() => {
                     let reason = panic_message(failure.into_panic());
-                    // An attempt that ran longer than the progress interval got
-                    // work done, so the panic that ended it starts a new count
-                    // rather than continuing the last one. Absent a start time
-                    // nothing has run, which counts as no progress.
-                    let ran_for = task
-                        .last_start
-                        .map(|start| start.elapsed().saturating_sub(task.last_delay))
-                        .unwrap_or_default();
-                    if ran_for >= PROGRESS_INTERVAL {
+                    if task.worked() {
                         task.panics = 0;
                     }
 
                     if task.panics >= RESTART_LIMIT {
-                        task.stopped_by = Some(Stopped::Exhausted(reason));
+                        Some(Stopped::Exhausted(reason))
                     } else {
                         task.panics += 1;
                         task.restarts += 1;
+                        tell(&Notice::Restarted {
+                            name: task.name.clone(),
+                            why: reason,
+                        });
                         start(&mut set, &mut owners, task, index, Duration::ZERO);
+                        None
                     }
                 }
                 // Nothing here aborts a task and the set outlives the loop, so
                 // a cancellation means something else reached in and took the
                 // handle. Recorded rather than guessed at.
-                Err(_cancelled) => {
-                    task.stopped_by = Some(Stopped::Permanent("the task was cancelled".to_owned()));
-                }
+                Err(_cancelled) => Some(Stopped::Permanent("the task was cancelled".to_owned())),
+            };
+
+            if let Some(stopped_by) = stopped_by {
+                tell(&Notice::Stopped(TaskRecord {
+                    name: task.name.clone(),
+                    restarts: task.restarts,
+                    stopped_by: stopped_by.clone(),
+                }));
+                task.stopped_by = Some(stopped_by);
             }
         }
 
-        self.tasks
+        tasks
             .into_iter()
             .map(|task| TaskRecord {
                 name: task.name,
@@ -319,11 +434,19 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROGRESS_INTERVAL, RESTART_LIMIT, Stopped, Supervisor, TaskError, backoff};
+    use super::{
+        BACKOFF_BASE, BACKOFF_CEILING, Notice, PROGRESS_INTERVAL, RESTART_LIMIT, Stopped,
+        Supervisor, TaskError, TaskRecord, backoff,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
     use tokio::time::Instant;
+
+    /// How long a test waits to be told, on the clock the supervisor sleeps
+    /// on. Only ever spent on a failure.
+    const PATIENCE: Duration = Duration::from_secs(5);
 
     /// A counter shared between a test and the task body it supervises.
     fn counter() -> Arc<AtomicU32> {
@@ -333,6 +456,350 @@ mod tests {
     /// Count this attempt and return which one it was, starting at one.
     fn attempt(count: &Arc<AtomicU32>) -> u32 {
         count.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// What a supervisor told, in the order it told it.
+    #[derive(Clone, Default)]
+    struct Told(Arc<Mutex<Vec<Notice>>>);
+
+    impl Told {
+        /// What a supervisor is handed so that what it tells is kept here.
+        fn listener(&self) -> impl FnMut(&Notice) + Send + 'static {
+            let told = self.clone();
+
+            move |notice| {
+                told.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(notice.clone());
+            }
+        }
+
+        fn all(&self) -> Vec<Notice> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Wait until this many notices have been told.
+        ///
+        /// Slept for and never yielded for: a paused clock moves on only
+        /// while every task waits on it.
+        async fn until(&self, count: usize) {
+            let waited = tokio::time::timeout(PATIENCE, async {
+                while self.all().len() < count {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+
+            assert!(waited.is_ok(), "told {:?} and no more", self.all());
+        }
+    }
+
+    /// What a task is stopped by, under this name and after this many
+    /// restarts, as a supervisor tells of it.
+    fn stopped(name: &str, restarts: u32, stopped_by: Stopped) -> Notice {
+        Notice::Stopped(TaskRecord {
+            name: name.to_owned(),
+            restarts,
+            stopped_by,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_that_stops_for_good_is_told_of_while_another_runs_on() {
+        // The daemon's socket does not stop, so `run` hands nothing back while
+        // the daemon runs.
+        let told = Told::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("refused", || async {
+            Err(TaskError::Permanent(anyhow::anyhow!("the token expired")))
+        });
+        supervisor.supervise("steady", std::future::pending);
+
+        let running = tokio::spawn(supervisor.run());
+        told.until(1).await;
+
+        assert!(!running.is_finished(), "the other task had not stopped");
+        assert_eq!(
+            told.all(),
+            [stopped(
+                "refused",
+                0,
+                Stopped::Permanent("the token expired".to_owned())
+            )]
+        );
+        running.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_started_again_after_a_fault_is_told_of_before_it_starts() {
+        let told = Told::default();
+        let told_by_then: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let starts: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("retrying", {
+            let told = told.clone();
+            let told_by_then = Arc::clone(&told_by_then);
+            let starts = Arc::clone(&starts);
+            move || {
+                // Read where the attempt is made ready, which the supervisor
+                // does as it starts it. Read where the attempt runs, a
+                // notice told after the start would be there as well.
+                told_by_then
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(told.all().len());
+                let starts = Arc::clone(&starts);
+                async move {
+                    let attempt = {
+                        let mut starts = starts.lock().unwrap_or_else(PoisonError::into_inner);
+                        starts.push(Instant::now());
+                        starts.len()
+                    };
+
+                    if attempt < 4 {
+                        Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        });
+
+        supervisor.run().await;
+
+        let again = |after| Notice::Retried {
+            name: "retrying".to_owned(),
+            after,
+            why: "the bus is away".to_owned(),
+        };
+        assert_eq!(
+            told.all(),
+            [
+                again(BACKOFF_BASE),
+                again(BACKOFF_BASE * 2),
+                again(BACKOFF_BASE * 4),
+                stopped("retrying", 3, Stopped::Finished),
+            ]
+        );
+        assert_eq!(
+            *told_by_then.lock().unwrap_or_else(PoisonError::into_inner),
+            [0, 1, 2, 3],
+            "an attempt had started before it was told of"
+        );
+        // The wait that is told is the wait that is made.
+        let starts = starts.lock().unwrap_or_else(PoisonError::into_inner);
+        let waits: Vec<Duration> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(waits, [BACKOFF_BASE, BACKOFF_BASE * 2, BACKOFF_BASE * 4]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_started_again_after_a_panic_is_told_of_before_it_starts() {
+        let told = Told::default();
+        let told_by_then: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("flaky", {
+            let told = told.clone();
+            let told_by_then = Arc::clone(&told_by_then);
+            move || {
+                // Read where the attempt is made ready, as in the test above.
+                let attempt = {
+                    let mut by_then = told_by_then.lock().unwrap_or_else(PoisonError::into_inner);
+                    by_then.push(told.all().len());
+                    by_then.len()
+                };
+                async move {
+                    assert!(attempt > 1, "the first attempt panics");
+                    Ok(())
+                }
+            }
+        });
+
+        supervisor.run().await;
+
+        assert_eq!(
+            told.all(),
+            [
+                Notice::Restarted {
+                    name: "flaky".to_owned(),
+                    why: "the first attempt panics".to_owned(),
+                },
+                stopped("flaky", 1, Stopped::Finished),
+            ]
+        );
+        assert_eq!(
+            *told_by_then.lock().unwrap_or_else(PoisonError::into_inner),
+            [0, 1],
+            "an attempt had started before it was told of"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_given_up_on_is_told_of() {
+        let attempts = counter();
+        let told = Told::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("doomed", {
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    // The same escape the test of the limit has.
+                    assert!(
+                        attempt(&attempts) > RESTART_LIMIT + 10,
+                        "this one always panics"
+                    );
+                    Ok(())
+                }
+            }
+        });
+
+        supervisor.run().await;
+
+        let told = told.all();
+        let restarted = Notice::Restarted {
+            name: "doomed".to_owned(),
+            why: "this one always panics".to_owned(),
+        };
+        let (last, before) = told.split_last().expect("something was told");
+        assert_eq!(before, vec![restarted; RESTART_LIMIT as usize]);
+        assert_eq!(
+            *last,
+            stopped(
+                "doomed",
+                RESTART_LIMIT,
+                Stopped::Exhausted("this one always panics".to_owned())
+            )
+        );
+    }
+
+    /// The waits a supervisor told of, in the order it told of them.
+    fn waits_in(told: &Told) -> Vec<Duration> {
+        told.all()
+            .iter()
+            .filter_map(|notice| match notice {
+                Notice::Retried { after, .. } => Some(*after),
+                Notice::Restarted { .. } | Notice::Stopped(_) => None,
+            })
+            .collect()
+    }
+
+    /// A supervisor over one task that fails in a way that passes at every
+    /// attempt up to `last`, where it returns, having first worked for
+    /// `worked` at the attempt `long`.
+    async fn faults_with_work(long: u32, worked: Duration, last: u32) -> Told {
+        let attempts = counter();
+        let told = Told::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("long-lived", {
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    let attempt = attempt(&attempts);
+                    if attempt == long {
+                        tokio::time::sleep(worked).await;
+                    }
+                    if attempt == last {
+                        return Ok(());
+                    }
+
+                    Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                }
+            }
+        });
+
+        supervisor.run().await;
+
+        told
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_after_a_while_of_work_waits_as_the_first_did() {
+        // A task that ran for a month and meets a fault has not been failing
+        // for a month. Counted from the first fault of its life, every fault
+        // from the seventh on waits a minute.
+        let told = faults_with_work(4, PROGRESS_INTERVAL, 6).await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_short_of_a_while_of_work_waits_longer_than_the_last() {
+        let short = PROGRESS_INTERVAL.saturating_sub(Duration::from_millis(1));
+
+        let told = faults_with_work(4, short, 6).await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE * 8,
+                BACKOFF_BASE * 16,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_wait_is_not_work() {
+        // An attempt that waited a minute to start and failed at once has
+        // been going for a minute and has done nothing. Taken for work, the
+        // wait would fall from its ceiling to its base and climb again.
+        let told = faults_with_work(0, Duration::ZERO, 10).await;
+
+        let waits = waits_in(&told);
+        assert_eq!(waits.len(), 9, "{waits:?}");
+        assert_eq!(
+            waits[6..],
+            [BACKOFF_CEILING, BACKOFF_CEILING, BACKOFF_CEILING],
+            "{waits:?}"
+        );
+    }
+
+    #[test]
+    fn a_notice_reads_as_a_sentence() {
+        // Each is a line the binary prints under its own name.
+        let retried = Notice::Retried {
+            name: "detection".to_owned(),
+            after: Duration::from_secs(2),
+            why: "the bus is away".to_owned(),
+        };
+        let restarted = Notice::Restarted {
+            name: "detection".to_owned(),
+            why: "index out of bounds".to_owned(),
+        };
+        let gone = stopped(
+            "detection",
+            3,
+            Stopped::Permanent("the token expired".to_owned()),
+        );
+
+        assert_eq!(
+            retried.to_string(),
+            "detection failed and is started again in 2s: the bus is away"
+        );
+        assert_eq!(
+            restarted.to_string(),
+            "detection panicked and is started again: index out of bounds"
+        );
+        assert_eq!(
+            gone.to_string(),
+            "detection stopped for good: the token expired"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -495,11 +962,10 @@ mod tests {
 
     #[test]
     fn an_outcome_reads_as_an_account_rather_than_a_value() {
-        // This is the binary's last line before it exits, and `{:?}` was the
-        // only formatting that compiled until `Stopped` had a `Display`, so a
-        // user's final word from the daemon was `Exhausted("...")`. The match
-        // below is exhaustive and empty: a variant added later stops the crate
-        // compiling here, in front of the list it has to join.
+        // The binary says this of a task that stopped, where `{:?}` would say
+        // `Exhausted("...")`. The match below is exhaustive and empty: a
+        // variant added to the enum stops the crate compiling here, in front of
+        // the list it has to join.
         let outcomes = [
             Stopped::Finished,
             Stopped::Permanent("the session bus went away".to_owned()),

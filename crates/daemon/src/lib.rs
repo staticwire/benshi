@@ -30,7 +30,7 @@ use crate::detection::{Detection, Seen, Wiring};
 use crate::ipc::Server;
 use crate::recognition::{Decided, Recogniser};
 #[cfg(unix)]
-use crate::supervisor::{Supervisor, TaskError, TaskRecord};
+use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
 
 pub mod bus;
 
@@ -77,20 +77,28 @@ pub mod supervisor;
 /// what a file's name is decided against, and `now` reads the time of day the
 /// store writes beside what it keeps.
 ///
+/// `tell` is told of a task as the task is started again and as it stops,
+/// whatever the other task is doing. A daemon whose detection has stopped
+/// goes on answering its socket, and nothing else says that it records
+/// nothing.
+///
 /// Returns once no task is left running, which for a daemon means every one of
-/// them stopped permanently. What stopped each is in its [`TaskRecord`].
-pub async fn run<W, B, F>(
+/// them stopped permanently. What stopped each is in its [`TaskRecord`], and
+/// `tell` has been told of each by then.
+pub async fn run<W, B, F, T>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
     recogniser: Recogniser,
     store: Arc<Mutex<Store>>,
     now: fn() -> SystemTime,
     period: Duration,
+    tell: T,
 ) -> Vec<TaskRecord>
 where
     B: FnMut() -> F + Send + 'static,
     F: Future<Output = Result<W, WatchError>> + Send + 'static,
     W: PlayerWatcher + Send + 'static,
+    T: FnMut(&Notice) + Send + 'static,
 {
     let wiring = Wiring {
         bus: Arc::new(EventBus::new()),
@@ -109,7 +117,7 @@ where
         wiring.decided.clone(),
     ));
 
-    let mut supervisor = Supervisor::new();
+    let mut supervisor = Supervisor::telling(tell);
 
     supervisor.supervise("detection", move || {
         let wiring = wiring.clone();

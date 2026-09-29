@@ -5,8 +5,8 @@
 //! itself is under test: whether detection and the socket were given the same
 //! records, the same bus and the same policy table, whether detection was
 //! given the store and the list the daemon was started with, whether one task
-//! failing takes the other down, and whether a restart starts from a watcher
-//! of its own.
+//! failing takes the other down, whether a restart starts from a watcher of
+//! its own, and whether what happens to a task is told as it happens.
 //!
 //! The platform is a fake, because a real one would make the run depend on
 //! what happens to be playing. Everything above it is the production article.
@@ -31,7 +31,7 @@ use benshi_daemon::bus::BusEvent;
 use benshi_daemon::ipc::bind;
 use benshi_daemon::protocol::{Request, Response, SourceListing};
 use benshi_daemon::recognition::Recogniser;
-use benshi_daemon::supervisor::RESTART_LIMIT;
+use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, TaskRecord};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use benshi_store::queue::{Kind, Operation};
@@ -237,11 +237,46 @@ fn a_socket() -> (TempDir, PathBuf) {
 
 /// A database in that directory, opened the way the binary opens one.
 fn a_store(home: &TempDir) -> Arc<Mutex<Store>> {
-    let database = home.path().join("data").join("benshi.db");
-
     Arc::new(Mutex::new(
-        Store::open(&database).expect("the database opens"),
+        Store::open(&the_database(home)).expect("the database opens"),
     ))
+}
+
+/// Where the database of [`a_store`] is.
+fn the_database(home: &TempDir) -> PathBuf {
+    home.path().join("data").join("benshi.db")
+}
+
+/// What a daemon told of its tasks, in the order it told it.
+#[derive(Clone, Default)]
+struct Told(Arc<Mutex<Vec<Notice>>>);
+
+impl Told {
+    /// What a daemon is handed so that what it tells is kept here.
+    fn listener(&self) -> impl FnMut(&Notice) + Send + 'static {
+        let told = self.clone();
+
+        move |notice| told.0.lock().expect("what was told").push(notice.clone())
+    }
+
+    fn all(&self) -> Vec<Notice> {
+        self.0.lock().expect("what was told").clone()
+    }
+
+    /// Wait until the daemon has told of something `wanted` holds for, and
+    /// answer with the first such.
+    async fn until(&self, what: &str, wanted: impl Fn(&Notice) -> bool) -> Notice {
+        timeout(PATIENCE, async {
+            loop {
+                if let Some(notice) = self.all().into_iter().find(|notice| wanted(notice)) {
+                    return notice;
+                }
+                tokio::time::sleep(PERIOD).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: it told {:?}", self.all()))
+    }
 }
 
 /// A daemon over this platform with nothing to match a name against, as the
@@ -250,7 +285,7 @@ fn a_daemon(
     platform: &Platform,
     home: &TempDir,
     socket: &Path,
-) -> tokio::task::JoinHandle<Vec<benshi_daemon::supervisor::TaskRecord>> {
+) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
 
     tokio::spawn(benshi_daemon::run(
@@ -260,6 +295,7 @@ fn a_daemon(
         a_store(home),
         SystemTime::now,
         PERIOD,
+        |_notice| {},
     ))
 }
 
@@ -269,7 +305,17 @@ fn a_daemon_with_a_list(
     platform: &Platform,
     store: &Arc<Mutex<Store>>,
     socket: &Path,
-) -> tokio::task::JoinHandle<Vec<benshi_daemon::supervisor::TaskRecord>> {
+) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+    a_daemon_that_tells(platform, store, socket, &Told::default())
+}
+
+/// [`a_daemon_with_a_list`] that tells `told` of its tasks.
+fn a_daemon_that_tells(
+    platform: &Platform,
+    store: &Arc<Mutex<Store>>,
+    socket: &Path,
+    told: &Told,
+) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
 
     tokio::spawn(benshi_daemon::run(
@@ -279,6 +325,7 @@ fn a_daemon_with_a_list(
         Arc::clone(store),
         the_time,
         PERIOD,
+        told.listener(),
     ))
 }
 
@@ -290,6 +337,25 @@ fn watched(store: &Arc<Mutex<Store>>) -> Option<Duration> {
         .resume("Show", Some(3))
         .expect("the total reads")
         .map(|kept| kept.watched)
+}
+
+/// Keep reading the queue until something is in it, or fail.
+async fn once_queued(store: &Arc<Mutex<Store>>, what: &str) -> Vec<Operation> {
+    timeout(PATIENCE, async {
+        loop {
+            let queued = store
+                .lock()
+                .expect("the store")
+                .queued()
+                .expect("the queue reads");
+            if !queued.is_empty() {
+                return queued;
+            }
+            tokio::time::sleep(PERIOD).await;
+        }
+    })
+    .await
+    .expect(what)
 }
 
 /// Ask the daemon one question and read one answer.
@@ -369,21 +435,7 @@ async fn a_running_daemon_records_what_its_detection_watched() {
 
     let running = a_daemon_with_a_list(&platform, &store, &socket);
 
-    let queued = timeout(PATIENCE, async {
-        loop {
-            let queued = store
-                .lock()
-                .expect("the store")
-                .queued()
-                .expect("the queue reads");
-            if !queued.is_empty() {
-                return queued;
-            }
-            tokio::time::sleep(PERIOD).await;
-        }
-    })
-    .await
-    .expect("the daemon recorded the episode it watched half of");
+    let queued = once_queued(&store, "the daemon recorded the episode it watched half of").await;
     running.abort();
 
     assert_eq!(
@@ -394,7 +446,7 @@ async fn a_running_daemon_records_what_its_detection_watched() {
             kind: Kind::Progress { episode: Some(3) },
         }]
     );
-    let seen_at: String = rusqlite::Connection::open(home.path().join("data").join("benshi.db"))
+    let seen_at: String = rusqlite::Connection::open(the_database(&home))
         .expect("the file opens for reading")
         .query_row("SELECT seen_at FROM episodes_seen", [], |row| row.get(0))
         .expect("the one episode that was recorded");
@@ -508,6 +560,104 @@ async fn a_policy_set_over_the_socket_is_the_one_detection_reads() {
         at_the_deny,
         "a player that was denied went on being counted"
     );
+}
+
+#[tokio::test]
+async fn a_daemon_tells_of_detection_stopping_while_its_socket_answers() {
+    // What stopped a task is handed back once every task has stopped, which
+    // for a daemon is as the process ends. Told as it happens, it is said
+    // while the daemon can still be asked what it saw.
+    let (home, socket) = a_socket();
+    let store = a_store(&home);
+    rusqlite::Connection::open(the_database(&home))
+        .expect("the file opens a second time")
+        .execute_batch(
+            "CREATE TRIGGER refused BEFORE INSERT ON watching \
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .expect("a trigger in the file");
+    let platform = Platform::default();
+    let told = Told::default();
+
+    let running = a_daemon_that_tells(&platform, &store, &socket, &told);
+
+    let stopped = told
+        .until("the daemon told of a task stopping", |notice| {
+            matches!(notice, Notice::Stopped(_))
+        })
+        .await;
+    let answer = timeout(PATIENCE, ask(&socket, &Request::Sources))
+        .await
+        .expect("the socket answered after detection had stopped");
+    running.abort();
+
+    assert!(
+        matches!(
+            &stopped,
+            Notice::Stopped(TaskRecord {
+                name,
+                restarts: 0,
+                stopped_by: Stopped::Permanent(why),
+            }) if name == "detection" && why.contains("refused by the test")
+        ),
+        "{stopped:?}"
+    );
+    assert!(
+        matches!(answer, Response::Sources(_)),
+        "got {answer:?} rather than a listing"
+    );
+}
+
+#[tokio::test]
+async fn a_daemon_whose_database_was_in_use_records_once_it_is_free() {
+    // A person with `sqlite3` open on the file can hold the write lock for
+    // as long as they like. Detection is started again until they let go,
+    // and says so each time.
+    let (home, socket) = a_socket();
+    let store = a_store(&home);
+    let writer =
+        rusqlite::Connection::open(the_database(&home)).expect("the file opens a second time");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the write lock is free");
+    let platform = Platform::default();
+    let told = Told::default();
+
+    let running = a_daemon_that_tells(&platform, &store, &socket, &told);
+
+    let started_again = told
+        .until("the daemon told of a task started again", |notice| {
+            matches!(notice, Notice::Retried { .. })
+        })
+        .await;
+    writer
+        .execute_batch("COMMIT")
+        .expect("the lock is given up");
+    let queued = once_queued(&store, "the daemon recorded once the database was free").await;
+    running.abort();
+
+    assert_eq!(
+        started_again,
+        Notice::Retried {
+            name: "detection".to_owned(),
+            after: BACKOFF_BASE,
+            why: "the database is in use by another connection: database is locked".to_owned(),
+        }
+    );
+    assert_eq!(
+        queued,
+        [Operation {
+            id: 1,
+            title: "Show".to_owned(),
+            kind: Kind::Progress { episode: Some(3) },
+        }]
+    );
+    let stopped: Vec<Notice> = told
+        .all()
+        .into_iter()
+        .filter(|notice| matches!(notice, Notice::Stopped(_)))
+        .collect();
+    assert_eq!(stopped, [], "a task stopped over a database in use");
 }
 
 #[tokio::test]
