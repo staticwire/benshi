@@ -47,6 +47,8 @@ pub mod recognition;
 
 pub mod supervisor;
 
+pub mod voice;
+
 /// Run the daemon until every one of its tasks has stopped.
 ///
 /// Built where the socket is, because a daemon with no interface is not one:
@@ -80,7 +82,9 @@ pub mod supervisor;
 /// `tell` is told of a task as the task is started again and as it stops,
 /// whatever the other task is doing. A daemon whose detection has stopped
 /// goes on answering its socket, and nothing else says that it records
-/// nothing.
+/// nothing. The supervisor deals with no task that ended until `tell` has
+/// returned, so a `tell` that writes hands the line to a
+/// [`Voice`](voice::Voice).
 ///
 /// Returns once no task is left running, which for a daemon means every one of
 /// them stopped permanently. What stopped each is in its [`TaskRecord`], and

@@ -20,19 +20,15 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::process::Stdio;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{Daemon, Descriptors, Directory, NO_TRAY, PATIENCE, Run, nowhere, run, the_binary};
+use common::{
+    Daemon, Descriptors, Directory, NO_SOURCE, NO_TRAY, SUCCEEDED, nowhere, run, sources_of,
+    the_binary,
+};
 
 /// How a process ends on Linux whose `main` answered `ExitCode::FAILURE`.
 const FAILED: Option<i32> = Some(1);
-
-/// How one ends whose `main` answered `ExitCode::SUCCESS`.
-const SUCCEEDED: Option<i32> = Some(0);
-
-/// What a client shows of a daemon that has seen no source.
-const NO_SOURCE: &str = "no source is open\n";
 
 /// What the binary says of a runtime it has one descriptor to start with.
 const NO_RUNTIME: &str =
@@ -42,33 +38,6 @@ const NO_RUNTIME: &str =
 /// twice that detection is started again, with as much again to spare: it
 /// says so as it starts detection and a second after.
 const SAID_TWICE: Duration = Duration::from_secs(2);
-
-/// What a client is answered that asks the daemon for its sources.
-///
-/// A client that is refused asks again for as long as the daemon runs. It is
-/// refused until the socket listens, and the file of the socket is there
-/// before that.
-fn sources_of(daemon: &mut Daemon, socket: &Path) -> Run {
-    let waited_from = Instant::now();
-    loop {
-        let mut client = the_binary(
-            &[
-                OsStr::new("sources"),
-                OsStr::new("--socket"),
-                socket.as_os_str(),
-            ],
-            &[],
-            Descriptors::Plenty,
-        );
-        client.stderr(Stdio::piped());
-        let asked = run(client);
-        let ended = daemon.ends_within(Duration::ZERO).is_some();
-        if asked.code == SUCCEEDED || ended || waited_from.elapsed() > PATIENCE {
-            return asked;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
 
 /// Holds that the daemon answers a client and is running two seconds later,
 /// by when it has twice had something to say of detection.

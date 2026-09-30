@@ -1,9 +1,9 @@
 //! The binary run in a session a test chose.
 //!
 //! The binary itself is run, because what is under test is what a person
-//! reads. A test binary that uses this opens no socket of its own: a process
-//! it starts holds a copy of every descriptor open in it until that process
-//! runs its own program.
+//! reads. A process a test starts holds a copy of every descriptor open in the
+//! test binary until it runs its own program, so a test binary that uses this
+//! never counts on a socket of its own being gone the moment it lets go of it.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -19,8 +19,17 @@ use std::time::{Duration, Instant};
 pub const PATIENCE: Duration = Duration::from_secs(10);
 
 /// A session bus that is not there, so that a daemon under test reaches no
-/// player of the person running the tests.
+/// player of the person running the tests. A session that names a bus of the
+/// test's own has that one.
 const NO_BUS: &str = "unix:path=/nowhere/bus";
+
+/// How a process ends on Linux whose `main` answered `ExitCode::SUCCESS`.
+pub const SUCCEEDED: Option<i32> = Some(0);
+
+/// What a client shows of a daemon that has seen no source.
+// Dead in a test binary that asks no daemon for its sources.
+#[allow(dead_code)]
+pub const NO_SOURCE: &str = "no source is open\n";
 
 /// What the last line a daemon says as it starts begins with.
 const STARTED: &str = "benshi: recording in ";
@@ -68,8 +77,8 @@ pub fn the_binary(
     binary
         .args(arguments)
         .env_clear()
-        .envs(session.iter().copied())
         .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
+        .envs(session.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null());
 
@@ -78,8 +87,6 @@ pub fn the_binary(
 
 /// Somewhere that cannot be written to. Every write to `/dev/full` fails, as
 /// one does to a terminal that has gone and to a pipe whose reader has gone.
-// Dead in a test binary that hears everything it starts.
-#[allow(dead_code)]
 pub fn nowhere() -> Stdio {
     File::options()
         .write(true)
@@ -89,7 +96,8 @@ pub fn nowhere() -> Stdio {
 }
 
 /// One run of the binary that was waited for until it ended.
-// Dead where `run` is.
+// `shown` and `said` are dead in a test binary that reads only the code of a
+// run.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct Run {
@@ -104,8 +112,6 @@ pub struct Run {
 
 /// Runs the binary until it ends, hearing what it answers and what it says
 /// where the command left that to be heard.
-// Dead in a test binary that runs the binary through `Daemon` alone.
-#[allow(dead_code)]
 pub fn run(mut binary: Command) -> Run {
     let mut running = binary
         .stdout(Stdio::piped())
@@ -141,8 +147,6 @@ fn ends_within(running: &mut Child, patience: Duration) -> Option<ExitStatus> {
 
 /// Everything a process that has ended wrote, and nothing where it was given
 /// nowhere to write that the test reads.
-// Dead where `run` is.
-#[allow(dead_code)]
 fn heard(written: Option<impl Read>) -> String {
     let mut all = String::new();
     if let Some(mut written) = written {
@@ -240,8 +244,14 @@ impl Daemon {
     // Dead in a test binary that hears every daemon it starts.
     #[allow(dead_code)]
     pub fn unheard(arguments: &[&OsStr], session: &[(&str, &OsStr)]) -> Self {
+        Self::saying_to(arguments, session, nowhere())
+    }
+
+    /// A daemon that says what it says to `unheard`, which the test does not
+    /// hear.
+    pub fn saying_to(arguments: &[&OsStr], session: &[(&str, &OsStr)], unheard: Stdio) -> Self {
         let running = the_binary(arguments, session, Descriptors::Plenty)
-            .stderr(nowhere())
+            .stderr(unheard)
             .spawn()
             .expect("the binary runs");
         // Nothing sends, so a test that waits for a line is told at once
@@ -276,8 +286,6 @@ impl Daemon {
     }
 
     /// How it ended, and nothing where it is still running.
-    // Dead in a test binary that stops every daemon it starts.
-    #[allow(dead_code)]
     pub fn ended(&mut self) -> Option<ExitStatus> {
         self.ends_within(PATIENCE)
     }
@@ -299,6 +307,35 @@ impl Drop for Daemon {
         if let Some(reader) = self.reader.take() {
             drop(reader.join());
         }
+    }
+}
+
+/// What a client is answered that asks the daemon for its sources.
+///
+/// A client that is refused asks again for as long as the daemon runs, up to
+/// `PATIENCE`. It is refused until the socket listens, and the file of the
+/// socket is there before that.
+// Dead in a test binary that asks no daemon for its sources.
+#[allow(dead_code)]
+pub fn sources_of(daemon: &mut Daemon, socket: &Path) -> Run {
+    let waited_from = Instant::now();
+    loop {
+        let mut client = the_binary(
+            &[
+                OsStr::new("sources"),
+                OsStr::new("--socket"),
+                socket.as_os_str(),
+            ],
+            &[],
+            Descriptors::Plenty,
+        );
+        client.stderr(Stdio::piped());
+        let asked = run(client);
+        let ended = daemon.ends_within(Duration::ZERO).is_some();
+        if asked.code == SUCCEEDED || ended || waited_from.elapsed() > PATIENCE {
+            return asked;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

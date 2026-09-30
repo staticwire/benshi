@@ -12,8 +12,12 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 use benshi_cli::Cli;
+#[cfg(target_os = "linux")]
+use benshi_daemon::voice::Voice;
 use clap::Parser;
 
 /// The flag that asks for a daemon without a tray icon.
@@ -55,13 +59,13 @@ impl Invocation {
     }
 }
 
-/// Says a line on stderr, and goes on where it cannot be written.
+/// Says a line on stderr for a process that has no voice to say it through,
+/// and goes on where it cannot be written.
 ///
-/// A daemon that outlives the terminal it was started from writes to a
-/// terminal that has gone, and the write fails. So does one to a pipe whose
-/// reader has gone and to a file on a disk that is full. `eprintln!` panics
-/// over each of them, which ends a daemon over a line nobody was there to
-/// read, and ends a run that failed with the code of a panic.
+/// A daemon says what it says through its voice, which waits for nobody to
+/// read it. This is for the line of a process that ends with it.
+/// `eprintln!` panics where the write fails, which would end a run that
+/// failed with the code of a panic.
 fn say(line: fmt::Arguments<'_>) {
     drop(writeln!(io::stderr(), "benshi: {line}"));
 }
@@ -87,11 +91,23 @@ fn main() -> ExitCode {
 /// so a daemon there would have a socket, a supervisor, and nothing to watch.
 #[cfg(target_os = "linux")]
 fn daemon(tray: bool) -> ExitCode {
+    // The first thing made and so the last to go: it goes once it has
+    // written what the daemon said as it ended.
+    let voice = match Voice::on(io::stderr()) {
+        Ok(voice) => Arc::new(voice),
+        Err(unstarted) => {
+            say(format_args!(
+                "the thread that writes to stderr could not be started: {unstarted}"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
     if tray {
         // Said rather than passed over. A tray that was asked for and is
         // silently absent looks exactly like a tray that failed to appear, and
         // the two are fixed differently.
-        say(format_args!("there is no tray yet, running without one"));
+        voice.say(format_args!("there is no tray yet, running without one"));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -100,19 +116,19 @@ fn daemon(tray: bool) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(unbuilt) => {
-            say(format_args!("the runtime could not be started: {unbuilt}"));
+            voice.say(format_args!("the runtime could not be started: {unbuilt}"));
             return ExitCode::FAILURE;
         }
     };
 
-    runtime.block_on(serve())
+    runtime.block_on(serve(&voice))
 }
 
 /// Bind the socket, open the database, supervise the daemon's tasks, and
 /// report what stopped them.
 #[cfg(target_os = "linux")]
-async fn serve() -> ExitCode {
-    use std::sync::{Arc, Mutex};
+async fn serve(voice: &Arc<Voice>) -> ExitCode {
+    use std::sync::Mutex;
     use std::time::SystemTime;
 
     use benshi_core::clock::SystemClock;
@@ -125,7 +141,7 @@ async fn serve() -> ExitCode {
     // The XDG Base Directory Specification asks for a warning where the
     // runtime directory is replaced.
     if let Some(fallback) = benshi_daemon::ipc::fallback() {
-        say(format_args!("{fallback}"));
+        voice.say(format_args!("{fallback}"));
     }
     // The socket is what says a daemon is running, so it is bound ahead of
     // the database. A second daemon that works out the same socket ends here,
@@ -134,7 +150,7 @@ async fn serve() -> ExitCode {
     let listener = match benshi_daemon::ipc::bind(&socket) {
         Ok(listener) => Arc::new(listener),
         Err(unbound) => {
-            say(format_args!(
+            voice.say(format_args!(
                 "{} cannot be used: {unbound}",
                 socket.display()
             ));
@@ -144,22 +160,22 @@ async fn serve() -> ExitCode {
     let database = match directory(Role::Data) {
         Ok(data) => data.join(DATABASE),
         Err(nowhere) => {
-            say(format_args!("{nowhere}"));
+            voice.say(format_args!("{nowhere}"));
             return ExitCode::FAILURE;
         }
     };
     let store = match Store::open(&database) {
         Ok(store) => Arc::new(Mutex::new(store)),
         Err(unopened) => {
-            say(format_args!(
+            voice.say(format_args!(
                 "{} cannot be used: {unopened}",
                 database.display()
             ));
             return ExitCode::FAILURE;
         }
     };
-    say(format_args!("listening on {}", socket.display()));
-    say(format_args!("recording in {}", database.display()));
+    voice.say(format_args!("listening on {}", socket.display()));
+    voice.say(format_args!("recording in {}", database.display()));
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
@@ -173,8 +189,13 @@ async fn serve() -> ExitCode {
         SystemTime::now,
         POLL_INTERVAL,
         // Said as it happens: the socket goes on answering once detection
-        // has stopped, and the process does not end to say so.
-        |notice| say(format_args!("{notice}")),
+        // has stopped, and the process does not end to say so. The
+        // supervisor deals with no task that ended until this returns, so it
+        // hands the line over and does not write it.
+        {
+            let voice = Arc::clone(voice);
+            move |notice| voice.say(format_args!("{notice}"))
+        },
     )
     .await;
 
