@@ -298,7 +298,10 @@ impl Supervisor {
     ///
     /// `tell` is called from [`Supervisor::run`] itself. A task that ends
     /// while `tell` is at work is started again, or recorded as stopped, only
-    /// once `tell` has returned.
+    /// once `tell` has returned. So a `tell` that waits keeps every task that
+    /// ends waiting with it, and one that writes waits where nobody reads.
+    /// [`Voice::say`](crate::voice::Voice::say) hands a line over and
+    /// returns.
     #[must_use]
     pub fn telling(tell: impl FnMut(&Notice) + Send + 'static) -> Self {
         Self {
