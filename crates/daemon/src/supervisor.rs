@@ -24,7 +24,7 @@
 //! cannot sleep, so taking one as a parameter would hand this module two clocks
 //! free to disagree about whether a task had been running long enough. What the
 //! rule is for still holds: `tokio::time` is virtualised under a paused runtime,
-//! so `a_long_backoff_does_not_count_as_work` winds through 423 seconds of
+//! so `a_long_backoff_does_not_count_as_work` winds through 2223 seconds of
 //! retries and takes no measurable time to run.
 
 use std::collections::HashMap;
@@ -45,9 +45,10 @@ use tokio::time::Instant;
 /// into a busy loop that hides it.
 ///
 /// In a row, and not in total: an attempt that ran for [`PROGRESS_INTERVAL`]
-/// before panicking starts the count again. A budget spent once and never
-/// renewed would stop a task for the life of the process over a minute of
-/// trouble it had long since recovered from.
+/// before it failed starts the count again, whether it ended in a panic or in
+/// a transient failure. A budget spent once and never renewed would stop a
+/// task for the life of the process over a minute of trouble it had long
+/// since recovered from.
 pub const RESTART_LIMIT: u32 = 5;
 
 /// How long to wait before the first retry of a transient failure.
@@ -63,18 +64,16 @@ pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 /// How long a task must run before a failure counts as new trouble rather
 /// than the continuation of the trouble before it.
 ///
-/// [`RESTART_LIMIT`] counts consecutive failures, and consecutive has to mean
-/// something in time. An attempt that ran this long did work, so the panic
-/// that ends it starts a fresh count. Without that, six panics inside one
-/// millisecond spend the entire budget - a panic is restarted with no delay -
-/// and the task never runs again however long the process lives, which is the
-/// opposite of what a restart limit is for.
+/// [`RESTART_LIMIT`] bounds panics in a row, and the wait before a retry
+/// doubles over transient failures in a row. In a row has to mean something
+/// in time: a failure that ends an attempt which ran this long starts both
+/// rows again, whichever kind of failure it is. Such an attempt did work, so
+/// what ended it is new trouble.
 ///
-/// The same holds for the wait before a retry, which doubles over
-/// consecutive transient failures. A failure that ends an attempt which ran
-/// this long waits [`BACKOFF_BASE`], as the first did. Counted over the life
-/// of a task, every failure from the seventh on would wait
-/// [`BACKOFF_CEILING`], however long the task had worked in between.
+/// A panic is restarted with no delay, so one bad millisecond can spend the
+/// whole of [`RESTART_LIMIT`]. Counted over the life of a task, the next
+/// panic would then stop it however long it had worked since, and every
+/// transient failure from the seventh on would wait [`BACKOFF_CEILING`].
 ///
 /// A minute, because the shortest-lived thing this will supervise polls once a
 /// second, so a minute is sixty rounds of real work.
@@ -202,14 +201,15 @@ struct Supervised {
     name: String,
     body: Box<dyn FnMut() -> TaskFuture + Send>,
     restarts: u32,
-    /// Panics in a row. A panic that ends an attempt which worked for
-    /// [`PROGRESS_INTERVAL`] is the first of a new row.
+    /// Panics in a row. The row starts again at the failure that ends an
+    /// attempt which worked for [`PROGRESS_INTERVAL`], whichever kind that
+    /// failure is.
     panics: u32,
     /// Transient failures in a row, by the same rule.
     faults: u32,
     /// When the current attempt was spawned, and how much of that it spent
     /// asleep before starting. The difference is how long it actually ran,
-    /// which is what decides whether a failure continues the row before it.
+    /// which is what decides whether a failure continues the rows before it.
     last_start: Option<Instant>,
     last_delay: Duration,
     /// `None` for as long as it is still running.
@@ -365,6 +365,11 @@ impl Supervisor {
             // owner is a bug in this file rather than a failure of a task.
             let index = index.expect("a joined handle was spawned here");
             let task = &mut tasks[index];
+            // Work ends both rows, whichever way the attempt then ended.
+            if task.worked() {
+                task.panics = 0;
+                task.faults = 0;
+            }
 
             // A task that is started again is told of before it is started.
             let stopped_by = match outcome {
@@ -373,9 +378,6 @@ impl Supervisor {
                     Some(Stopped::Permanent(reason.to_string()))
                 }
                 Ok(Err(TaskError::Transient(reason))) => {
-                    if task.worked() {
-                        task.faults = 0;
-                    }
                     task.faults += 1;
                     task.restarts += 1;
                     let delay = backoff(task.faults);
@@ -389,10 +391,6 @@ impl Supervisor {
                 }
                 Err(failure) if failure.is_panic() => {
                     let reason = panic_message(failure.into_panic());
-                    if task.worked() {
-                        task.panics = 0;
-                    }
-
                     if task.panics >= RESTART_LIMIT {
                         Some(Stopped::Exhausted(reason))
                     } else {
@@ -690,27 +688,40 @@ mod tests {
             .collect()
     }
 
-    /// A supervisor over one task that fails in a way that passes at every
-    /// attempt up to `last`, where it returns, having first worked for
-    /// `worked` at the attempt `long`.
-    async fn faults_with_work(long: u32, worked: Duration, last: u32) -> Told {
-        let attempts = counter();
+    /// How an attempt of a task fails.
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// In a way that passes.
+        Fault,
+        /// With a panic.
+        Panic,
+    }
+
+    /// How long an attempt works for that fails as it starts.
+    const AT_ONCE: Duration = Duration::ZERO;
+
+    /// What a supervisor told of one task that fails once for each of
+    /// `failures`, in their order and each after working for that long, and
+    /// returns at the attempt after the last.
+    async fn failing(failures: Vec<(Duration, Failure)>) -> Told {
         let told = Told::default();
         let mut supervisor = Supervisor::telling(told.listener());
-        supervisor.supervise("long-lived", {
-            let attempts = Arc::clone(&attempts);
+        supervisor.supervise("troubled", {
+            let mut failures = failures.into_iter();
             move || {
-                let attempts = Arc::clone(&attempts);
+                let failure = failures.next();
                 async move {
-                    let attempt = attempt(&attempts);
-                    if attempt == long {
-                        tokio::time::sleep(worked).await;
-                    }
-                    if attempt == last {
+                    let Some((worked, failure)) = failure else {
                         return Ok(());
-                    }
+                    };
 
-                    Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                    tokio::time::sleep(worked).await;
+                    match failure {
+                        Failure::Fault => {
+                            Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                        }
+                        Failure::Panic => panic!("index out of bounds"),
+                    }
                 }
             }
         });
@@ -725,7 +736,14 @@ mod tests {
         // A task that ran for a month and meets a fault has not been failing
         // for a month. Counted from the first fault of its life, every fault
         // from the seventh on waits a minute.
-        let told = faults_with_work(4, PROGRESS_INTERVAL, 6).await;
+        let told = failing(vec![
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (PROGRESS_INTERVAL, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+        ])
+        .await;
 
         assert_eq!(
             waits_in(&told),
@@ -743,7 +761,14 @@ mod tests {
     async fn a_fault_short_of_a_while_of_work_waits_longer_than_the_last() {
         let short = PROGRESS_INTERVAL.saturating_sub(Duration::from_millis(1));
 
-        let told = faults_with_work(4, short, 6).await;
+        let told = failing(vec![
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (short, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+        ])
+        .await;
 
         assert_eq!(
             waits_in(&told),
@@ -762,7 +787,7 @@ mod tests {
         // An attempt that waited a minute to start and failed at once has
         // been going for a minute and has done nothing. Taken for work, the
         // wait would fall from its ceiling to its base and climb again.
-        let told = faults_with_work(0, Duration::ZERO, 10).await;
+        let told = failing(vec![(AT_ONCE, Failure::Fault); 9]).await;
 
         let waits = waits_in(&told);
         assert_eq!(waits.len(), 9, "{waits:?}");
@@ -770,6 +795,121 @@ mod tests {
             waits[6..],
             [BACKOFF_CEILING, BACKOFF_CEILING, BACKOFF_CEILING],
             "{waits:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_a_fault_ends_gives_the_budget_back() {
+        // Every panic the budget allows, a while of work, and every panic the
+        // budget allows again.
+        let spent = vec![(AT_ONCE, Failure::Panic); RESTART_LIMIT as usize];
+        let failures = [
+            spent.clone(),
+            vec![(PROGRESS_INTERVAL, Failure::Fault)],
+            spent,
+        ]
+        .concat();
+
+        let told = failing(failures).await;
+
+        assert_eq!(
+            told.all().last(),
+            Some(&stopped(
+                "troubled",
+                RESTART_LIMIT * 2 + 1,
+                Stopped::Finished
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_that_ends_work_is_the_first_of_a_new_row() {
+        // Every panic the budget allows, a while of work that a panic ends,
+        // and every panic the budget allows again. The panic that ends the
+        // work is the first of its row, so the last of these is one more
+        // than the budget allows.
+        let spent = vec![(AT_ONCE, Failure::Panic); RESTART_LIMIT as usize];
+        let failures = [
+            spent.clone(),
+            vec![(PROGRESS_INTERVAL, Failure::Panic)],
+            spent,
+        ]
+        .concat();
+
+        let told = failing(failures).await;
+
+        assert_eq!(
+            told.all().last(),
+            Some(&stopped(
+                "troubled",
+                RESTART_LIMIT * 2,
+                Stopped::Exhausted("index out of bounds".to_owned())
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_short_of_a_while_of_work_gives_no_budget_back() {
+        let short = PROGRESS_INTERVAL.saturating_sub(Duration::from_millis(1));
+        let mut failures = vec![(AT_ONCE, Failure::Panic); RESTART_LIMIT as usize];
+        failures.push((short, Failure::Fault));
+        failures.push((AT_ONCE, Failure::Panic));
+
+        let told = failing(failures).await;
+
+        assert_eq!(
+            told.all().last(),
+            Some(&stopped(
+                "troubled",
+                RESTART_LIMIT + 1,
+                Stopped::Exhausted("index out of bounds".to_owned())
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_a_panic_ends_starts_the_wait_again() {
+        let told = failing(vec![
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (PROGRESS_INTERVAL, Failure::Panic),
+            (AT_ONCE, Failure::Fault),
+        ])
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_short_of_a_while_of_work_leaves_the_wait_growing() {
+        let short = PROGRESS_INTERVAL.saturating_sub(Duration::from_millis(1));
+
+        let told = failing(vec![
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+            (short, Failure::Panic),
+            (AT_ONCE, Failure::Fault),
+        ])
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE * 8
+            ]
         );
     }
 
@@ -892,16 +1032,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_long_backoff_does_not_count_as_work() {
-        // The one way a crash loop could refund its own budget for ever: fail
-        // transiently until the retry delay has grown to a minute, then panic
-        // the instant the delay is over. Waiting is not working, so the attempt
-        // is as short as it looks and the limit must still stop it.
+        // A crash loop that waits a minute before each panic: it fails
+        // transiently until the retry delay has grown to a minute, then
+        // panics the instant the delay is over. Waiting is not working, so the
+        // attempt is as short as it looks and the limit must still stop it.
         let ramp = (1..=32_u32)
             .find(|&restarts| backoff(restarts) >= PROGRESS_INTERVAL)
             .expect("the backoff ceiling reaches the progress interval");
         // Far past what a working limit needs, so a budget that does keep being
         // refunded still leaves this test finite.
-        let escape = ramp + RESTART_LIMIT * 8;
+        let escape = (ramp + 1) * RESTART_LIMIT * 8;
         let attempts = counter();
         let mut supervisor = Supervisor::new();
         supervisor.supervise("sleepy", {
@@ -914,10 +1054,11 @@ mod tests {
                         return Ok(());
                     }
 
-                    // Transient until the delay reaches its ceiling, and then
-                    // one transient between every pair of panics to hold it
-                    // there: a panic on its own is restarted with no delay.
-                    let panics_now = attempt > ramp && attempt.is_multiple_of(2);
+                    // As many transient failures as take the delay to its
+                    // ceiling, then a panic, and the same again. A delay
+                    // counted as work would start both counts again, so the
+                    // delay has to be climbed before every panic.
+                    let panics_now = attempt.is_multiple_of(ramp + 1);
                     if !panics_now {
                         return Err(TaskError::Transient(anyhow::anyhow!("the bus is away")));
                     }
