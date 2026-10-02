@@ -20,17 +20,19 @@
 //!
 //! This module reads the time from `tokio::time` rather than from an injected
 //! `benshi_core::clock::Clock`, and it is the only place in the workspace that
-//! does. It has to sleep on the same clock it measures with, and a `Clock`
-//! cannot sleep, so taking one as a parameter would hand this module two clocks
-//! free to disagree about whether a task had been running long enough. What the
-//! rule is for still holds: `tokio::time` is virtualised under a paused runtime,
-//! so `a_long_backoff_does_not_count_as_work` winds through 2223 seconds of
+//! does. It has to sleep before a retry, and a `Clock` cannot sleep. With a
+//! `Clock` taken as a parameter a test would have two clocks to move, the one
+//! a wait is slept on and the one a run is measured on, free to disagree about
+//! whether a task had been running long enough. What the rule is for still
+//! holds: `tokio::time` is virtualised under a paused runtime, so
+//! `a_long_backoff_does_not_count_as_work` winds through 2223 seconds of
 //! retries and takes no measurable time to run.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::task::{Id, JoinSet};
@@ -83,8 +85,10 @@ pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 /// equality is worth knowing about rather than ignoring, because it is the
 /// worst case for this rule. A task retried at the ceiling sleeps for exactly
 /// this long, so an attempt that woke and panicked at once would look like a
-/// full interval of work. Subtracting the delay before comparing is what stops
-/// it, and `a_long_backoff_does_not_count_as_work` is what holds that there.
+/// full interval of work if its run were counted from the instant it was
+/// spawned. It is counted from the instant its wait is over, and
+/// `a_long_backoff_does_not_count_as_work` is what holds that such a wait is
+/// left out.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Why a task failed, in the two classes a task can report about itself.
@@ -207,11 +211,10 @@ struct Supervised {
     panics: u32,
     /// Transient failures in a row, by the same rule.
     faults: u32,
-    /// When the current attempt was spawned, and how much of that it spent
-    /// asleep before starting. The difference is how long it actually ran,
-    /// which is what decides whether a failure continues the rows before it.
-    last_start: Option<Instant>,
-    last_delay: Duration,
+    /// When the current attempt set to work. The attempt notes it itself,
+    /// once the wait before it is over, so it is empty for as long as the
+    /// attempt waits. Each attempt has one of its own.
+    working_since: Arc<OnceLock<Instant>>,
     /// `None` for as long as it is still running.
     stopped_by: Option<Stopped>,
 }
@@ -220,16 +223,20 @@ impl Supervised {
     /// Whether the attempt that has just ended ran for long enough to have
     /// got work done.
     ///
-    /// The wait before it started is taken off, because waiting is not
-    /// working. Absent a start time nothing has run, which counts as no
-    /// work.
+    /// Its run is counted on the clock, from the instant its wait was over
+    /// to the instant the supervisor deals with its end. The wait is left
+    /// out however long it lasted: a process that stays stopped past the end
+    /// of a wait finds the wait over late, and the attempt that wakes has
+    /// done nothing. An attempt that never got past its wait has no run,
+    /// which counts as no work.
+    ///
+    /// The clock goes on over a process that is stopped. So a stop while the
+    /// attempt itself runs is counted as part of its run, and so is a stop
+    /// after the attempt has ended and before the supervisor deals with it.
     fn worked(&self) -> bool {
-        let ran_for = self
-            .last_start
-            .map(|start| start.elapsed().saturating_sub(self.last_delay))
-            .unwrap_or_default();
-
-        ran_for >= PROGRESS_INTERVAL
+        self.working_since
+            .get()
+            .is_some_and(|since| since.elapsed() >= PROGRESS_INTERVAL)
     }
 }
 
@@ -272,13 +279,16 @@ fn start(
     delay: Duration,
 ) {
     let body = (task.body)();
-    task.last_start = Some(Instant::now());
-    task.last_delay = delay;
+    let working_since = Arc::new(OnceLock::new());
+    task.working_since = Arc::clone(&working_since);
     let handle = set.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
 
+        // The wait can last longer than `delay`, by as long as the process
+        // stays stopped past its end. Only the attempt knows when it was over.
+        working_since.get_or_init(Instant::now);
         body.await
     });
 
@@ -326,8 +336,7 @@ impl Supervisor {
             restarts: 0,
             panics: 0,
             faults: 0,
-            last_start: None,
-            last_delay: Duration::ZERO,
+            working_since: Arc::default(),
             stopped_by: None,
         });
     }
@@ -731,6 +740,21 @@ mod tests {
         told
     }
 
+    /// What a supervisor told of the task `failing` supervises, where the
+    /// clock moves on by twice `PROGRESS_INTERVAL` at once, as it does over a
+    /// process that is stopped. It moves half a `BACKOFF_BASE` after the task
+    /// starts, which is halfway through the first wait of the task where
+    /// every attempt before that wait fails at once.
+    async fn failing_with_a_wait_that_ran_over(failures: Vec<(Duration, Failure)>) -> Told {
+        let overrun = async {
+            tokio::time::sleep(BACKOFF_BASE / 2).await;
+            tokio::time::advance(PROGRESS_INTERVAL * 2).await;
+        };
+        let (told, ()) = tokio::join!(failing(failures), overrun);
+
+        told
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_fault_after_a_while_of_work_waits_as_the_first_did() {
         // A task that ran for a month and meets a fault has not been failing
@@ -910,6 +934,52 @@ mod tests {
                 BACKOFF_BASE * 4,
                 BACKOFF_BASE * 8
             ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_ran_over_leaves_the_wait_growing() {
+        // The attempt that wakes late fails at once, as the one before it
+        // did. It has done no work, however long ago it was started.
+        let told = failing_with_a_wait_that_ran_over(vec![(AT_ONCE, Failure::Fault); 2]).await;
+
+        assert_eq!(waits_in(&told), [BACKOFF_BASE, BACKOFF_BASE * 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_ran_over_gives_no_budget_back() {
+        // Every panic the budget allows, and a fault whose wait runs over.
+        // The attempt that wakes late panics at once.
+        let mut failures = vec![(AT_ONCE, Failure::Panic); RESTART_LIMIT as usize];
+        failures.push((AT_ONCE, Failure::Fault));
+        failures.push((AT_ONCE, Failure::Panic));
+
+        let told = failing_with_a_wait_that_ran_over(failures).await;
+
+        assert_eq!(
+            told.all().last(),
+            Some(&stopped(
+                "troubled",
+                RESTART_LIMIT + 1,
+                Stopped::Exhausted("index out of bounds".to_owned())
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_after_a_wait_that_ran_over_starts_the_wait_again() {
+        // The attempt that wakes late works for a while before it fails. Its
+        // work is counted from when it woke, however late that was.
+        let told = failing_with_a_wait_that_ran_over(vec![
+            (AT_ONCE, Failure::Fault),
+            (PROGRESS_INTERVAL, Failure::Fault),
+            (AT_ONCE, Failure::Fault),
+        ])
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [BACKOFF_BASE, BACKOFF_BASE, BACKOFF_BASE * 2]
         );
     }
 
