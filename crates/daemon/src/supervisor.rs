@@ -20,11 +20,13 @@
 //!
 //! This module reads the time from `tokio::time` rather than from an injected
 //! `benshi_core::clock::Clock`, and it is the only place in the workspace that
-//! does. It has to sleep before a retry, and a `Clock` cannot sleep. With a
-//! `Clock` taken as a parameter a test would have two clocks to move, the one
-//! a wait is slept on and the one a run is measured on, free to disagree about
-//! whether a task had been running long enough. What the rule is for still
-//! holds: `tokio::time` is virtualised under a paused runtime, so
+//! does. It has to sleep before a retry, and a `Clock` cannot sleep. It wakes
+//! every second as well, to see a stop of the process and take it off the run
+//! of every attempt it fell in. With a `Clock` taken as a parameter a test
+//! would have two clocks to move, the one a wait is slept on and the one a
+//! run is measured on, free to disagree about whether a task had been running
+//! long enough. What the rule is for still holds: `tokio::time` is
+//! virtualised under a paused runtime, so
 //! `a_long_backoff_does_not_count_as_work` winds through 2223 seconds of
 //! retries and takes no measurable time to run.
 
@@ -36,7 +38,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::task::{Id, JoinSet};
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 
 /// How many times in a row a task is restarted after a panic before it is left
 /// stopped.
@@ -70,7 +72,8 @@ pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 /// doubles over transient failures in a row. In a row has to mean something
 /// in time: a failure that ends an attempt which ran this long starts both
 /// rows again, whichever kind of failure it is. Such an attempt did work, so
-/// what ended it is new trouble.
+/// what ended it is new trouble. Time in which the process did not run is no
+/// part of a run, as far as the supervisor saw it, which `WAKE` describes.
 ///
 /// A panic is restarted with no delay, so one bad millisecond can spend the
 /// whole of [`RESTART_LIMIT`]. Counted over the life of a task, the next
@@ -90,6 +93,29 @@ pub const BACKOFF_CEILING: Duration = Duration::from_secs(60);
 /// `a_long_backoff_does_not_count_as_work` is what holds that such a wait is
 /// left out.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the supervisor wakes to read the clock while no task ends.
+///
+/// The clock goes on over a process that is stopped, and so a run measured
+/// on it alone would count a stop as work. At every wake the supervisor
+/// reads how long it is since the wake before. What that is over this by,
+/// where it is over by more than [`LATE`], is counted as time the process
+/// did not run, and it is taken off the run of every attempt it fell in.
+/// The stop began some time after the wake before it, so what is taken off
+/// is short of the stop by up to this much. Where what is over is [`LATE`]
+/// or less, nothing is taken off, so a stop as long as this and [`LATE`]
+/// together can go unseen. A second, because the shortest-lived thing this
+/// supervises polls once a second, and a probe woken every second spent
+/// seven milliseconds of processor time in a minute.
+const WAKE: Duration = Duration::from_secs(1);
+
+/// How far the time between two wakes may run over [`WAKE`] before what it
+/// ran over is counted as a stop.
+///
+/// A tick that nothing holds up comes a few milliseconds late on an idle
+/// machine, 5.6 at the most in 39 seen, and a loaded machine holds a thread
+/// up for longer.
+const LATE: Duration = Duration::from_millis(100);
 
 /// Why a task failed, in the two classes a task can report about itself.
 ///
@@ -215,6 +241,9 @@ struct Supervised {
     /// once the wait before it is over, so it is empty for as long as the
     /// attempt waits. Each attempt has one of its own.
     working_since: Arc<OnceLock<Instant>>,
+    /// How long the process did not run while the current attempt ran, as
+    /// far as the supervisor saw, see [`WAKE`].
+    not_run_for: Duration,
     /// `None` for as long as it is still running.
     stopped_by: Option<Stopped>,
 }
@@ -224,19 +253,44 @@ impl Supervised {
     /// got work done.
     ///
     /// Its run is counted on the clock, from the instant its wait was over
-    /// to the instant the supervisor deals with its end. The wait is left
-    /// out however long it lasted: a process that stays stopped past the end
-    /// of a wait finds the wait over late, and the attempt that wakes has
-    /// done nothing. An attempt that never got past its wait has no run,
-    /// which counts as no work.
-    ///
-    /// The clock goes on over a process that is stopped. So a stop while the
-    /// attempt itself runs is counted as part of its run, and so is a stop
-    /// after the attempt has ended and before the supervisor deals with it.
-    fn worked(&self) -> bool {
-        self.working_since
-            .get()
-            .is_some_and(|since| since.elapsed() >= PROGRESS_INTERVAL)
+    /// to `now`, the instant the supervisor woke to deal with its end, less
+    /// what the supervisor saw of a stop of the process in between, see
+    /// [`WAKE`]. The wait is left out however long it lasted: a process that
+    /// stays stopped past the end of a wait finds the wait over late, and the
+    /// attempt that wakes has done nothing. An attempt that never got past
+    /// its wait has no run, which counts as no work.
+    fn worked(&self, now: Instant) -> bool {
+        self.working_since.get().is_some_and(|since| {
+            let ran_for = now.saturating_duration_since(*since);
+
+            ran_for.saturating_sub(self.not_run_for) >= PROGRESS_INTERVAL
+        })
+    }
+
+    /// Takes `not_run`, the time the process did not run before the wake at
+    /// `now`, off the run of the current attempt, as far as the attempt has
+    /// run by then. An attempt that set to work after that time loses what
+    /// it ran before the wake, and no more.
+    fn take_off(&mut self, not_run: Duration, now: Instant) {
+        if let Some(since) = self.working_since.get() {
+            self.not_run_for += not_run.min(now.saturating_duration_since(*since));
+        }
+    }
+}
+
+/// Takes the time the process did not run, up to the wake at `now`, off
+/// every attempt it fell in.
+///
+/// Called at every wake of the supervisor, which is every [`WAKE`] and the
+/// end of every attempt, so that a stop is taken off before an attempt's run
+/// is read, whichever of the two wakes comes first after it.
+fn account_for_a_stop(tasks: &mut [Supervised], woke: &mut Instant, now: Instant) {
+    let not_run = now.saturating_duration_since(*woke).saturating_sub(WAKE);
+    *woke = now;
+    if not_run > LATE {
+        for task in tasks {
+            task.take_off(not_run, now);
+        }
     }
 }
 
@@ -281,6 +335,7 @@ fn start(
     let body = (task.body)();
     let working_since = Arc::new(OnceLock::new());
     task.working_since = Arc::clone(&working_since);
+    task.not_run_for = Duration::ZERO;
     let handle = set.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -337,6 +392,7 @@ impl Supervisor {
             panics: 0,
             faults: 0,
             working_since: Arc::default(),
+            not_run_for: Duration::ZERO,
             stopped_by: None,
         });
     }
@@ -365,7 +421,30 @@ impl Supervisor {
             start(&mut set, &mut owners, task, index, Duration::ZERO);
         }
 
-        while let Some(joined) = set.join_next_with_id().await {
+        // A tick missed over a stop fires once, late, and the next is due a
+        // wake after it. Fired once for every tick missed instead, the loop
+        // would wake once for each second of a stop, at once, for nothing.
+        let mut ticker = tokio::time::interval(WAKE);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut woke = Instant::now();
+
+        loop {
+            let joined = tokio::select! {
+                biased;
+                joined = set.join_next_with_id() => joined,
+                _due = ticker.tick() => {
+                    account_for_a_stop(&mut tasks, &mut woke, Instant::now());
+                    continue;
+                }
+            };
+            let Some(joined) = joined else {
+                break;
+            };
+            // One reading for the stops and the run: a stop while this wake
+            // is dealt with falls after the run of the attempt that ended.
+            let now = Instant::now();
+            account_for_a_stop(&mut tasks, &mut woke, now);
+
             let (index, outcome) = match joined {
                 Ok((id, outcome)) => (owners.remove(&id), Ok(outcome)),
                 Err(failure) => (owners.remove(&failure.id()), Err(failure)),
@@ -375,7 +454,7 @@ impl Supervisor {
             let index = index.expect("a joined handle was spawned here");
             let task = &mut tasks[index];
             // Work ends both rows, whichever way the attempt then ended.
-            if task.worked() {
+            if task.worked(now) {
                 task.panics = 0;
                 task.faults = 0;
             }
@@ -445,8 +524,8 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_BASE, BACKOFF_CEILING, Notice, PROGRESS_INTERVAL, RESTART_LIMIT, Stopped,
-        Supervisor, TaskError, TaskRecord, backoff,
+        BACKOFF_BASE, BACKOFF_CEILING, LATE, Notice, PROGRESS_INTERVAL, RESTART_LIMIT, Stopped,
+        Supervisor, TaskError, TaskFuture, TaskRecord, backoff,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -709,46 +788,86 @@ mod tests {
     /// How long an attempt works for that fails as it starts.
     const AT_ONCE: Duration = Duration::ZERO;
 
-    /// What a supervisor told of one task that fails once for each of
-    /// `failures`, in their order and each after working for that long, and
-    /// returns at the attempt after the last.
-    async fn failing(failures: Vec<(Duration, Failure)>) -> Told {
+    /// How long the process is stopped for where a test stops it: twice what
+    /// counts as work. On the paused clock a stop is the clock moving on that
+    /// far at once.
+    const STOPPED_FOR: Duration = PROGRESS_INTERVAL.saturating_mul(2);
+
+    /// The body of a task that fails once for each of `failures`, in their
+    /// order and each after working for that long, and returns at the attempt
+    /// after the last. Where `stop` names an attempt, counted from one, and
+    /// how far into its work, the process is stopped for `STOPPED_FOR` there.
+    fn attempts(
+        failures: Vec<(Duration, Failure)>,
+        stop: Option<(usize, Duration)>,
+    ) -> impl FnMut() -> TaskFuture {
+        let mut failures = failures.into_iter().enumerate();
+
+        move || {
+            let failure = failures.next();
+            Box::pin(async move {
+                let Some((place, (worked, failure))) = failure else {
+                    return Ok(());
+                };
+
+                match stop {
+                    Some((attempt, after)) if attempt == place + 1 => {
+                        tokio::time::sleep(after).await;
+                        tokio::time::advance(STOPPED_FOR).await;
+                        tokio::time::sleep(worked.saturating_sub(after)).await;
+                    }
+                    _ => tokio::time::sleep(worked).await,
+                }
+                match failure {
+                    Failure::Fault => Err(TaskError::Transient(anyhow::anyhow!("the bus is away"))),
+                    Failure::Panic => panic!("index out of bounds"),
+                }
+            })
+        }
+    }
+
+    /// What a supervisor told of one task whose body `attempts` makes of
+    /// `failures` and `stop`.
+    async fn supervised(
+        failures: Vec<(Duration, Failure)>,
+        stop: Option<(usize, Duration)>,
+    ) -> Told {
         let told = Told::default();
         let mut supervisor = Supervisor::telling(told.listener());
-        supervisor.supervise("troubled", {
-            let mut failures = failures.into_iter();
-            move || {
-                let failure = failures.next();
-                async move {
-                    let Some((worked, failure)) = failure else {
-                        return Ok(());
-                    };
-
-                    tokio::time::sleep(worked).await;
-                    match failure {
-                        Failure::Fault => {
-                            Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
-                        }
-                        Failure::Panic => panic!("index out of bounds"),
-                    }
-                }
-            }
-        });
+        supervisor.supervise("troubled", attempts(failures, stop));
 
         supervisor.run().await;
 
         told
     }
 
+    /// What a supervisor told of one task that fails once for each of
+    /// `failures`, in their order and each after working for that long, and
+    /// returns at the attempt after the last.
+    async fn failing(failures: Vec<(Duration, Failure)>) -> Told {
+        supervised(failures, None).await
+    }
+
     /// What a supervisor told of the task `failing` supervises, where the
-    /// clock moves on by twice `PROGRESS_INTERVAL` at once, as it does over a
-    /// process that is stopped. It moves half a `BACKOFF_BASE` after the task
-    /// starts, which is halfway through the first wait of the task where
-    /// every attempt before that wait fails at once.
+    /// process is stopped while attempt `attempt` of it runs, counted from
+    /// one, `after` into its work.
+    async fn failing_with_a_stop_in(
+        attempt: usize,
+        after: Duration,
+        failures: Vec<(Duration, Failure)>,
+    ) -> Told {
+        supervised(failures, Some((attempt, after))).await
+    }
+
+    /// What a supervisor told of the task `failing` supervises, where the
+    /// clock moves on by `STOPPED_FOR` at once, as it does over a process
+    /// that is stopped. It moves half a `BACKOFF_BASE` after the task starts,
+    /// which is halfway through the first wait of the task where every
+    /// attempt before that wait fails at once.
     async fn failing_with_a_wait_that_ran_over(failures: Vec<(Duration, Failure)>) -> Told {
         let overrun = async {
             tokio::time::sleep(BACKOFF_BASE / 2).await;
-            tokio::time::advance(PROGRESS_INTERVAL * 2).await;
+            tokio::time::advance(STOPPED_FOR).await;
         };
         let (told, ()) = tokio::join!(failing(failures), overrun);
 
@@ -981,6 +1100,291 @@ mod tests {
             waits_in(&told),
             [BACKOFF_BASE, BACKOFF_BASE, BACKOFF_BASE * 2]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_ran_over_by_a_hair_is_not_work_either() {
+        // The first wait runs over by half of what a wake can be late by
+        // before the supervisor takes it for a stop, and the attempt that
+        // wakes works for a millisecond more than the interval less that.
+        // Counted from when the wait was due, the hair makes up the
+        // interval.
+        let hair = LATE / 2;
+        let overrun = async {
+            tokio::time::sleep(BACKOFF_BASE.saturating_sub(hair)).await;
+            tokio::time::advance(hair * 2).await;
+        };
+        let failures = vec![
+            (AT_ONCE, Failure::Fault),
+            (
+                PROGRESS_INTERVAL.saturating_sub(hair) + Duration::from_millis(1),
+                Failure::Fault,
+            ),
+            (AT_ONCE, Failure::Fault),
+        ];
+
+        let (told, ()) = tokio::join!(failing(failures), overrun);
+
+        assert_eq!(
+            waits_in(&told),
+            [BACKOFF_BASE, BACKOFF_BASE * 2, BACKOFF_BASE * 4]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_while_an_attempt_runs_leaves_the_wait_growing() {
+        // Three faults at once, then an attempt that runs for a second with
+        // the process stopped halfway through, fails, and is followed by a
+        // fault at once. The attempt ran for a second, however long the
+        // clock says.
+        let told = failing_with_a_stop_in(
+            4,
+            Duration::from_millis(500),
+            vec![
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (Duration::from_secs(1), Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE * 8,
+                BACKOFF_BASE * 16,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_after_an_attempt_ended_leaves_the_wait_growing() {
+        // Two faults at once, and a third attempt that spawns a task to stop
+        // the process and then fails at once. On a runtime of one thread the
+        // task it spawned runs once the attempt has returned and before the
+        // supervisor is polled, which `told_by_then` shows: two notices told,
+        // and the third not yet.
+        let told = Told::default();
+        let told_by_then: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise("troubled", {
+            let told = told.clone();
+            let told_by_then = Arc::clone(&told_by_then);
+            let mut attempt = 0_u32;
+            move || {
+                attempt += 1;
+                let attempt = attempt;
+                let told = told.clone();
+                let told_by_then = Arc::clone(&told_by_then);
+                async move {
+                    if attempt > 3 {
+                        return Ok(());
+                    }
+                    if attempt == 3 {
+                        drop(tokio::spawn(async move {
+                            told_by_then
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(told.all().len());
+                            tokio::time::advance(STOPPED_FOR).await;
+                        }));
+                    }
+
+                    Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                }
+            }
+        });
+
+        supervisor.run().await;
+
+        assert_eq!(
+            *told_by_then.lock().unwrap_or_else(PoisonError::into_inner),
+            [2],
+            "the end of the attempt was dealt with before the clock moved on"
+        );
+        assert_eq!(
+            waits_in(&told),
+            [BACKOFF_BASE, BACKOFF_BASE * 2, BACKOFF_BASE * 4]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_around_a_stop_is_still_work() {
+        // Three faults at once, then an attempt that works for a minute and
+        // a second with the process stopped halfway through. The fault that
+        // ends it starts the wait again.
+        let told = failing_with_a_stop_in(
+            4,
+            Duration::from_secs(30),
+            vec![
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (Duration::from_secs(61), Failure::Fault),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_in_one_attempt_is_not_taken_off_the_next() {
+        // The attempt after the one the process was stopped in works for a
+        // while and has that counted whole.
+        let told = failing_with_a_stop_in(
+            4,
+            Duration::from_millis(500),
+            vec![
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (Duration::from_secs(1), Failure::Fault),
+                (PROGRESS_INTERVAL, Failure::Fault),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE * 8,
+                BACKOFF_BASE
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_is_taken_off_every_attempt_it_fell_in() {
+        // Two tasks with a fault behind each, both at work when the process
+        // is stopped: the first for a second with the stop halfway through,
+        // the second for two seconds. Neither has worked when it fails.
+        let told = Told::default();
+        let mut supervisor = Supervisor::telling(told.listener());
+        supervisor.supervise(
+            "first",
+            attempts(
+                vec![
+                    (AT_ONCE, Failure::Fault),
+                    (Duration::from_secs(1), Failure::Fault),
+                ],
+                Some((2, Duration::from_millis(500))),
+            ),
+        );
+        supervisor.supervise(
+            "second",
+            attempts(
+                vec![
+                    (AT_ONCE, Failure::Fault),
+                    (Duration::from_secs(2), Failure::Fault),
+                ],
+                None,
+            ),
+        );
+
+        supervisor.run().await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 2
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_more_is_taken_off_than_the_stop() {
+        // Three faults at once, then an attempt that works for two
+        // milliseconds more than the interval with the process stopped a
+        // millisecond short of a wake into it. The wake before the stop is
+        // the one the stop is counted from, so three milliseconds of work
+        // are left over, and the fault that ends it starts the wait again.
+        let told = failing_with_a_stop_in(
+            4,
+            Duration::from_millis(999),
+            vec![
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (AT_ONCE, Failure::Fault),
+                (PROGRESS_INTERVAL + Duration::from_millis(2), Failure::Fault),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            waits_in(&told),
+            [
+                BACKOFF_BASE,
+                BACKOFF_BASE * 2,
+                BACKOFF_BASE * 4,
+                BACKOFF_BASE
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_before_an_attempt_set_to_work_is_not_taken_off_it() {
+        // One task stops the process once it has yielded, so that the
+        // other's second attempt is first polled after the stop and before
+        // the supervisor wakes to it. That attempt works for the interval,
+        // which is counted whole: the budget of panics comes back once, and
+        // the task is given up on one restart later than the limit.
+        let mut supervisor = Supervisor::new();
+        supervisor.supervise("stopper", {
+            let mut attempt = 0_u32;
+            move || {
+                attempt += 1;
+                let attempt = attempt;
+                async move {
+                    if attempt > 1 {
+                        return Ok(());
+                    }
+                    tokio::task::yield_now().await;
+                    tokio::time::advance(STOPPED_FOR).await;
+
+                    Err(TaskError::Transient(anyhow::anyhow!("the bus is away")))
+                }
+            }
+        });
+        supervisor.supervise("worker", {
+            let attempts = counter();
+            move || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    let attempt = attempt(&attempts);
+                    if attempt == 2 {
+                        tokio::time::sleep(PROGRESS_INTERVAL).await;
+                    }
+                    // The same escape the test of the limit has.
+                    assert!(attempt > RESTART_LIMIT + 10, "index out of bounds");
+                    Ok(())
+                }
+            }
+        });
+
+        let records = supervisor.run().await;
+
+        assert_eq!(records[1].name, "worker");
+        assert_eq!(records[1].restarts, RESTART_LIMIT + 1);
     }
 
     #[test]
