@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use benshi_core::policy::PolicyTable;
+use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast::error::RecvError;
@@ -175,11 +176,23 @@ fn in_the_fallback(temporary_dir: &Path) -> PathBuf {
 /// connection is the one answer that proves nobody is there; every other answer
 /// is read as a daemon that is running, because that is the side to be wrong
 /// on.
-fn still_listening(path: &Path) -> bool {
-    !matches!(
-        std::os::unix::net::UnixStream::connect(path),
+///
+/// The try does not block. The connections made to a socket nobody accepts on
+/// fill its backlog, and a connect that blocks waits for room in it for as
+/// long as nobody accepts. One that does not block is answered at once, and
+/// where the backlog has no room the answer is `EAGAIN`, which is a daemon.
+///
+/// # Errors
+///
+/// Whatever making the socket of the try, or its address, said.
+fn still_listening(path: &Path) -> Result<bool> {
+    let probe = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    probe.set_nonblocking(true)?;
+
+    Ok(!matches!(
+        probe.connect(&SockAddr::unix(path)?),
         Err(error) if error.kind() == ErrorKind::ConnectionRefused
-    )
+    ))
 }
 
 /// Make sure the socket's directory exists and no one else can reach it.
@@ -218,7 +231,7 @@ fn private_directory(directory: &Path) -> Result<()> {
 /// [`ErrorKind::AddrInUse`] when a daemon is already listening there,
 /// [`ErrorKind::PermissionDenied`] when the directory is open to other users,
 /// [`ErrorKind::InvalidInput`] for a path with no directory to put a socket in,
-/// and whatever the filesystem says otherwise.
+/// and whatever the filesystem or the socket of the try says otherwise.
 ///
 /// # Panics
 ///
@@ -232,7 +245,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     private_directory(directory)?;
 
     if path.exists() {
-        if still_listening(path) {
+        if still_listening(path)? {
             return Err(Error::new(
                 ErrorKind::AddrInUse,
                 format!("a daemon is already listening on {}", path.display()),
@@ -334,8 +347,9 @@ impl Server {
 
     /// Answer one connection until the client goes away.
     ///
-    /// A [`Request::Watch`] is the last request on its connection: what follows
-    /// it is a stream rather than an answer, and nothing more is read.
+    /// A [`Request::Watch`] is the last request on its connection: it is
+    /// answered with [`Response::Ok`] once the stream is on, what follows is
+    /// the stream, and nothing more is read.
     ///
     /// # Errors
     ///
@@ -405,12 +419,18 @@ impl Server {
             .collect()
     }
 
-    /// Write every event to the client until it goes away.
+    /// Say that the stream is on, then write every event to the client until
+    /// it goes away.
+    ///
+    /// The subscription is taken before the answer is written, so a client
+    /// that has read the answer is subscribed, and every event published after
+    /// that is in its stream or counted in it as missed.
     async fn stream_events<W>(&self, writer: &mut W) -> Result<()>
     where
         W: AsyncWrite + Unpin,
     {
         let mut events = self.bus.subscribe();
+        reply(writer, &Response::Ok).await?;
 
         loop {
             let response = match events.recv().await {
@@ -464,13 +484,16 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
     use benshi_detect::SourceInfo;
+    use socket2::{Domain, SockAddr, Socket, Type};
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, RwLock, mpsc};
+    use std::thread;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
     use tokio::net::UnixStream;
+    use tokio::runtime::Handle;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -556,17 +579,6 @@ mod tests {
                 parsed,
                 answer,
             });
-        }
-
-        /// Wait until a connection has subscribed, so what follows is not a race.
-        async fn watched(&self) {
-            timeout(PATIENCE, async {
-                while self.bus.subscribers() == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("a connection subscribed to the bus");
         }
     }
 
@@ -715,7 +727,7 @@ mod tests {
         let mut client = Client::to(&daemon, 4096);
 
         client.ask(&Request::Watch).await;
-        daemon.watched().await;
+        assert_eq!(client.answer().await, Response::Ok, "the stream is on");
         daemon.bus.publish(BusEvent::SourcesChanged {
             sources: vec![PlayerId("mpv".to_owned())],
         });
@@ -731,6 +743,20 @@ mod tests {
             client.answer().await,
             Response::Event(BusEvent::Snapshot(a_snapshot()))
         );
+    }
+
+    #[tokio::test]
+    async fn a_watch_is_answered_before_any_event() {
+        // Nothing is published, and the stream is on. The answer is what a
+        // client waits for under its deadline: a quiet daemon sends no event
+        // for minutes, and without the answer a quiet daemon and one that will
+        // never answer look the same.
+        let daemon = Daemon::with(Vec::new());
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::Watch).await;
+
+        assert_eq!(client.answer().await, Response::Ok);
     }
 
     #[tokio::test]
@@ -821,7 +847,7 @@ mod tests {
         let mut client = Client::to(&daemon, 64);
 
         client.ask(&Request::Watch).await;
-        daemon.watched().await;
+        assert_eq!(client.answer().await, Response::Ok, "the stream is on");
 
         let serving = client.hang_up();
         for _ in 0..8 {
@@ -850,7 +876,7 @@ mod tests {
         let mut client = Client::to(&daemon, 4096);
 
         client.ask(&Request::Watch).await;
-        daemon.watched().await;
+        assert_eq!(client.answer().await, Response::Ok, "the stream is on");
         for _ in 0..8 {
             daemon.bus.publish(BusEvent::Snapshot(a_snapshot()));
         }
@@ -948,6 +974,49 @@ mod tests {
 
         assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
         drop(running);
+    }
+
+    #[tokio::test]
+    async fn a_socket_whose_backlog_is_full_is_left_alone_at_once() {
+        // The connections made to a socket nobody accepts on fill its
+        // backlog, as they do where a daemon's socket task has stopped while
+        // the process goes on. A connection to it then waits for room for as
+        // long as nobody accepts, and a second daemon has to find out that the
+        // first is there without waiting with it. A backlog of 0 takes one
+        // connection on Linux, and the one made here fills it.
+        let home = tempfile::tempdir().expect("a directory of our own");
+        let run = home.path().join("run");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&run)
+            .expect("a private directory");
+        let path = run.join("benshi.sock");
+        let full = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a socket");
+        full.bind(&SockAddr::unix(&path).expect("an address"))
+            .expect("the socket binds");
+        full.listen(0).expect("the socket listens");
+        let queued =
+            std::os::unix::net::UnixStream::connect(&path).expect("one connection is queued");
+        let (told, hear) = mpsc::channel();
+        let found = path.clone();
+        let runtime = Handle::current();
+        // On a thread of its own, so that a bind which waits fails this test
+        // rather than holding it. The thread is in the test's runtime: a bind
+        // that takes the socket registers its listener there and returns, and
+        // the failure names what it did.
+        thread::spawn(move || {
+            let _inside = runtime.enter();
+            drop(told.send(bind(&found).map(drop)));
+        });
+
+        let refused = hear
+            .recv_timeout(PATIENCE)
+            .expect("binding waited for room in the backlog")
+            .expect_err("a second daemon must not take the socket");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+        drop(queued);
+        drop(full);
     }
 
     #[tokio::test]

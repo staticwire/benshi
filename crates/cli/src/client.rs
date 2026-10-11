@@ -3,17 +3,39 @@
 //! One request per line, one answer per line, exactly as the daemon writes
 //! them. Nothing here decides anything or renders anything: it carries
 //! messages, and `commands` does the rest.
+//!
+//! A connection waits for its first answer until [`DEADLINE`] from the moment
+//! it began to connect, and no longer. What follows the first answer of a
+//! `watch` is a stream, which waits for as long as the user does.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use benshi_daemon::protocol::{Request, Response};
+use humantime::format_duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
+use tokio::time::{Instant, timeout_at};
+
+/// How long a connection waits for its first answer, counted from the moment
+/// it began to connect.
+///
+/// A daemon that listens answers in a few milliseconds. One that has bound its
+/// socket and is still opening its database answers once it listens, and that
+/// is within a second and some: the wait inside SQLite is a second, and a
+/// connection made before the daemon listens waits in the socket's backlog
+/// until it does. Five seconds is several times that, and is what a person at
+/// a terminal is kept waiting before being told that the daemon does not
+/// answer.
+pub const DEADLINE: Duration = Duration::from_secs(5);
 
 /// A connection to a running daemon.
 #[derive(Debug)]
 pub struct Daemon {
+    socket: PathBuf,
+    /// When the first answer is due.
+    answer_by: Instant,
     writer: WriteHalf<UnixStream>,
     lines: Lines<BufReader<ReadHalf<UnixStream>>>,
 }
@@ -26,14 +48,19 @@ impl Daemon {
     /// Says where it looked when nothing is listening there. A client that
     /// reported only that it had failed would leave the user guessing between
     /// a daemon that is not running and one listening somewhere else, which
-    /// are fixed differently.
+    /// are fixed differently. Says that the daemon did not answer where the
+    /// connection is not made within [`DEADLINE`] of its start.
     pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
+        let answer_by = Instant::now() + DEADLINE;
+        let stream = timeout_at(answer_by, UnixStream::connect(socket))
             .await
+            .map_err(|_elapsed| did_not_answer(socket))?
             .with_context(|| format!("no daemon at {}", socket.display()))?;
         let (reader, writer) = tokio::io::split(stream);
 
         Ok(Self {
+            socket: socket.to_path_buf(),
+            answer_by,
             writer,
             lines: BufReader::new(reader).lines(),
         })
@@ -41,24 +68,32 @@ impl Daemon {
 
     /// Send one request.
     ///
+    /// A request longer than the socket's send buffer is sent only as the
+    /// daemon reads it, so the send waits under the deadline as well.
+    ///
     /// # Errors
     ///
-    /// Returns whatever the socket did.
+    /// Returns whatever the socket did, and that the daemon did not answer
+    /// where the request is not sent within [`DEADLINE`] of the start of the
+    /// connection.
     pub async fn ask(&mut self, request: &Request) -> Result<()> {
         let mut line = serde_json::to_vec(request).context("the request could not be written")?;
         line.push(b'\n');
 
-        self.writer
-            .write_all(&line)
-            .await
-            .context("the request could not be sent")?;
-        self.writer
-            .flush()
-            .await
-            .context("the request could not be sent")
+        let sent = timeout_at(self.answer_by, async {
+            self.writer.write_all(&line).await?;
+            self.writer.flush().await
+        })
+        .await
+        .map_err(|_elapsed| did_not_answer(&self.socket))?;
+
+        sent.context("the request could not be sent")
     }
 
     /// The next answer, or nothing once the daemon has closed the connection.
+    ///
+    /// Waits for as long as it takes: this is how a stream is read, and a
+    /// stream is quiet for as long as the desktop is.
     ///
     /// # Errors
     ///
@@ -81,15 +116,28 @@ impl Daemon {
             .with_context(|| format!("the daemon sent a line this client cannot read: {line}"))
     }
 
-    /// The next answer, failing when the daemon closed instead of answering.
+    /// The first answer, failing when the daemon closed instead of answering
+    /// and when it gave none by the deadline.
     ///
     /// # Errors
     ///
-    /// As [`Daemon::answer`], and when the connection ended with the request
-    /// unanswered.
+    /// As [`Daemon::answer`], when the connection ended with the request
+    /// unanswered, and that the daemon did not answer where no answer came
+    /// within [`DEADLINE`] of the start of the connection.
     pub async fn expect_answer(&mut self) -> Result<Response> {
-        self.answer()
-            .await?
-            .context("the daemon closed the connection without answering")
+        let answered = timeout_at(self.answer_by, self.answer())
+            .await
+            .map_err(|_elapsed| did_not_answer(&self.socket))??;
+
+        answered.context("the daemon closed the connection without answering")
     }
+}
+
+/// What is said of a daemon that gave no answer by the deadline.
+fn did_not_answer(socket: &Path) -> anyhow::Error {
+    anyhow!(
+        "the daemon at {} did not answer within {}",
+        socket.display(),
+        format_duration(DEADLINE)
+    )
 }

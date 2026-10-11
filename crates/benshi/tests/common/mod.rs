@@ -312,9 +312,11 @@ impl Drop for Daemon {
 
 /// What a client is answered that asks the daemon for its sources.
 ///
-/// A client that is refused asks again for as long as the daemon runs, up to
-/// `PATIENCE`. It is refused until the socket listens, and the file of the
-/// socket is there before that.
+/// A client that is refused, or that gave up waiting, asks again for as long
+/// as the daemon runs, up to `PATIENCE`. It is refused until the socket is
+/// bound, and the file of the socket is there before that; once the socket is
+/// bound its connection waits in the backlog until the daemon serves it, and
+/// it gives up on that wait at the client's own deadline.
 // Dead in a test binary that asks no daemon for its sources.
 #[allow(dead_code)]
 pub fn sources_of(daemon: &mut Daemon, socket: &Path) -> Run {
