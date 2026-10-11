@@ -187,13 +187,28 @@ async fn sources(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
     write!(out, "{}", render::listing(&listed)).context("the listing could not be printed")
 }
 
+/// Ask for the stream and read the answer that says it is on.
+///
+/// The one place a stream is asked for, as [`ask_for_sources`] is the one
+/// place a listing is. The answer is what a daemon that does not answer fails
+/// to give in time; the events after it come whenever they come.
+async fn subscribe(daemon: &mut Daemon) -> Result<()> {
+    daemon.ask(&Request::Watch).await?;
+
+    match daemon.expect_answer().await? {
+        Response::Ok => Ok(()),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("the daemon answered a watch with {unexpected:?}"),
+    }
+}
+
 /// Print the daemon's events until it stops sending them.
 ///
 /// Ends when the daemon closes the connection. A client run from a terminal is
 /// ended by the user instead, which the daemon sees as the connection going
 /// away and treats as the ordinary end of a stream.
 async fn watch(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
-    daemon.ask(&Request::Watch).await?;
+    subscribe(daemon).await?;
 
     while let Some(response) = daemon.answer().await? {
         let line = match response {
@@ -256,15 +271,15 @@ async fn record(
     output: &Path,
     out: &mut impl Write,
 ) -> Result<()> {
-    daemon.ask(&Request::Watch).await?;
+    subscribe(daemon).await?;
 
-    // The subscription goes out first, and the listing is asked for afterwards
-    // on a connection of its own. A reading published between the two ends up
-    // in the trace this way round; the other way round it would be published
-    // into the gap between the answer and the subscription, and be lost. A
-    // recording with a hole in it replays a timeline that never happened, which
-    // is the one failure nothing downstream of the file could notice - the same
-    // reason a lagged stream ends the recording below.
+    // The subscription is answered first, and the listing is asked for
+    // afterwards on a connection of its own. A reading published between the
+    // two ends up in the trace this way round; the other way round it would
+    // be published into the gap between the answer and the subscription, and
+    // be lost. A recording with a hole in it replays a timeline that never
+    // happened, which is the one failure nothing downstream of the file could
+    // notice - the same reason a lagged stream ends the recording below.
     //
     // Not covered by a test. Making the order observable needs a daemon that
     // stalls a listing while readings are published, and a test that cannot
@@ -399,6 +414,7 @@ fn append(file: &mut File, line: &str, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Command, run};
+    use crate::client::DEADLINE;
     use benshi_core::clock::{Clock, TestClock};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
@@ -410,6 +426,7 @@ mod tests {
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
+    use benshi_daemon::protocol::Response;
     use benshi_daemon::recognition::{Decided, Decision, Recogniser};
     use benshi_daemon::supervisor::TaskError;
     use std::io::Write;
@@ -418,14 +435,24 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
     use tokio::task::JoinHandle;
-    use tokio::time::timeout;
+    use tokio::time::{Instant, timeout};
 
     /// How long a test waits before calling an answer lost.
     ///
     /// Only ever spent on a failure. What matters is that it exists: a command
     /// that never answers has to fail the run rather than hang it.
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// How often a test looks again for something that arrives on its own.
+    ///
+    /// A sleep rather than a yield. On the paused clock a look that sleeps
+    /// parks the runtime, and the clock moves on to [`PATIENCE`] where what
+    /// is looked for never comes; a look that yields keeps the runtime busy,
+    /// the clock stands still, and the test holds the run instead of failing.
+    const POLL: Duration = Duration::from_millis(1);
 
     fn a_source(identity: &str, app: &str) -> SourceInfo {
         SourceInfo {
@@ -478,7 +505,7 @@ mod tests {
                     if enough(&text) {
                         return text;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await
@@ -570,10 +597,20 @@ mod tests {
         }
 
         fn listening_with(sources: Vec<SourceInfo>, bus: EventBus) -> Self {
-            let home = tempfile::tempdir().expect("a directory of our own");
-            let socket = home.path().join("run").join("benshi.sock");
-            let listener = bind(&socket).expect("the socket binds");
+            let (home, socket, listener) = a_socket_bound_and_not_served();
 
+            Self::serving(home, socket, listener, sources, bus)
+        }
+
+        /// A daemon serving a socket that was bound before, as the daemon's
+        /// is once its database is open.
+        fn serving(
+            home: TempDir,
+            socket: PathBuf,
+            listener: UnixListener,
+            sources: Vec<SourceInfo>,
+            bus: EventBus,
+        ) -> Self {
             let bus = Arc::new(bus);
             let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
@@ -627,7 +664,7 @@ mod tests {
         async fn subscribed(&self) {
             timeout(PATIENCE, async {
                 while self.bus.subscribers() == 0 {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await
@@ -725,7 +762,7 @@ mod tests {
                     {
                         return trace;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await
@@ -774,6 +811,44 @@ mod tests {
         let socket = home.path().join("run").join("benshi.sock");
 
         (home, socket)
+    }
+
+    /// A socket bound and not served, as a daemon's is while it opens its
+    /// database: a connection to it waits in the backlog.
+    fn a_socket_bound_and_not_served() -> (TempDir, PathBuf, UnixListener) {
+        let (home, socket) = nowhere();
+        let listener = bind(&socket).expect("the socket binds");
+
+        (home, socket, listener)
+    }
+
+    /// A socket served by something that answers every request with `answer`
+    /// and nothing more. The daemon never answers so; the client is written
+    /// for the protocol, and this is what holds it to that.
+    fn a_daemon_that_answers_with(answer: &Response) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let line = serde_json::to_string(answer).expect("serialise");
+        let answering = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("a client arrived");
+                let line = line.clone();
+                drop(tokio::spawn(async move {
+                    let (reader, mut writer) = tokio::io::split(stream);
+                    let mut requests = BufReader::new(reader).lines();
+                    while let Ok(Some(_request)) = requests.next_line().await {
+                        if writer
+                            .write_all(format!("{line}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+        });
+
+        (home, socket, answering)
     }
 
     async fn go(command: Command, socket: &Path) -> (ExitCode, String, String) {
@@ -936,19 +1011,7 @@ mod tests {
     async fn every_command_fails_when_no_daemon_is_listening() {
         let (_home, socket) = nowhere();
 
-        for command in [
-            Command::Sources,
-            Command::Watch,
-            Command::Why,
-            Command::Policy {
-                app: "mpv".to_owned(),
-                policy: super::PolicyArgument::Deny,
-            },
-            Command::Record {
-                duration: Duration::from_secs(60),
-                output: socket.with_file_name("trace.jsonl"),
-            },
-        ] {
+        for command in every_command(&socket) {
             let (outcome, shown, complained) = go(command, &socket).await;
 
             assert_eq!(outcome, ExitCode::FAILURE, "succeeded without a daemon");
@@ -962,6 +1025,241 @@ mod tests {
                 "the message does not say where it looked: {complained:?}"
             );
         }
+    }
+
+    /// Every command, with the trace of a recording beside `socket`.
+    fn every_command(socket: &Path) -> [Command; 5] {
+        [
+            Command::Sources,
+            Command::Watch,
+            Command::Why,
+            Command::Policy {
+                app: "mpv".to_owned(),
+                policy: super::PolicyArgument::Deny,
+            },
+            Command::Record {
+                duration: Duration::from_secs(60),
+                output: socket.with_file_name("trace.jsonl"),
+            },
+        ]
+    }
+
+    /// How long a test on the paused clock gives a command to end, which is
+    /// longer than the client waits for an answer by far. On the paused clock
+    /// it costs nothing: time moves to the next timer whenever nothing can
+    /// run.
+    const ENDED_BY: Duration = Duration::from_secs(60);
+
+    /// A command running as a task of its own, for [`settled`] to wait for.
+    fn started(command: Command, socket: &Path) -> JoinHandle<(ExitCode, String, String)> {
+        let socket = socket.to_path_buf();
+
+        tokio::spawn(async move { go(command, &socket).await })
+    }
+
+    /// What a command running on the paused clock ended with, waited for in
+    /// steps of [`POLL`].
+    ///
+    /// Every time the runtime parks, it polls the sockets and then moves the
+    /// paused clock to the next timer, even where that poll woke a task. An
+    /// answer over a socket takes up to three parks: one for the server to
+    /// accept, one for it to read the request, and one for the client to
+    /// read the answer. Where the client's deadline is the next timer, those
+    /// parks move the clock toward it in the steps of tokio's timer wheel,
+    /// and for some deadlines the clock reaches it first and the client gives
+    /// up on an answer that was on its way. A sleep of [`POLL`] is always the
+    /// next timer, so each park moves the clock by one step.
+    async fn settled(
+        running: JoinHandle<(ExitCode, String, String)>,
+    ) -> (ExitCode, String, String) {
+        timeout(ENDED_BY, async {
+            while !running.is_finished() {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("the client ended");
+
+        running.await.expect("the client did not panic")
+    }
+
+    /// What a client says of a daemon that did not answer in time.
+    fn did_not_answer(socket: &Path) -> String {
+        format!(
+            "benshi: the daemon at {} did not answer within 5s\n",
+            socket.display()
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_command_gives_up_on_a_daemon_that_accepts_nothing() {
+        // A daemon whose socket task has stopped while the process goes on:
+        // the connection waits in the backlog and no answer comes.
+        let (_home, socket, listener) = a_socket_bound_and_not_served();
+
+        for command in every_command(&socket) {
+            let began = Instant::now();
+            let (outcome, shown, complained) = timeout(ENDED_BY, go(command, &socket))
+                .await
+                .expect("the client gave up");
+
+            assert_eq!(began.elapsed(), DEADLINE, "gave up at another time");
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert_eq!(complained, did_not_answer(&socket));
+        }
+
+        assert!(
+            !socket.with_file_name("trace.jsonl").exists(),
+            "left a trace of a recording never taken"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_the_daemon_does_not_read_is_given_up_on() {
+        // A request longer than the socket's send buffer is sent only as the
+        // daemon reads it. A daemon that accepts nothing reads nothing, and
+        // the send waits under the deadline as an answer does.
+        let (_home, socket, listener) = a_socket_bound_and_not_served();
+        let long = Command::Policy {
+            app: "\"".repeat(200_000),
+            policy: super::PolicyArgument::Deny,
+        };
+
+        let (outcome, shown, complained) = timeout(ENDED_BY, go(long, &socket))
+            .await
+            .expect("the client gave up");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert_eq!(complained, did_not_answer(&socket));
+        drop(listener);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_waits_for_a_daemon_that_listens_late() {
+        // A daemon between binding its socket and serving it, which is where
+        // it opens its database: the connection waits in the backlog, and the
+        // answer comes once the daemon listens, which is within the deadline.
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let asking = started(Command::Sources, &socket);
+
+        tokio::time::sleep(DEADLINE / 2).await;
+        let daemon = Daemon::serving(
+            home,
+            socket,
+            listener,
+            vec![a_source(PLAYER, "mpv")],
+            EventBus::new(),
+        );
+
+        let (outcome, shown, complained) = settled(asking).await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(shown.contains(PLAYER), "{shown}");
+        drop(daemon);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_outlasts_the_deadline_once_it_is_on() {
+        // The deadline is for the first answer alone. A desktop with nothing
+        // playing sends no event for as long as that lasts, and `watch` stays.
+        let daemon = Daemon::listening(Vec::new());
+        let (watching, out, err) = daemon.watching().await;
+
+        tokio::time::sleep(DEADLINE * 3).await;
+
+        assert!(
+            !watching.is_finished(),
+            "the stream gave up: {}",
+            err.text()
+        );
+        daemon.bus.publish(BusEvent::SourcesChanged {
+            sources: vec![PlayerId(PLAYER.to_owned())],
+        });
+        let shown = out
+            .until("the event reached the terminal", |text| {
+                text.contains(PLAYER)
+            })
+            .await;
+        watching.abort();
+        assert!(err.text().is_empty(), "{}", err.text());
+        assert!(shown.contains(PLAYER), "{shown}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_the_daemon_refuses_is_a_failure_that_says_why() {
+        // A daemon that cannot stream answers the watch with an error, and
+        // what it said is what the user reads. A client that took the error
+        // for the stream being on would wait for events for ever, so the
+        // test gives it a deadline of its own.
+        let (_home, socket, answering) = a_daemon_that_answers_with(&Response::Error {
+            message: "no stream today".to_owned(),
+        });
+
+        let (outcome, shown, complained) = settled(started(Command::Watch, &socket)).await;
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert_eq!(complained, "benshi: no stream today\n");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_answered_with_an_event_is_a_failure_that_says_so() {
+        // The answer that the stream is on comes before the first event. A
+        // daemon that sends an event in its place speaks another protocol,
+        // and the event is reported rather than printed as the stream's.
+        let (_home, socket, answering) =
+            a_daemon_that_answers_with(&Response::Event(BusEvent::SourcesChanged {
+                sources: vec![PlayerId(PLAYER.to_owned())],
+            }));
+
+        let (outcome, shown, complained) = settled(started(Command::Watch, &socket)).await;
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(
+            shown.is_empty(),
+            "printed an event it was not streaming: {shown}"
+        );
+        assert!(
+            complained.starts_with("benshi: the daemon answered a watch with Event"),
+            "got {complained:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_command_gives_up_on_a_daemon_that_never_answers() {
+        // The connection is accepted and read, and nothing is ever written
+        // back.
+        let (_home, socket, listener) = a_socket_bound_and_not_served();
+        let silent = tokio::spawn(async move {
+            loop {
+                let (mut stream, _peer) = listener.accept().await.expect("a client arrived");
+                drop(tokio::spawn(async move {
+                    tokio::io::copy(&mut stream, &mut tokio::io::sink()).await
+                }));
+            }
+        });
+
+        for command in every_command(&socket) {
+            let began = Instant::now();
+            let (outcome, shown, complained) = timeout(ENDED_BY, go(command, &socket))
+                .await
+                .expect("the client gave up");
+
+            assert_eq!(began.elapsed(), DEADLINE, "gave up at another time");
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert_eq!(complained, did_not_answer(&socket));
+        }
+
+        assert!(
+            !socket.with_file_name("trace.jsonl").exists(),
+            "left a trace of a recording never taken"
+        );
+        silent.abort();
     }
 
     #[tokio::test]

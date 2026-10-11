@@ -24,3 +24,4 @@ workspace = true
 benshi-detect = { path = "../detect" }
 benshi-store = { path = "../store" }
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }

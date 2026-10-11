@@ -32,7 +32,9 @@ pub enum Request {
     ///
     /// The last request on a connection: what follows is a stream rather than
     /// an answer, and a client that wants to ask something else opens another
-    /// connection.
+    /// connection. It is answered with [`Response::Ok`] once the stream is on,
+    /// and the events follow: a quiet daemon sends none for minutes, and the
+    /// answer is what tells it from one that will never answer.
     Watch,
 
     /// Set the policy for an application.
@@ -108,7 +110,8 @@ pub enum Response {
         missed: u64,
     },
 
-    /// The request was carried out and has nothing to return.
+    /// The request was carried out and has nothing to return. In answer to
+    /// [`Request::Watch`], that the stream is on and what follows is it.
     Ok,
 
     /// The request could not be carried out.
