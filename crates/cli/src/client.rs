@@ -8,10 +8,11 @@
 //! it began to connect, and no longer. What follows the first answer of a
 //! `watch` is a stream, which waits for as long as the user does.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use benshi_daemon::protocol::{Request, Response};
 use humantime::format_duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
@@ -48,14 +49,25 @@ impl Daemon {
     /// Says where it looked when nothing is listening there. A client that
     /// reported only that it had failed would leave the user guessing between
     /// a daemon that is not running and one listening somewhere else, which
-    /// are fixed differently. Says that the daemon did not answer where the
-    /// connection is not made within [`DEADLINE`] of its start.
+    /// are fixed differently. Says that the daemon is not accepting
+    /// connections where the socket's backlog has no room for one more: the
+    /// connect is answered `EAGAIN` there, and something holds that socket.
+    /// Says that the daemon did not answer where the connection is not made
+    /// within [`DEADLINE`] of its start.
     pub async fn connect(socket: &Path) -> Result<Self> {
         let answer_by = Instant::now() + DEADLINE;
-        let stream = timeout_at(answer_by, UnixStream::connect(socket))
+        let connected = timeout_at(answer_by, UnixStream::connect(socket))
             .await
-            .map_err(|_elapsed| did_not_answer(socket))?
-            .with_context(|| format!("no daemon at {}", socket.display()))?;
+            .map_err(|_elapsed| did_not_answer(socket))?;
+        let stream = match connected {
+            Err(full) if full.kind() == io::ErrorKind::WouldBlock => Err(full).with_context(|| {
+                format!(
+                    "daemon at {} is not accepting connections",
+                    socket.display()
+                )
+            }),
+            connected => connected.with_context(|| format!("no daemon at {}", socket.display())),
+        }?;
         let (reader, writer) = tokio::io::split(stream);
 
         Ok(Self {
@@ -121,17 +133,33 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// As [`Daemon::answer`], when the connection ended with the request
-    /// unanswered, and that the daemon did not answer where no answer came
-    /// within [`DEADLINE`] of the start of the connection.
+    /// As [`Daemon::answer`]. Returns that the daemon closed the connection
+    /// where it ended with the request unanswered: at its end where the
+    /// daemon had read the request, and at a reset, said with it, where the
+    /// daemon closed with the request unread or with the connection still in
+    /// the socket's backlog. Returns that the daemon did not answer where no
+    /// answer came within [`DEADLINE`] of the start of the connection.
     pub async fn expect_answer(&mut self) -> Result<Response> {
         let answered = timeout_at(self.answer_by, self.answer())
             .await
-            .map_err(|_elapsed| did_not_answer(&self.socket))??;
+            .map_err(|_elapsed| did_not_answer(&self.socket))?;
 
-        answered.context("the daemon closed the connection without answering")
+        match answered {
+            Ok(Some(answer)) => Ok(answer),
+            Ok(None) => bail!(CLOSED_WITHOUT_ANSWERING),
+            Err(failure) => match failure.downcast_ref::<io::Error>() {
+                Some(reset) if reset.kind() == io::ErrorKind::ConnectionReset => {
+                    bail!("{CLOSED_WITHOUT_ANSWERING}: {reset}")
+                }
+                _ => Err(failure),
+            },
+        }
     }
 }
+
+/// What is said of a daemon that closed the connection before its first
+/// answer.
+const CLOSED_WITHOUT_ANSWERING: &str = "daemon closed connection without answering";
 
 /// What is said of a daemon that gave no answer by the deadline.
 fn did_not_answer(socket: &Path) -> anyhow::Error {
