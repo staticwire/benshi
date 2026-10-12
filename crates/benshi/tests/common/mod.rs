@@ -7,7 +7,9 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -57,23 +59,49 @@ pub fn the_binary(
     session: &[(&str, &OsStr)],
     descriptors: Descriptors,
 ) -> Command {
-    let mut binary = match descriptors {
-        Descriptors::Plenty => Command::new(env!("CARGO_BIN_EXE_benshi")),
-        Descriptors::One => {
-            // Under a limit of four a descriptor is one of 0 to 3, and the
-            // first three are the streams the binary is started with. The
-            // shell lets go of 3 first, so that it is free whatever the
-            // tests were started with.
-            let mut shell = Command::new("/bin/sh");
-            shell.args([
-                "-c",
-                "exec 3>&-; ulimit -n 4; exec \"$@\"",
-                "sh",
-                env!("CARGO_BIN_EXE_benshi"),
-            ]);
-            shell
-        }
+    let binary = match descriptors {
+        Descriptors::Plenty => unignoring(env!("CARGO_BIN_EXE_benshi")),
+        // Under a limit of four a descriptor is one of 0 to 3, and the first
+        // three are the streams the binary is started with. The shell lets
+        // go of 3 first, so that it is free whatever the tests were started
+        // with.
+        Descriptors::One => after("exec 3>&-; ulimit -n 4"),
     };
+
+    in_session(binary, arguments, session)
+}
+
+/// `program` run with each signal that stops a daemon doing what the system
+/// does with it, whatever the tests were started with.
+///
+/// A process starts with the signals ignored that its parent ignored, and a
+/// shell script that runs the tests in the background starts them with
+/// `SIGINT` ignored. A shell cannot undo that in what it starts, and `env`
+/// can.
+fn unignoring(program: &str) -> Command {
+    let mut env = Command::new("/usr/bin/env");
+    env.args(["--default-signal=TERM,INT,HUP", program]);
+
+    env
+}
+
+/// The binary as a shell starts it that did `first`: in the process of the
+/// shell, with what `first` left.
+fn after(first: &str) -> Command {
+    let mut shell = unignoring("/bin/sh");
+    shell.args([
+        "-c",
+        &format!("{first}; exec \"$@\""),
+        "sh",
+        env!("CARGO_BIN_EXE_benshi"),
+    ]);
+
+    shell
+}
+
+/// `binary` asked for `arguments` in a session the test chose, with nothing
+/// to read, nowhere to answer and nothing of the session the tests run in.
+fn in_session(mut binary: Command, arguments: &[&OsStr], session: &[(&str, &OsStr)]) -> Command {
     binary
         .args(arguments)
         .env_clear()
@@ -188,6 +216,31 @@ impl Drop for Directory {
     }
 }
 
+/// A stream that is full, and the end of it that nobody reads.
+///
+/// The test keeps that end for as long as the daemon runs: a write to a
+/// stream whose other end has gone fails, where a write to this one waits.
+// Dead in a test binary that reads every daemon it starts.
+#[allow(dead_code)]
+pub fn nobody_reads() -> (UnixStream, Stdio) {
+    let (unread, full) = UnixStream::pair().expect("a pair of sockets can be made");
+    // Filled without waiting, and handed over as a stream that waits.
+    full.set_nonblocking(true)
+        .expect("a socket can be kept from waiting");
+    let filling = [b'.'; 4096];
+    loop {
+        match (&full).write(&filling) {
+            Ok(_taken) => {}
+            Err(waits) if waits.kind() == ErrorKind::WouldBlock => break,
+            Err(other) => panic!("the stream could not be filled: {other}"),
+        }
+    }
+    full.set_nonblocking(false)
+        .expect("a socket can be made to wait");
+
+    (unread, OwnedFd::from(full).into())
+}
+
 /// A daemon in a session the test chose, stopped when this goes.
 pub struct Daemon {
     running: Child,
@@ -215,8 +268,25 @@ impl Daemon {
         Self::hearing(arguments, session, usize::MAX)
     }
 
+    /// A daemon started with `signal` ignored, as `nohup` starts one with
+    /// `HUP`. The signal is named as `trap` names it.
+    // Dead in a test binary whose every daemon starts with no signal ignored.
+    #[allow(dead_code)]
+    pub fn ignoring(signal: &str, session: &[(&str, &OsStr)]) -> Self {
+        let binary = after(&format!("trap '' {signal}"));
+
+        Self::read_for(
+            in_session(binary, &[OsStr::new(NO_TRAY)], session),
+            usize::MAX,
+        )
+    }
+
     fn hearing(arguments: &[&OsStr], session: &[(&str, &OsStr)], limit: usize) -> Self {
-        let mut running = the_binary(arguments, session, Descriptors::Plenty)
+        Self::read_for(the_binary(arguments, session, Descriptors::Plenty), limit)
+    }
+
+    fn read_for(mut binary: Command, limit: usize) -> Self {
+        let mut running = binary
             .stderr(Stdio::piped())
             .spawn()
             .expect("the binary runs");
@@ -283,6 +353,18 @@ impl Daemon {
     /// The next line it says, and nothing where it says none in time.
     pub fn says_next(&self) -> Option<String> {
         self.heard.recv_timeout(PATIENCE).ok()
+    }
+
+    /// Sends it a signal, named as `kill` names it.
+    // Dead in a test binary that sends no daemon a signal.
+    #[allow(dead_code)]
+    pub fn is_sent(&self, signal: &str) {
+        let sent = Command::new("kill")
+            .args(["-s", signal, &self.running.id().to_string()])
+            .status()
+            .expect("`kill` runs");
+
+        assert!(sent.success(), "`kill` could not send {signal}");
     }
 
     /// How it ended, and nothing where it is still running.

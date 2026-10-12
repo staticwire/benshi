@@ -212,7 +212,8 @@ pub struct Wiring {
 ///
 /// [`TaskError::Transient`] when the database is in use, and
 /// [`TaskError::Permanent`] when the store refuses the call for any other
-/// reason. Both say what the store said.
+/// reason. Both say what the store said. [`TaskError::Permanent`] as well
+/// when the runtime shut down before the call started.
 ///
 /// # Panics
 ///
@@ -232,11 +233,14 @@ where
 
     match called.await {
         Ok(answered) => answered.map_err(refused),
-        // Nothing aborts this handle, and a runtime cancels a blocking call
-        // only by shutting down before the call starts. The daemon's runtime
-        // shuts down after its last task has ended, so a call that did not
-        // come back panicked, and the panic is handed on as it was raised.
-        Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
+        // Handed on as it was raised.
+        Err(panicked) if panicked.is_panic() => std::panic::resume_unwind(panicked.into_panic()),
+        // Nothing aborts this handle, so the runtime gave the call up: it
+        // shut down before the call started. A daemon that is stopped lets
+        // its runtime go while a round can still be under way.
+        Err(given_up) => Err(TaskError::Permanent(anyhow::anyhow!(
+            "store could not be asked: {given_up}"
+        ))),
     }
 }
 
@@ -547,10 +551,12 @@ mod tests {
     use benshi_store::watching::{Kept, Total};
     use benshi_store::{Store, Viewing};
     use std::collections::{BTreeSet, VecDeque};
+    use std::future::Future;
     use std::ops::RangeInclusive;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+    use std::task::{Context, Poll, Waker};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use tokio::sync::broadcast::Receiver;
@@ -2167,5 +2173,32 @@ mod tests {
             .downcast_ref::<String>()
             .expect("a panic that says something");
         assert!(said.starts_with("the store was poisoned"), "{said}");
+    }
+
+    #[test]
+    fn a_call_a_runtime_that_shut_down_gave_up_stops_the_task() {
+        // A runtime that shuts down hands back as cancelled a call it had
+        // not started. Nothing in that is a bug, so it is no panic.
+        let database = Database::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let shut_down = runtime.handle().clone();
+        drop(runtime);
+        let _entered = shut_down.enter();
+
+        let asked = std::pin::pin!(super::ask(Arc::clone(&database.store), |_store| Ok(())));
+        let answered = asked.poll(&mut Context::from_waker(Waker::noop()));
+
+        let Poll::Ready(Err(failure)) = answered else {
+            panic!("a call that was never made was answered: {answered:?}");
+        };
+        assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
+        assert!(
+            failure
+                .to_string()
+                .starts_with("store could not be asked: "),
+            "{failure}"
+        );
     }
 }
