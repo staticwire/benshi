@@ -6,15 +6,17 @@
 //! never counts on a socket of its own being gone the moment it lets go of it.
 
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
 
 /// How long a test waits for the binary to say something or to end before
 /// calling it lost. Only ever spent on a failure.
@@ -186,33 +188,29 @@ fn heard(written: Option<impl Read>) -> String {
     all
 }
 
-/// A directory of one test in one run of the tests, gone when the test is
-/// over.
+/// A directory of one test, gone when the test is over.
 ///
-/// Named by the process as well as by the test, so that two runs of the tests
-/// at once do not bind in one directory.
-pub struct Directory(PathBuf);
+/// Under the temporary directory of the system, as the tests of the other
+/// crates keep theirs. A daemon syncs its database as it makes it and as it
+/// lets go of it, and on a disk that is busy writing either can take longer
+/// than a test allows. Where the temporary directory is in memory a sync
+/// costs nothing.
+///
+/// Named after the test, so that one left behind says whose it was.
+pub struct Directory(TempDir);
 
 impl Directory {
     pub fn of(test: &str) -> Self {
-        let directory =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{test}-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("the directory can be made");
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("benshi-{test}-"))
+            .tempdir()
+            .expect("a directory of our own");
 
         Self(directory)
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        // Whatever is left in it is what a daemon that was stopped left. A
-        // directory that stays behind fails nothing, so a failure to remove
-        // it is not worth a panic inside a panic.
-        drop(fs::remove_dir_all(&self.0));
+        self.0.path()
     }
 }
 
