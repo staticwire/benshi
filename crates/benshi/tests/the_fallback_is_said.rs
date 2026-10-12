@@ -49,7 +49,7 @@ fn the_daemon_says_that_the_runtime_directory_is_not_set() {
         said,
         [
             format!(
-                "benshi: `XDG_RUNTIME_DIR` is not set, so the socket is {}",
+                "benshi: `XDG_RUNTIME_DIR` is not set, so socket is {}",
                 socket.display()
             ),
             format!("benshi: listening on {}", socket.display()),
@@ -74,7 +74,7 @@ fn the_daemon_says_what_is_wrong_with_the_runtime_directory_it_was_given() {
         said,
         [
             format!(
-                "benshi: `XDG_RUNTIME_DIR` holds `run/1000`, which is a relative path, so the \
+                "benshi: `XDG_RUNTIME_DIR` holds `run/1000`, which is a relative path, so \
                  socket is {}",
                 socket.display()
             ),
@@ -118,7 +118,7 @@ fn the_client_says_that_the_runtime_directory_is_not_set() {
     assert_eq!(
         said.first(),
         Some(&format!(
-            "benshi: `XDG_RUNTIME_DIR` is not set, so the socket is {}",
+            "benshi: `XDG_RUNTIME_DIR` is not set, so socket is {}",
             socket.display()
         )),
         "{said:?}"

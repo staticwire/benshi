@@ -34,7 +34,7 @@ pub enum ReplayError {
     /// was published and parses like any other; what nothing in it says is how
     /// to describe that source, and a round that carried its reading without
     /// describing it would break the contract every watcher is held to.
-    #[error("line {line} is a reading from {player}, which the trace does not declare")]
+    #[error("line {line} is a reading from {player}, which this trace does not declare")]
     UndeclaredSource {
         /// Which line of the file, counting the header as line 1.
         line: usize,
@@ -102,7 +102,7 @@ impl ReplayWatcher {
             .declared
             .iter_mut()
             .find(|source| source.player == reading.player)
-            .expect("new() refuses a reading from a source the trace does not declare");
+            .expect("new() refuses a reading from a source this trace does not declare");
         described.state = reading.state;
 
         self.declared.clone()
@@ -318,6 +318,10 @@ mod tests {
         );
         let said = failure.to_string();
         assert!(said.contains("line 3"), "got {said}");
+        assert!(
+            said.ends_with(", which this trace does not declare"),
+            "got {said}"
+        );
         // This message names its subject, unlike a `WatchError`: whoever gets
         // it holds the trace and not the pair the reading came in. Named
         // plainly, though - the identity goes through `Display`, and nothing

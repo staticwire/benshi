@@ -122,7 +122,7 @@ impl<'de> Deserialize<'de> for Rating {
         let points = u8::deserialize(deserializer)?;
         Self::new(points).ok_or_else(|| {
             D::Error::custom(format_args!(
-                "a rating is from 1 to 100, and this is {points}"
+                "rating is from 1 to 100, and this is {points}"
             ))
         })
     }
@@ -672,6 +672,13 @@ mod tests {
             assert!(
                 matches!(refused, Err(Error::Operation { id: 1, .. })),
                 "a score of {score} got {refused:?}"
+            );
+            let said = refused.expect_err("no rating").to_string();
+            assert!(
+                said.starts_with(&format!(
+                    "queued operation 1 cannot be read: rating is from 1 to 100, and this is {score}"
+                )),
+                "{said}"
             );
         }
     }

@@ -71,7 +71,7 @@ pub enum Error {
     /// Refused rather than opened, because this build cannot see the tables
     /// the newer one made and would write into a schema it does not
     /// understand.
-    #[error("the database is at schema {found} and this build knows only up to {known}")]
+    #[error("database is at schema {found} and this build knows only up to {known}")]
     FromTheFuture {
         /// The schema the file is at.
         found: u32,
@@ -84,15 +84,15 @@ pub enum Error {
     /// The one failure here that can pass on its own: the statement
     /// succeeds when it is made again after the connection that has the
     /// file has given it up.
-    #[error("the database is in use by another connection: {0}")]
+    #[error("database is in use by another connection: {0}")]
     Busy(#[source] rusqlite::Error),
     /// A statement failed on a database that is already open, and the
     /// database was not busy. The schema version read that starts the
     /// migrations is one of them.
-    #[error("the database could not be read or written: {0}")]
+    #[error("database could not be read or written: {0}")]
     Write(#[source] rusqlite::Error),
     /// A row in the queue that cannot be read as an operation.
-    #[error("operation {id} in the queue cannot be read: {cause}")]
+    #[error("queued operation {id} cannot be read: {cause}")]
     Operation {
         /// The row's `id` in `sync_queue`.
         id: i64,
@@ -105,14 +105,14 @@ pub enum Error {
     /// Foreign keys keep one from being written through this crate.
     /// `sqlite3` leaves them off unless it is asked, so a row written by
     /// hand or a show deleted by hand leaves one.
-    #[error("operation {id} in the queue is for a show that is not there")]
+    #[error("queued operation {id} is for a show that is not there")]
     Orphan {
         /// The row's `id` in `sync_queue`.
         id: i64,
     },
     /// A row of `watching` whose media is not a path as this crate writes
     /// one: a per-cent sign with no two hexadecimal digits after it.
-    #[error("the media of row {id} in `watching` is not an escaped path: {text:?}")]
+    #[error("media of row {id} in `watching` is not an escaped path: {text:?}")]
     Media {
         /// The row's `id` in `watching`.
         id: i64,
@@ -124,7 +124,7 @@ pub enum Error {
     ///
     /// A clock reading either is broken, and the answer is to say so rather
     /// than to write a date that is not the one it read.
-    #[error("the clock reads {at:?}, which is before 1970 or past the year 9999")]
+    #[error("clock reads {at:?}, which is before 1970 or after 9999")]
     Instant {
         /// What the clock read.
         at: std::time::SystemTime,
@@ -208,7 +208,7 @@ impl Store {
     pub fn schema_version(&self) -> u32 {
         self.connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("user_version is in the header of every SQLite file")
+            .expect("every SQLite file has user_version in its header")
     }
 }
 
@@ -564,7 +564,7 @@ mod tests {
 
         assert_eq!(
             refused.to_string(),
-            "the database is in use by another connection: database is locked"
+            "database is in use by another connection: database is locked"
         );
     }
 
@@ -584,5 +584,44 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "the file holds what somebody watched");
+    }
+
+    #[test]
+    fn a_failure_says_what_was_wrong_and_what_was_said_of_it() {
+        let refused = || rusqlite::Error::InvalidQuery;
+        let unread = || serde_json::from_str::<u8>("x").expect_err("no number");
+
+        assert_eq!(
+            Error::FromTheFuture { found: 9, known: 3 }.to_string(),
+            "database is at schema 9 and this build knows only up to 3"
+        );
+        assert_eq!(
+            Error::Write(refused()).to_string(),
+            format!("database could not be read or written: {}", refused())
+        );
+        assert_eq!(
+            Error::Operation {
+                id: 7,
+                cause: unread()
+            }
+            .to_string(),
+            format!("queued operation 7 cannot be read: {}", unread())
+        );
+        assert_eq!(
+            Error::Orphan { id: 7 }.to_string(),
+            "queued operation 7 is for a show that is not there"
+        );
+        assert_eq!(
+            Error::Media {
+                id: 7,
+                text: "%zz".to_owned()
+            }
+            .to_string(),
+            "media of row 7 in `watching` is not an escaped path: \"%zz\""
+        );
+        assert_eq!(
+            Error::Instant { at: UNIX_EPOCH }.to_string(),
+            format!("clock reads {UNIX_EPOCH:?}, which is before 1970 or after 9999")
+        );
     }
 }

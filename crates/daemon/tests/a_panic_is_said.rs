@@ -30,7 +30,7 @@ const PANICKED: Option<i32> = Some(101);
 /// supervisor tells of each panic, and the third attempt runs.
 const SHOWN: [&str; 3] = [
     "told: flaky panicked and is started again: attempt 1 panics",
-    "told: flaky panicked and is started again: a panic carrying no message",
+    "told: flaky panicked and is started again: panic carrying no message",
     "attempt 3 runs",
 ];
 

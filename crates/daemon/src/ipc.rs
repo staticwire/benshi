@@ -47,7 +47,7 @@ const LAST_RESORT: &str = "/tmp";
 const PRIVATE: u32 = 0o700;
 
 /// What is said when the policy table cannot be trusted.
-const POISONED: &str = "the policy table was poisoned by a panic in another task";
+const POISONED: &str = "policy table was poisoned by a panic in another task";
 
 /// The way in which a session names no runtime directory the socket can go in.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,7 +77,7 @@ impl fmt::Display for Fallback {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}, so the socket is {}",
+            "{}, so socket is {}",
             self.why,
             self.socket.display()
         )
@@ -213,7 +213,7 @@ fn private_directory(directory: &Path) -> Result<()> {
     Err(Error::new(
         ErrorKind::PermissionDenied,
         format!(
-            "{} is mode {mode:o} and must be {PRIVATE:o}: a socket in a directory \
+            "{} is mode {mode:o} and must be {PRIVATE:o}: socket in a directory \
              others can reach is one others can replace",
             directory.display()
         ),
@@ -241,14 +241,14 @@ fn private_directory(directory: &Path) -> Result<()> {
 pub fn bind(path: &Path) -> Result<UnixListener> {
     let directory = path
         .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "a socket path has a directory"))?;
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "socket path has no directory"))?;
     private_directory(directory)?;
 
     if path.exists() {
         if still_listening(path)? {
             return Err(Error::new(
                 ErrorKind::AddrInUse,
-                format!("a daemon is already listening on {}", path.display()),
+                format!("daemon is already listening on {}", path.display()),
             ));
         }
         fs::remove_file(path)?;
@@ -973,6 +973,10 @@ mod tests {
         let refused = bind(&path).expect_err("a second daemon must not take the socket");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(
+            refused.to_string(),
+            format!("daemon is already listening on {}", path.display())
+        );
         drop(running);
     }
 
@@ -1035,6 +1039,46 @@ mod tests {
         let refused = bind(&open.join("benshi.sock")).expect_err("must refuse");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        let said = refused.to_string();
+        assert!(
+            said.ends_with(
+                " and must be 700: socket in a directory others can reach is one others can replace"
+            ),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_table_a_panic_left_poisoned_is_not_listed_from() {
+        let daemon = Daemon::with(Vec::new());
+        let poisoner = Arc::clone(&daemon.policy);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.write().expect("the policy table");
+            panic!("a bug in another task");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread did not panic");
+
+        let server = Arc::clone(&daemon.server);
+        let panic = std::thread::spawn(move || server.listing())
+            .join()
+            .expect_err("a poisoned policy table was listed from as though it were trustworthy");
+
+        let said = panic
+            .downcast_ref::<String>()
+            .expect("a panic that says something");
+        assert!(
+            said.starts_with("policy table was poisoned by a panic in another task: "),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_directory_is_refused() {
+        let refused = bind(Path::new("/")).expect_err("the root has no directory above it");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(refused.to_string(), "socket path has no directory");
     }
 
     #[tokio::test]
@@ -1193,7 +1237,7 @@ mod tests {
         assert_eq!(
             said(None),
             Some(
-                "`XDG_RUNTIME_DIR` is not set, so the socket is \
+                "`XDG_RUNTIME_DIR` is not set, so socket is \
                  /nowhere/tmp/benshi/benshi.sock"
                     .to_owned()
             )
@@ -1201,7 +1245,7 @@ mod tests {
         assert_eq!(
             said(Some("")),
             Some(
-                "`XDG_RUNTIME_DIR` is empty, so the socket is \
+                "`XDG_RUNTIME_DIR` is empty, so socket is \
                  /nowhere/tmp/benshi/benshi.sock"
                     .to_owned()
             )
@@ -1209,7 +1253,7 @@ mod tests {
         assert_eq!(
             said(Some("run/user/1000")),
             Some(
-                "`XDG_RUNTIME_DIR` holds `run/user/1000`, which is a relative path, so the \
+                "`XDG_RUNTIME_DIR` holds `run/user/1000`, which is a relative path, so \
                  socket is /nowhere/tmp/benshi/benshi.sock"
                     .to_owned()
             )

@@ -246,7 +246,7 @@ fn a_client_that_cannot_say_where_it_looks_is_answered_as_one_that_can() {
     assert_eq!(
         heard.said,
         format!(
-            "benshi: `XDG_RUNTIME_DIR` is not set, so the socket is {}\n",
+            "benshi: `XDG_RUNTIME_DIR` is not set, so socket is {}\n",
             socket.display()
         )
     );
