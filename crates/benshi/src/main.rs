@@ -102,6 +102,9 @@ fn daemon(tray: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A panic written by the thread that panicked would hold its task for
+    // as long as nobody reads.
+    benshi_daemon::panics::are_said_through(&voice);
 
     if tray {
         // Said rather than passed over. A tray that was asked for and is

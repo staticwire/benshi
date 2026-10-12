@@ -39,6 +39,8 @@ pub mod detection;
 #[cfg(unix)]
 pub mod ipc;
 
+pub mod panics;
+
 pub mod paths;
 
 pub mod protocol;

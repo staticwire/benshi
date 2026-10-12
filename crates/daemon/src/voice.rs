@@ -57,6 +57,8 @@ struct Lines {
     dropped: u64,
     /// The voice has gone, and nothing more is said.
     over: bool,
+    /// The thread that writes has ended, and nothing more is written.
+    ended: bool,
 }
 
 impl Unwritten {
@@ -94,8 +96,20 @@ fn dropped_here(lines: u64) -> String {
     }
 }
 
+/// Says that the thread that writes has ended, as it ends.
+struct Ended<'a>(&'a Unwritten);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        self.0.lines().ended = true;
+    }
+}
+
 /// Writes every line that is said, until the voice has gone.
 fn write(unwritten: &Unwritten, mut sink: impl Write) {
+    // Said where this returns and where it panics, and ahead of the sink
+    // being let go of.
+    let _ended = Ended(unwritten);
     while let Some((dropped, line)) = unwritten.next() {
         // A line that cannot be written is passed over: the next may be one
         // that can be written.
@@ -126,6 +140,7 @@ impl Voice {
                 said: VecDeque::new(),
                 dropped: 0,
                 over: false,
+                ended: false,
             }),
             changed: Condvar::new(),
         });
@@ -157,13 +172,30 @@ impl Voice {
         drop(lines);
         self.unwritten.changed.notify_one();
     }
+
+    /// Whether a line said on this thread is one the thread of the voice
+    /// writes: that thread has not ended, and is not this one.
+    #[must_use]
+    pub(crate) fn writes_for_this_thread(&self) -> bool {
+        // The thread is looked at first: the one that writes does not ask
+        // for the lines it may hold.
+        self.writer
+            .as_ref()
+            .is_some_and(|writer| writer.thread().id() != thread::current().id())
+            && !self.unwritten.lines().ended
+    }
 }
 
 impl Drop for Voice {
     fn drop(&mut self) {
         self.unwritten.lines().over = true;
         self.unwritten.changed.notify_one();
-        if let Some(writer) = self.writer.take() {
+        // The thread that writes cannot wait for itself to end. It lets go
+        // of the voice last where everything else let go of it while that
+        // thread said a panic of its own.
+        if let Some(writer) = self.writer.take()
+            && writer.thread().id() != thread::current().id()
+        {
             // A writer that panicked has written what it could, and a voice
             // that goes has nowhere left to say so.
             drop(writer.join());
