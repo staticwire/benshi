@@ -127,6 +127,7 @@ dependencies = [
  "benshi-store",
  "benshi-tray",
  "clap",
+ "tempfile",
  "tokio",
 ]
 
