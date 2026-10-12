@@ -209,7 +209,7 @@ fn answer(of: &Outcome) -> String {
             format!("ambiguous: {}\n", quoted.join(", "))
         }
         Outcome::Unrecognised { best: Some(score) } => {
-            format!("unrecognised: the closest candidate scored {score:.2}\n")
+            format!("unrecognised: closest candidate scored {score:.2}\n")
         }
         Outcome::Unrecognised { best: None } => {
             "unrecognised: nothing to score against\n".to_owned()
@@ -810,7 +810,10 @@ mod tests {
             Outcome::Unrecognised { best: None },
         ));
 
-        assert!(line_of(&close, "unrecognised:").contains("0.40"), "{close}");
+        assert_eq!(
+            line_of(&close, "unrecognised:"),
+            "unrecognised: closest candidate scored 0.40"
+        );
         let unscored = line_of(&nothing, "unrecognised:");
         assert!(unscored.contains("nothing"), "{unscored}");
         assert!(

@@ -156,7 +156,7 @@ async fn ask_for_sources(daemon: &mut Daemon) -> Result<Vec<SourceListing>> {
     match daemon.expect_answer().await? {
         Response::Sources(listed) => Ok(listed),
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("the daemon answered a listing with {unexpected:?}"),
+        unexpected => bail!("daemon answered a listing with {unexpected:?}"),
     }
 }
 
@@ -184,7 +184,7 @@ async fn listing(socket: &Path) -> Result<Vec<SourceInfo>> {
 async fn sources(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
     let listed = ask_for_sources(daemon).await?;
 
-    write!(out, "{}", render::listing(&listed)).context("the listing could not be printed")
+    write!(out, "{}", render::listing(&listed)).context("listing could not be printed")
 }
 
 /// Ask for the stream and read the answer that says it is on.
@@ -198,7 +198,7 @@ async fn subscribe(daemon: &mut Daemon) -> Result<()> {
     match daemon.expect_answer().await? {
         Response::Ok => Ok(()),
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("the daemon answered a watch with {unexpected:?}"),
+        unexpected => bail!("daemon answered a watch with {unexpected:?}"),
     }
 }
 
@@ -218,11 +218,11 @@ async fn watch(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
             // answer it can give.
             Response::Lagged { missed } => format!("... {missed} events missed ..."),
             Response::Error { message } => bail!("{message}"),
-            unexpected => bail!("the daemon sent {unexpected:?} on a stream"),
+            unexpected => bail!("daemon sent {unexpected:?} on a stream"),
         };
 
-        writeln!(out, "{line}").context("the stream could not be printed")?;
-        out.flush().context("the stream could not be printed")?;
+        writeln!(out, "{line}").context("stream could not be printed")?;
+        out.flush().context("stream could not be printed")?;
     }
 
     Ok(())
@@ -240,7 +240,7 @@ async fn set_policy(daemon: &mut Daemon, app: &str, policy: Policy) -> Result<()
     match daemon.expect_answer().await? {
         Response::Ok => Ok(()),
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("the daemon answered a policy change with {unexpected:?}"),
+        unexpected => bail!("daemon answered a policy change with {unexpected:?}"),
     }
 }
 
@@ -250,9 +250,9 @@ async fn why(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
 
     match daemon.expect_answer().await? {
         Response::Why(explained) => write!(out, "{}", render::why(explained.as_ref()))
-            .context("the explanation could not be printed"),
+            .context("explanation could not be printed"),
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("the daemon answered why with {unexpected:?}"),
+        unexpected => bail!("daemon answered why with {unexpected:?}"),
     }
 }
 
@@ -341,7 +341,7 @@ async fn record(
                     bail!("missed {missed} readings, so this recording would have a gap in it")
                 }
                 Response::Error { message } => bail!("{message}"),
-                unexpected => bail!("the daemon sent {unexpected:?} on a stream"),
+                unexpected => bail!("daemon sent {unexpected:?} on a stream"),
             }
         }
 
@@ -361,7 +361,7 @@ async fn record(
         }
     };
     let why = if cut_short {
-        " - the daemon closed the connection before the time was up"
+        " - daemon closed connection before time was up"
     } else {
         ""
     };
@@ -371,7 +371,7 @@ async fn record(
         "recorded {readings} readings to {}{why}",
         output.display()
     )
-    .context("the summary could not be printed")?;
+    .context("summary could not be printed")?;
 
     // Said because the file is a true record of what was published and parses
     // like any other: nothing about it looks wrong, so a replay days later,
@@ -394,7 +394,7 @@ async fn record(
          so it holds more than it can replay: {}",
         named.join(", ")
     )
-    .context("the summary could not be printed")
+    .context("summary could not be printed")
 }
 
 /// Put one line in the trace, where a reader finds it before the next arrives.
@@ -1091,7 +1091,7 @@ mod tests {
     /// What a client says of a daemon that did not answer in time.
     fn did_not_answer(socket: &Path) -> String {
         format!(
-            "benshi: the daemon at {} did not answer within 5s\n",
+            "benshi: daemon at {} did not answer within 5s\n",
             socket.display()
         )
     }
@@ -1229,7 +1229,7 @@ mod tests {
             "printed an event it was not streaming: {shown}"
         );
         assert!(
-            complained.starts_with("benshi: the daemon answered a watch with Event"),
+            complained.starts_with("benshi: daemon answered a watch with Event"),
             "got {complained:?}"
         );
     }
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert!(shown.is_empty(), "printed {shown:?}");
         assert!(
-            complained.starts_with("benshi: the request could not be sent: "),
+            complained.starts_with("benshi: request could not be sent: "),
             "got {complained:?}"
         );
         assert!(
@@ -1461,10 +1461,89 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert!(shown.is_empty(), "printed {shown:?}");
         assert!(
-            complained.starts_with("benshi: the daemon stopped mid-answer: "),
+            complained.starts_with("benshi: daemon stopped mid-answer: "),
             "got {complained:?}"
         );
         assert!(complained.contains("UTF-8"), "got {complained:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_one_is_a_failure_that_quotes_it() {
+        // A line that is text and is no answer is quoted, with what the
+        // parser said of it after.
+        let line = "not an answer";
+        let (_home, socket, answering) = a_daemon_that_writes(format!("{line}\n").into_bytes());
+        let unread = serde_json::from_str::<Response>(line).expect_err("the line is no answer");
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Sources, &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert_eq!(
+            complained,
+            format!("benshi: daemon sent a line this client cannot read: {line}: {unread}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_of_another_kind_is_a_failure_that_names_it() {
+        // The daemon never answers so. The client is written for the
+        // protocol, and says what it was sent where that is not what it
+        // asked for.
+        let policy = Command::Policy {
+            app: "mpv".to_owned(),
+            policy: super::PolicyArgument::Deny,
+        };
+
+        for (command, answer, said) in [
+            (
+                Command::Sources,
+                Response::Ok,
+                "benshi: daemon answered a listing with Ok\n",
+            ),
+            (
+                Command::Why,
+                Response::Ok,
+                "benshi: daemon answered why with Ok\n",
+            ),
+            (
+                policy,
+                Response::Why(None),
+                "benshi: daemon answered a policy change with Why(None)\n",
+            ),
+        ] {
+            let (_home, socket, answering) = a_daemon_that_answers_with(&answer);
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert!(shown.is_empty(), "printed {shown:?}");
+            assert_eq!(complained, said);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_carries_another_answer_is_a_failure_that_names_it() {
+        // After the answer that it is on, a stream carries events. A second
+        // answer in their place is named and not printed.
+        let mut on = serde_json::to_vec(&Response::Ok).expect("serialise");
+        on.push(b'\n');
+        let (_home, socket, answering) = a_daemon_that_writes(on.repeat(2));
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Watch, &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert_eq!(complained, "benshi: daemon sent Ok on a stream\n");
     }
 
     #[tokio::test]
@@ -1639,6 +1718,12 @@ mod tests {
         assert!(trace.snapshots.is_empty(), "{:?}", trace.snapshots);
     }
 
+    /// How a summary ends where the daemon closed the connection before the
+    /// recording's time was up. The test that this is said and the test that
+    /// it is absent read the one text, because a test of absence passes on
+    /// any text a summary never carries.
+    const ENDED_EARLY: &str = " - daemon closed connection before time was up";
+
     #[tokio::test]
     async fn a_recording_ends_with_what_it_has_when_the_daemon_goes_away() {
         // The other way a recording ends, and it is not a failure: what
@@ -1658,7 +1743,7 @@ mod tests {
 
         assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
         assert!(
-            shown.contains("closed the connection"),
+            shown.contains(ENDED_EARLY),
             "a recording that ended early reads as a complete one: {shown:?}"
         );
         // The absence half of the line a recording prints when a source outran
@@ -1715,7 +1800,7 @@ mod tests {
         // The absence half. A recording that ran its full length must not
         // carry the caveat, or the caveat says nothing when it does appear.
         assert!(
-            !shown.contains("closed the connection"),
+            !shown.contains(ENDED_EARLY),
             "a complete recording apologised for ending early: {shown:?}"
         );
         assert!(
@@ -1775,7 +1860,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             err.text(),
-            "benshi: the listing could not be printed: broken pipe\n"
+            "benshi: listing could not be printed: broken pipe\n"
         );
     }
 
@@ -1789,7 +1874,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             err.text(),
-            "benshi: the explanation could not be printed: broken pipe\n"
+            "benshi: explanation could not be printed: broken pipe\n"
         );
     }
 
@@ -1815,7 +1900,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             err.text(),
-            "benshi: the stream could not be printed: broken pipe\n"
+            "benshi: stream could not be printed: broken pipe\n"
         );
     }
 
@@ -1841,7 +1926,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             err.text(),
-            "benshi: the stream could not be printed: broken pipe\n"
+            "benshi: stream could not be printed: broken pipe\n"
         );
     }
 
@@ -1880,7 +1965,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             complained,
-            "benshi: the summary could not be printed: broken pipe\n"
+            "benshi: summary could not be printed: broken pipe\n"
         );
     }
 
@@ -1903,7 +1988,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
             err.text(),
-            "benshi: the summary could not be printed: broken pipe\n"
+            "benshi: summary could not be printed: broken pipe\n"
         );
     }
 }

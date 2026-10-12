@@ -97,7 +97,7 @@ fn daemon(tray: bool) -> ExitCode {
         Ok(voice) => Arc::new(voice),
         Err(unstarted) => {
             say(format_args!(
-                "the thread that writes to stderr could not be started: {unstarted}"
+                "thread that writes to stderr could not be started: {unstarted}"
             ));
             return ExitCode::FAILURE;
         }
@@ -116,7 +116,7 @@ fn daemon(tray: bool) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(unbuilt) => {
-            voice.say(format_args!("the runtime could not be started: {unbuilt}"));
+            voice.say(format_args!("runtime could not be started: {unbuilt}"));
             return ExitCode::FAILURE;
         }
     };

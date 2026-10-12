@@ -87,7 +87,7 @@ pub fn main(arguments: Cli) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(unbuilt) => {
-            say(format_args!("the runtime could not be started: {unbuilt}"));
+            say(format_args!("runtime could not be started: {unbuilt}"));
             return ExitCode::FAILURE;
         }
     };
