@@ -139,7 +139,7 @@ fn the_socket_is_where_the_session_puts_it() {
     }
 
     for (runtime, temporary, expected, why) in sessions {
-        let warning = why.map(|why| format!("{why}, so the socket is {}", expected.display()));
+        let warning = why.map(|why| format!("{why}, so socket is {}", expected.display()));
         let mut session = vec![(SOCKET, expected.into_os_string())];
         session.extend(warning.map(|warning| (WARNING, warning.into())));
         session.extend(runtime.map(|runtime| ("XDG_RUNTIME_DIR", runtime)));

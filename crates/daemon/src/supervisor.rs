@@ -319,7 +319,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         Ok(literal) => (*literal).to_owned(),
         Err(panic) => match panic.downcast::<String>() {
             Ok(formatted) => *formatted,
-            Err(_something_else) => "a panic carrying no message".to_owned(),
+            Err(_something_else) => "panic carrying no message".to_owned(),
         },
     }
 }
@@ -495,7 +495,7 @@ impl Supervisor {
                 // Nothing here aborts a task and the set outlives the loop, so
                 // a cancellation means something else reached in and took the
                 // handle. Recorded rather than guessed at.
-                Err(_cancelled) => Some(Stopped::Permanent("the task was cancelled".to_owned())),
+                Err(_cancelled) => Some(Stopped::Permanent("task was cancelled".to_owned())),
             };
 
             if let Some(stopped_by) = stopped_by {

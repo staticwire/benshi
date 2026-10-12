@@ -641,7 +641,7 @@ async fn a_daemon_whose_database_was_in_use_records_once_it_is_free() {
         Notice::Retried {
             name: "detection".to_owned(),
             after: BACKOFF_BASE,
-            why: "the database is in use by another connection: database is locked".to_owned(),
+            why: "database is in use by another connection: database is locked".to_owned(),
         }
     );
     assert_eq!(

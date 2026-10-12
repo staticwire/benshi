@@ -237,7 +237,7 @@ fn line<T: Serialize>(value: &T) -> Result<String, TraceError> {
 #[derive(Debug, thiserror::Error)]
 pub enum TraceError {
     /// The text held no lines, so there was no header to read.
-    #[error("a trace begins with a header line, and this text has no lines")]
+    #[error("trace begins with a header line, and this text has no lines")]
     Empty,
 
     /// The first line is not a header.
@@ -266,7 +266,7 @@ pub enum TraceError {
     },
 
     /// A line could not be produced.
-    #[error("a trace line could not be written: {source}")]
+    #[error("trace line could not be written: {source}")]
     NotWritten {
         /// What the serialiser said.
         #[source]
@@ -704,6 +704,31 @@ mod tests {
         assert!(
             matches!(failure, TraceError::Header { .. }),
             "got {failure:?}"
+        );
+    }
+
+    #[test]
+    fn text_with_no_lines_is_refused_for_want_of_a_header() {
+        let failure = Trace::from_jsonl("").expect_err("no line is no header");
+
+        assert_eq!(
+            failure.to_string(),
+            "trace begins with a header line, and this text has no lines"
+        );
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_written_says_what_the_serialiser_said() {
+        // A map whose keys are not text is one JSON cannot spell.
+        let unwritable = std::collections::BTreeMap::from([((1, 2), 3)]);
+
+        let cause = serde_json::to_string(&unwritable).expect_err("JSON has no such key");
+
+        let failure = super::line(&unwritable).expect_err("JSON has no such key");
+
+        assert_eq!(
+            failure.to_string(),
+            format!("trace line could not be written: {cause}")
         );
     }
 }

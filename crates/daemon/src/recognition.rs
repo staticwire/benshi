@@ -22,7 +22,7 @@ use benshi_core::recognise::{Recognition, decide};
 use benshi_core::{MediaRef, PlayerId};
 
 /// What is said when the record of the last decision cannot be trusted.
-const POISONED: &str = "the last decision was poisoned by a panic in another task";
+const POISONED: &str = "last decision was poisoned by a panic in another task";
 
 /// What a name is decided against: the corpus, its index and the assignments.
 #[derive(Debug)]
@@ -256,6 +256,30 @@ mod tests {
                 Recognition::Unrecognised(Refusal { best: None, .. })
             ),
             "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_a_panic_left_poisoned_is_not_read() {
+        let decided = Decided::new();
+        let poisoner = decided.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.0.write().expect("the record");
+            panic!("a bug in another task");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread did not panic");
+
+        let panic = std::thread::spawn(move || decided.latest())
+            .join()
+            .expect_err("a poisoned record was read as though it were trustworthy");
+
+        let said = panic
+            .downcast_ref::<String>()
+            .expect("a panic that says something");
+        assert!(
+            said.starts_with("last decision was poisoned by a panic in another task: "),
+            "{said}"
         );
     }
 }

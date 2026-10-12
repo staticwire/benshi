@@ -80,7 +80,7 @@ impl fmt::Display for Role {
 pub enum Nowhere {
     /// `BENSHI_DATA_DIR` holds a relative path that is not beneath `~`.
     #[error(
-        "`{OVERRIDE}` holds `{}`, which is a relative path: the data directory is an absolute \
+        "`{OVERRIDE}` holds `{}`, which is a relative path: data directory is an absolute \
          path or a path beneath `{MARK}`",
         .given.display()
     )]
@@ -650,7 +650,7 @@ mod tests {
             found.map_err(|nowhere| nowhere.to_string()),
             Err(
                 "`BENSHI_DATA_DIR` holds `data/here`, which is a relative path: \
-                 the data directory is an absolute path or a path beneath `~`"
+                 data directory is an absolute path or a path beneath `~`"
                     .to_owned()
             )
         );

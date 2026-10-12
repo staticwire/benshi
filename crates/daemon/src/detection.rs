@@ -74,16 +74,16 @@ use crate::supervisor::TaskError;
 /// The adapter contract forbids this, and the daemon does not rely on that. A
 /// reading it cannot attribute to an application is a reading it cannot apply
 /// policy to, and publishing it would walk past a deny the user set.
-const UNDESCRIBED: &str = "read but not described in the same round, so no policy applies to it";
+const UNDESCRIBED: &str = "read in a round that did not describe it, so no policy applies to it";
 
 /// What is said when the policy table cannot be trusted.
-const POISONED: &str = "the policy table was poisoned by a panic in another task";
+const POISONED: &str = "policy table was poisoned by a panic in another task";
 
 /// What is said when the record of what was seen cannot be trusted.
 const POISONED_SEEN: &str = "what was last seen was poisoned by a panic in another task";
 
 /// What is said when the store cannot be trusted.
-const POISONED_STORE: &str = "the store was poisoned by a panic in a call into it";
+const POISONED_STORE: &str = "store was poisoned by a panic in a call into it";
 
 /// Every source the last round was able to describe.
 ///
@@ -1120,11 +1120,19 @@ mod tests {
             snapshots_in(&published).is_empty(),
             "an unattributable reading was published: {published:?}"
         );
-        assert!(
-            published
-                .iter()
-                .any(|event| matches!(event, BusEvent::SourceFailed { player, .. } if player == &id("firefox"))),
-            "an unattributable reading was dropped without a word: {published:?}"
+        let said: Vec<&str> = published
+            .iter()
+            .filter_map(|event| match event {
+                BusEvent::SourceFailed { player, reason } if player == &id("firefox") => {
+                    Some(reason.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said,
+            ["read in a round that did not describe it, so no policy applies to it"],
+            "what was said of an unattributable reading: {published:?}"
         );
     }
 
@@ -1559,9 +1567,16 @@ mod tests {
 
         let read = tokio::spawn(async move { detection.round().await });
 
+        let panic = read
+            .await
+            .expect_err("a poisoned policy table was read as though it were trustworthy")
+            .into_panic();
+        let said = panic
+            .downcast_ref::<String>()
+            .expect("a panic that says something");
         assert!(
-            read.await.expect_err("the round panics").is_panic(),
-            "a poisoned policy table was read as though it were trustworthy"
+            said.starts_with("policy table was poisoned by a panic in another task: "),
+            "{said}"
         );
     }
 
@@ -2172,7 +2187,10 @@ mod tests {
         let said = panic
             .downcast_ref::<String>()
             .expect("a panic that says something");
-        assert!(said.starts_with("the store was poisoned"), "{said}");
+        assert!(
+            said.starts_with("store was poisoned by a panic in a call into it: "),
+            "{said}"
+        );
     }
 
     #[test]

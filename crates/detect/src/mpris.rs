@@ -86,7 +86,7 @@ pub const SOURCE_DEADLINE: Duration = Duration::from_millis(500);
 // round itself away.
 const _: () = assert!(
     SOURCE_DEADLINE.as_nanos() * 2 <= POLL_INTERVAL.as_nanos(),
-    "a source deadline above half the poll interval lets rounds overlap"
+    "source deadline above half a poll interval lets rounds overlap"
 );
 
 /// The properties one `GetAll` returns, keyed as the bus spelled them.
@@ -98,7 +98,7 @@ type Properties = HashMap<String, OwnedValue>;
 /// answer. Enumerating the bus is not attributable to any one player, so it is
 /// reported as a transport failure instead.
 #[derive(Debug, thiserror::Error)]
-#[error("the session bus did not answer within {deadline:?}")]
+#[error("session bus did not answer within {deadline:?}")]
 struct BusTimeout {
     deadline: Duration,
 }
@@ -560,8 +560,9 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities, duration_of,
-        identity_from_bus_name, media_from, observe, percent_decode, play_state, position_of,
+        BusTimeout, PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
+        duration_of, identity_from_bus_name, media_from, observe, percent_decode, play_state,
+        position_of,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
@@ -1018,5 +1019,17 @@ mod tests {
         let empty = properties(vec![("xesam:url", a_string(""))]);
 
         assert!(!declare_capabilities(&Properties::new(), &empty).location);
+    }
+
+    #[test]
+    fn a_bus_that_does_not_answer_says_how_long_it_was_given() {
+        let unanswered = BusTimeout {
+            deadline: Duration::from_secs(2),
+        };
+
+        assert_eq!(
+            unanswered.to_string(),
+            "session bus did not answer within 2s"
+        );
     }
 }

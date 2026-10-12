@@ -229,16 +229,14 @@ pub enum WatchedPolicyError {
     /// The percentage is outside [`WATCHED_PERCENT_MIN`] to
     /// [`WATCHED_PERCENT_MAX`].
     #[error(
-        "a watched percentage of {percent} is outside {WATCHED_PERCENT_MIN} to {WATCHED_PERCENT_MAX}"
+        "watched percentage of {percent} is outside {WATCHED_PERCENT_MIN} to {WATCHED_PERCENT_MAX}"
     )]
     Percent {
         /// What was asked for.
         percent: u8,
     },
     /// The fallback is outside [`WATCHED_MINIMUM`] to [`WATCHED_FALLBACK_MAX`].
-    #[error(
-        "a fallback of {fallback:?} is outside {WATCHED_MINIMUM:?} to {WATCHED_FALLBACK_MAX:?}"
-    )]
+    #[error("fallback of {fallback:?} is outside {WATCHED_MINIMUM:?} to {WATCHED_FALLBACK_MAX:?}")]
     Fallback {
         /// What was asked for.
         fallback: Duration,
@@ -1865,6 +1863,24 @@ mod tests {
         );
         assert!(WatchedPolicy::new(WATCHED_PERCENT, WATCHED_MINIMUM).is_ok());
         assert!(WatchedPolicy::new(WATCHED_PERCENT, WATCHED_FALLBACK_MAX).is_ok());
+    }
+
+    #[test]
+    fn a_policy_that_is_refused_says_what_was_asked_for_and_what_may_be() {
+        let above = WATCHED_FALLBACK_MAX + SECOND;
+
+        assert_eq!(
+            WatchedPolicyError::Percent { percent: 101 }.to_string(),
+            format!(
+                "watched percentage of 101 is outside {WATCHED_PERCENT_MIN} to {WATCHED_PERCENT_MAX}"
+            )
+        );
+        assert_eq!(
+            WatchedPolicyError::Fallback { fallback: above }.to_string(),
+            format!(
+                "fallback of {above:?} is outside {WATCHED_MINIMUM:?} to {WATCHED_FALLBACK_MAX:?}"
+            )
+        );
     }
 
     #[test]
