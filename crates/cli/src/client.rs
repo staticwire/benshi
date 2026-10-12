@@ -89,7 +89,7 @@ impl Daemon {
     /// where the request is not sent within [`DEADLINE`] of the start of the
     /// connection.
     pub async fn ask(&mut self, request: &Request) -> Result<()> {
-        let mut line = serde_json::to_vec(request).context("the request could not be written")?;
+        let mut line = serde_json::to_vec(request).context("request could not be written")?;
         line.push(b'\n');
 
         let sent = timeout_at(self.answer_by, async {
@@ -99,7 +99,7 @@ impl Daemon {
         .await
         .map_err(|_elapsed| did_not_answer(&self.socket))?;
 
-        sent.context("the request could not be sent")
+        sent.context("request could not be sent")
     }
 
     /// The next answer, or nothing once the daemon has closed the connection.
@@ -118,14 +118,14 @@ impl Daemon {
             .lines
             .next_line()
             .await
-            .context("the daemon stopped mid-answer")?
+            .context("daemon stopped mid-answer")?
         else {
             return Ok(None);
         };
 
         serde_json::from_str(&line)
             .map(Some)
-            .with_context(|| format!("the daemon sent a line this client cannot read: {line}"))
+            .with_context(|| format!("daemon sent a line this client cannot read: {line}"))
     }
 
     /// The first answer, failing when the daemon closed instead of answering
@@ -164,7 +164,7 @@ const CLOSED_WITHOUT_ANSWERING: &str = "daemon closed connection without answeri
 /// What is said of a daemon that gave no answer by the deadline.
 fn did_not_answer(socket: &Path) -> anyhow::Error {
     anyhow!(
-        "the daemon at {} did not answer within {}",
+        "daemon at {} did not answer within {}",
         socket.display(),
         format_duration(DEADLINE)
     )

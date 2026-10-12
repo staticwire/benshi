@@ -32,7 +32,7 @@ const FAILED: Option<i32> = Some(1);
 
 /// What the binary says of a runtime it has one descriptor to start with.
 const NO_RUNTIME: &str =
-    "benshi: the runtime could not be started: Too many open files (os error 24)\n";
+    "benshi: runtime could not be started: Too many open files (os error 24)\n";
 
 /// How long after it serves its socket a daemon with no session bus has said
 /// twice that detection is started again, with as much again to spare: it
