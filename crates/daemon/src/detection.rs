@@ -24,8 +24,8 @@
 //! **What was decided is what gets recorded.** Every admitted reading goes to
 //! a [`Session`] with the decision about it, and what the session answers is
 //! carried out in the store: what was watched of an episode is kept, an
-//! episode watched far enough is recorded, and an episode is closed when the
-//! last player that had it open has left it.
+//! episode watched far enough is recorded, and an episode is closed at the
+//! end of a round that leaves it open in no player.
 //!
 //! **A player has left what it had open when a round hears nothing of it
 //! that says otherwise.** A reading that policy admitted says otherwise. So
@@ -388,11 +388,12 @@ impl<W: PlayerWatcher> Detection<W> {
             }
         }
 
-        // After the readings, so that a player let go here does not close an
-        // episode that another player opened in this round.
+        // After the readings, where the round is over: an episode nobody has
+        // open any more is closed here, and one that another player opened
+        // in this round stays open.
         self.heard.retain(|player| !quiet.contains(player));
         let quiet: Vec<PlayerId> = quiet.into_iter().collect();
-        let effects = self.session.gone(&quiet);
+        let effects = self.session.end_round(&quiet);
         self.carry_out(effects).await?;
 
         self.seen.record(sources);
@@ -587,6 +588,7 @@ mod tests {
     const FILM: &str = "A Film";
 
     const THIRD: &str = "/anime/[Group] Show Title - 03 [1080p].mkv";
+    const FOURTH: &str = "/anime/[Group] Show Title - 04 [1080p].mkv";
     const NOT_LISTED: &str = "/anime/[Group] Some Other Show - 03 [1080p].mkv";
 
     /// What [`the_time`] reads, as a store writes it.
@@ -1982,6 +1984,31 @@ mod tests {
         let mpv = a_source("mpv", "mpv");
         let vlc = a_source("vlc", "vlc");
         let handed_over = a_round_of(&[&vlc], vec![playing(&vlc, THIRD, HALF_AT + 1)]);
+        let mut detection = registered(&database, &mpv, handed_over).await;
+
+        rounds(&mut detection, 1).await;
+
+        assert_eq!(
+            database.kept(SERIES, Some(3)),
+            Some(the_third(STEP * HALF_AT, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_episode_its_player_moves_on_from_as_another_opens_it_stays_open() {
+        // The player that had the episode is read first, and it opens the
+        // next one in the round another player opens this one in. Nobody is
+        // let go, and the total of the episode is where it was.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let vlc = a_source("vlc", "vlc");
+        let handed_over = a_round_of(
+            &[&mpv, &vlc],
+            vec![
+                playing(&mpv, FOURTH, HALF_AT + 1),
+                playing(&vlc, THIRD, HALF_AT + 1),
+            ],
+        );
         let mut detection = registered(&database, &mpv, handed_over).await;
 
         rounds(&mut detection, 1).await;

@@ -81,9 +81,15 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
                 Effect::Resume { question, .. } => session.resumed(question, None),
                 Effect::Keep { watched, .. } => kept.push(watched),
                 Effect::Record { .. } => recorded += 1,
-                Effect::Close { .. } => panic!("the recording plays one file to its end"),
+                Effect::Close { .. } => panic!("no reading closes a sitting"),
             }
         }
+        // One player, so each reading is a round.
+        let closed = session.end_round(&[]);
+        assert!(
+            closed.is_empty(),
+            "the recording plays one file to its end: {closed:?}"
+        );
     }
 
     assert_eq!(kept.len(), PLAYING_INTERVALS);
