@@ -429,6 +429,7 @@ mod tests {
     use benshi_daemon::protocol::Response;
     use benshi_daemon::recognition::{Decided, Decision, Recogniser};
     use benshi_daemon::supervisor::TaskError;
+    use socket2::{Domain, SockAddr, Socket, Type};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -826,8 +827,16 @@ mod tests {
     /// and nothing more. The daemon never answers so; the client is written
     /// for the protocol, and this is what holds it to that.
     fn a_daemon_that_answers_with(answer: &Response) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let mut line = serde_json::to_vec(answer).expect("serialise");
+        line.push(b'\n');
+
+        a_daemon_that_writes(line)
+    }
+
+    /// A socket served by something that answers every request with `line`,
+    /// byte for byte.
+    fn a_daemon_that_writes(line: Vec<u8>) -> (TempDir, PathBuf, JoinHandle<()>) {
         let (home, socket, listener) = a_socket_bound_and_not_served();
-        let line = serde_json::to_string(answer).expect("serialise");
         let answering = tokio::spawn(async move {
             loop {
                 let (stream, _peer) = listener.accept().await.expect("a client arrived");
@@ -836,11 +845,7 @@ mod tests {
                     let (reader, mut writer) = tokio::io::split(stream);
                     let mut requests = BufReader::new(reader).lines();
                     while let Ok(Some(_request)) = requests.next_line().await {
-                        if writer
-                            .write_all(format!("{line}\n").as_bytes())
-                            .await
-                            .is_err()
-                        {
+                        if writer.write_all(&line).await.is_err() {
                             break;
                         }
                     }
@@ -1263,6 +1268,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_command_says_that_a_daemon_with_no_room_is_not_accepting() {
+        // The connections made to a socket nobody accepts on fill its
+        // backlog. The client's connect does not block, so where the backlog
+        // has no room it is answered at once that there is none. Something
+        // listens there, and a client that said there was no daemon would
+        // send the user to start a second one. A backlog of 0 takes one
+        // connection on Linux, and the one made here fills it.
+        let (_home, socket) = nowhere();
+        std::fs::create_dir(socket.parent().expect("the socket is in a directory"))
+            .expect("a directory for the socket");
+        let full = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a socket");
+        full.bind(&SockAddr::unix(&socket).expect("an address"))
+            .expect("the socket binds");
+        full.listen(0).expect("the socket listens");
+        let queued =
+            std::os::unix::net::UnixStream::connect(&socket).expect("one connection is queued");
+        // What the socket answers a connect that does not block, which is
+        // the cause the client's line ends with.
+        let probe = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a socket");
+        probe
+            .set_nonblocking(true)
+            .expect("a socket that does not block");
+        let no_room = probe
+            .connect(&SockAddr::unix(&socket).expect("an address"))
+            .expect_err("the backlog has no room");
+
+        for command in every_command(&socket) {
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client waited for room");
+
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without a connection");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert_eq!(
+                complained,
+                format!(
+                    "benshi: daemon at {} is not accepting connections: {no_room}\n",
+                    socket.display()
+                )
+            );
+        }
+
+        assert!(
+            !socket.with_file_name("trace.jsonl").exists(),
+            "left a trace of a recording never taken"
+        );
+        drop(queued);
+        drop(full);
+    }
+
+    #[tokio::test]
+    async fn every_command_says_that_a_socket_nobody_listens_on_has_no_daemon() {
+        // A daemon that is killed leaves its socket behind, and a connect to
+        // it is refused. Nothing holds that socket, which is what tells it
+        // from one whose backlog has no room.
+        let (_home, socket, listener) = a_socket_bound_and_not_served();
+        drop(listener);
+
+        for command in every_command(&socket) {
+            let (outcome, shown, complained) = go(command, &socket).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without a daemon");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert!(
+                complained.starts_with(&format!("benshi: no daemon at {}: ", socket.display())),
+                "got {complained:?}"
+            );
+            assert!(
+                complained.contains("refused"),
+                "said without what the socket said: {complained:?}"
+            );
+        }
+    }
+
+    /// What a client says of a daemon that closed the connection before it
+    /// answered, without the end of the line.
+    const CLOSED_WITHOUT_ANSWERING: &str = "benshi: daemon closed connection without answering";
+
+    /// A socket served by something that takes a connection, waits for the
+    /// request to arrive and closes without answering it. Where the request
+    /// is left unread the client's end is reset; where it is read, the client
+    /// reads the end of the connection.
+    fn a_daemon_that_hangs_up(having_read: bool) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let hanging_up = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("a client arrived");
+                stream.readable().await.expect("the request arrived");
+                if having_read {
+                    let mut request = String::new();
+                    BufReader::new(stream)
+                        .read_line(&mut request)
+                        .await
+                        .expect("the request is read");
+                }
+            }
+        });
+
+        (home, socket, hanging_up)
+    }
+
+    #[tokio::test]
+    async fn every_command_says_that_a_daemon_which_closed_unread_did_not_answer() {
+        // No answer had begun, so the reset is not said as a daemon that
+        // stopped in the middle of one. What the client says ends with the
+        // reset itself.
+        let (_home, socket, hanging_up) = a_daemon_that_hangs_up(false);
+        // What a read says of a connection closed with something unread.
+        let (mut asking, closing) =
+            std::os::unix::net::UnixStream::pair().expect("a pair of sockets");
+        asking.write_all(b"unread").expect("the pair takes a write");
+        drop(closing);
+        let reset = std::io::Read::read(&mut asking, &mut [0]).expect_err("the end is reset");
+
+        for command in every_command(&socket) {
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert_eq!(complained, format!("{CLOSED_WITHOUT_ANSWERING}: {reset}\n"));
+        }
+
+        assert!(
+            !socket.with_file_name("trace.jsonl").exists(),
+            "left a trace of a recording never taken"
+        );
+        hanging_up.abort();
+    }
+
+    #[tokio::test]
+    async fn every_command_says_that_a_daemon_which_read_and_closed_did_not_answer() {
+        let (_home, socket, hanging_up) = a_daemon_that_hangs_up(true);
+
+        for command in every_command(&socket) {
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+
+            assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
+            assert!(shown.is_empty(), "printed an answer it never got: {shown}");
+            assert_eq!(complained, format!("{CLOSED_WITHOUT_ANSWERING}\n"));
+        }
+
+        assert!(
+            !socket.with_file_name("trace.jsonl").exists(),
+            "left a trace of a recording never taken"
+        );
+        hanging_up.abort();
+    }
+
+    #[tokio::test]
+    async fn a_request_the_daemon_closes_on_half_sent_says_that_it_was_not_sent() {
+        // A request longer than the socket's send buffer is still being sent
+        // when the daemon closes, and it is the send that fails.
+        let (_home, socket, hanging_up) = a_daemon_that_hangs_up(false);
+        let long = Command::Policy {
+            app: "\"".repeat(200_000),
+            policy: super::PolicyArgument::Deny,
+        };
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(long, &socket))
+            .await
+            .expect("the client ended");
+        hanging_up.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert!(
+            complained.starts_with("benshi: the request could not be sent: "),
+            "got {complained:?}"
+        );
+        assert!(
+            complained.contains("os error"),
+            "said without what the socket said: {complained:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_text_is_a_failure_that_names_it() {
+        // Only a reset is said as a daemon that closed the connection. A
+        // first read that fails another way is said as it was.
+        let (_home, socket, answering) = a_daemon_that_writes(vec![0xff, b'\n']);
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Sources, &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert!(
+            complained.starts_with("benshi: the daemon stopped mid-answer: "),
+            "got {complained:?}"
+        );
+        assert!(complained.contains("UTF-8"), "got {complained:?}");
+    }
+
+    #[tokio::test]
     async fn a_recording_is_a_trace_the_format_can_read() {
         // A recorder that assembled its own lines would write a file only it
         // could read, and nothing would say so until a replay was attempted
@@ -1523,10 +1728,7 @@ mod tests {
     async fn a_recording_that_cannot_reach_a_daemon_leaves_no_file_behind() {
         // `carry_out` connects before it runs any command, so a socket with
         // nothing behind it fails before `record` is reached and leaves no
-        // empty file. That is the ordering this holds; the one inside `record`
-        // would need a daemon that went away partway through the three steps
-        // before the file is made - connect, subscribe, ask for the listing -
-        // which a test cannot stage.
+        // empty file.
         let (home, socket) = nowhere();
         let output = home.path().join("trace.jsonl");
 

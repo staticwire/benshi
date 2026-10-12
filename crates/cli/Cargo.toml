@@ -23,5 +23,6 @@ workspace = true
 [dev-dependencies]
 benshi-detect = { path = "../detect" }
 benshi-store = { path = "../store" }
+socket2 = "0.6.5"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
