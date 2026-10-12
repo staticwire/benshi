@@ -14,14 +14,42 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::task::Poll;
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use benshi_cli::Cli;
 #[cfg(target_os = "linux")]
 use benshi_daemon::voice::Voice;
 use clap::Parser;
+#[cfg(target_os = "linux")]
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 /// The flag that asks for a daemon without a tray icon.
 const NO_TRAY: &str = "--no-tray";
+
+/// How long the process waits to end, at the most, once `serve` has
+/// returned: at a signal, or over a failure.
+///
+/// It waits for a call into the store that is under way, and for its voice
+/// to write what it holds, which waits for whoever reads. Where nobody does
+/// it would end only when it was killed, since no signal that stops the
+/// daemon ends the process by itself once it is taken. What is still under
+/// way when the time is up is cut.
+#[cfg(target_os = "linux")]
+const LAST_WORDS: Duration = Duration::from_secs(5);
+
+/// The code a daemon ends with that a signal stopped.
+#[cfg(target_os = "linux")]
+const STOPPED: u8 = 0;
+
+/// The code a daemon ends with that could not start, or that has no task
+/// left running.
+#[cfg(target_os = "linux")]
+const FAILED: u8 = 1;
 
 /// What one invocation of this binary is for.
 ///
@@ -77,6 +105,99 @@ fn main() -> ExitCode {
     }
 }
 
+/// The signals that stop the daemon, each with the name it is said under.
+#[cfg(target_os = "linux")]
+const STOPS: &[(SignalKind, &str)] = &[
+    (SignalKind::terminate(), "SIGTERM"),
+    (SignalKind::interrupt(), "SIGINT"),
+    (SignalKind::hangup(), "SIGHUP"),
+];
+
+/// Where the system says which signals this process ignores.
+#[cfg(target_os = "linux")]
+const STATUS: &str = "/proc/self/status";
+
+/// The signals this process ignores: bit `n - 1` is set for signal `n`.
+///
+/// Read from procfs: the standard library has no call for it.
+#[cfg(target_os = "linux")]
+fn ignored() -> io::Result<u64> {
+    ignored_in(&std::fs::read_to_string(STATUS)?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no SigIgn line in it"))
+}
+
+/// The mask in the `SigIgn` line of a `status` of procfs.
+#[cfg(target_os = "linux")]
+fn ignored_in(status: &str) -> Option<u64> {
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))?;
+
+    u64::from_str_radix(mask.trim(), 16).ok()
+}
+
+/// The signals among [`STOPS`] that stop a daemon started with `ignored`.
+#[cfg(target_os = "linux")]
+fn stopping(ignored: u64) -> impl Iterator<Item = (SignalKind, &'static str)> {
+    STOPS
+        .iter()
+        .copied()
+        .filter(move |(kind, _name)| ignored & (1 << (kind.as_raw_value() - 1)) == 0)
+}
+
+/// The signals that stop this daemon, as they are waited for.
+#[cfg(target_os = "linux")]
+struct Stops(Vec<(Signal, &'static str)>);
+
+#[cfg(target_os = "linux")]
+impl Stops {
+    /// Takes from here on each signal of [`STOPS`] that `ignored` does not
+    /// hold. One that is sent before it is waited for is kept until it is.
+    ///
+    /// A signal that was ignored as the daemon started stays ignored: `nohup`
+    /// starts a process that way, and so does a shell script that runs a job
+    /// in the background.
+    ///
+    /// None of those taken ends the process by itself after this, for as
+    /// long as the process runs: the handler tokio installs stays in place
+    /// once every `Signal` has gone.
+    fn taken(ignored: u64) -> io::Result<Self> {
+        stopping(ignored)
+            .map(|(kind, name)| Ok((signal(kind)?, name)))
+            .collect::<io::Result<_>>()
+            .map(Self)
+    }
+
+    /// The name of the first of them to come.
+    async fn first(&mut self) -> &'static str {
+        std::future::poll_fn(|context| {
+            for (signal, name) in &mut self.0 {
+                if signal.poll_recv(context).is_ready() {
+                    return Poll::Ready(*name);
+                }
+            }
+
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+/// Ends the process with `code` once `patience` has passed, whatever it
+/// waits for by then.
+#[cfg(target_os = "linux")]
+fn gives_up_after(patience: Duration, code: u8) {
+    let giving_up = thread::Builder::new()
+        .name("last words".to_owned())
+        .spawn(move || {
+            thread::sleep(patience);
+            std::process::exit(i32::from(code));
+        });
+    // Where the thread cannot be started the process ends once everything
+    // it waits for has come.
+    drop(giving_up);
+}
+
 /// Run the daemon, and hand this thread to the runtime.
 ///
 /// The runtime is built rather than declared with an attribute, because the
@@ -124,13 +245,19 @@ fn daemon(tray: bool) -> ExitCode {
         }
     };
 
-    runtime.block_on(serve(&voice))
+    let ended = runtime.block_on(serve(&voice));
+    // The runtime goes next and the voice after it, and each waits: one for
+    // a call into the store that is under way, the other for whoever reads.
+    gives_up_after(LAST_WORDS, ended);
+
+    ExitCode::from(ended)
 }
 
-/// Bind the socket, open the database, supervise the daemon's tasks, and
-/// report what stopped them.
+/// Bind the socket, open the database and supervise the daemon's tasks, until
+/// every one of them has stopped or a signal stops the daemon. The answer is
+/// the code the process ends with.
 #[cfg(target_os = "linux")]
-async fn serve(voice: &Arc<Voice>) -> ExitCode {
+async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
@@ -140,6 +267,31 @@ async fn serve(voice: &Arc<Voice>) -> ExitCode {
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
     use benshi_store::Store;
 
+    // Read ahead of the first signal that is taken: one that is taken is
+    // ignored no longer.
+    let ignored = match ignored() {
+        Ok(ignored) => ignored,
+        Err(untold) => {
+            voice.say(format_args!(
+                "{STATUS} does not say which signals are ignored, so none is waited for: {untold}"
+            ));
+            // As though every signal were ignored, so that none is taken and
+            // one that is ignored stays so.
+            u64::MAX
+        }
+    };
+    // Taken ahead of the socket and the database, so that a signal sent
+    // while one is bound and the other opened stops the daemon once its
+    // tasks run. A signal sent ahead of this, while the runtime is built, is
+    // the system's to deal with, and where it ends the daemon nothing says
+    // so.
+    let mut stops = match Stops::taken(ignored) {
+        Ok(stops) => stops,
+        Err(untaken) => {
+            voice.say(format_args!("cannot wait for a signal: {untaken}"));
+            return FAILED;
+        }
+    };
     let socket = benshi_daemon::ipc::socket_path();
     // The XDG Base Directory Specification asks for a warning where the
     // runtime directory is replaced.
@@ -157,14 +309,14 @@ async fn serve(voice: &Arc<Voice>) -> ExitCode {
                 "{} cannot be used: {unbound}",
                 socket.display()
             ));
-            return ExitCode::FAILURE;
+            return FAILED;
         }
     };
     let database = match directory(Role::Data) {
         Ok(data) => data.join(DATABASE),
         Err(nowhere) => {
             voice.say(format_args!("{nowhere}"));
-            return ExitCode::FAILURE;
+            return FAILED;
         }
     };
     let store = match Store::open(&database) {
@@ -174,7 +326,7 @@ async fn serve(voice: &Arc<Voice>) -> ExitCode {
                 "{} cannot be used: {unopened}",
                 database.display()
             ));
-            return ExitCode::FAILURE;
+            return FAILED;
         }
     };
     voice.say(format_args!("listening on {}", socket.display()));
@@ -182,7 +334,7 @@ async fn serve(voice: &Arc<Voice>) -> ExitCode {
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
-    benshi_daemon::run(
+    let running = benshi_daemon::run(
         || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
         listener,
         // No list to match a name against, so every file is refused and
@@ -199,13 +351,24 @@ async fn serve(voice: &Arc<Voice>) -> ExitCode {
             let voice = Arc::clone(voice);
             move |notice| voice.say(format_args!("{notice}"))
         },
-    )
-    .await;
+    );
+    let signal = tokio::select! {
+        _records = running => {
+            // Reached only when nothing is left running, which for a daemon
+            // is a failure however tidily each task arrived at it. What
+            // stopped each task was said as it stopped.
+            return FAILED;
+        }
+        signal = stops.first() => signal,
+    };
 
-    // Reached only when nothing is left running, which for a daemon is a
-    // failure however tidily each task arrived at it. What stopped each
-    // task was said as it stopped.
-    ExitCode::FAILURE
+    // The supervisor went with `running`, and its `JoinSet` aborts every
+    // task as it is dropped. A task that is aborted ends at an await: the
+    // one it waits at, or the next it reaches. The runtime waits for that
+    // as it is dropped, and for a call into the store that is under way.
+    voice.say(format_args!("stopped by {signal}"));
+
+    STOPPED
 }
 
 /// There is no adapter for this platform, so there is no daemon to run.
@@ -223,6 +386,42 @@ fn daemon(_tray: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::Invocation;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_signals_a_process_ignores_are_read_from_its_status() {
+        // A `status` as procfs writes one, cut to the lines around the mask.
+        let status = "Threads:\t1\nSigQ:\t0/126428\nSigPnd:\t0000000000000000\n\
+                      ShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\n\
+                      SigIgn:\t0000000000001001\nSigCgt:\t0000000000004002\n";
+
+        assert_eq!(super::ignored_in(status), Some(0x1001));
+        assert_eq!(
+            super::ignored_in("Threads:\t1\nSigCgt:\t0000000000004002\n"),
+            None
+        );
+        assert_eq!(super::ignored_in("SigIgn:\tnot a mask\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_signal_that_was_ignored_is_not_one_that_stops_the_daemon() {
+        let named = |ignored| {
+            super::stopping(ignored)
+                .map(|(_kind, name)| name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(named(0), ["SIGTERM", "SIGINT", "SIGHUP"]);
+        // What `nohup` leaves: signal 1, which is `SIGHUP`.
+        assert_eq!(named(0b1), ["SIGTERM", "SIGINT"]);
+        // Signal 2, which is `SIGINT`, and signal 15, which is `SIGTERM`.
+        assert_eq!(named(0b10), ["SIGTERM", "SIGHUP"]);
+        assert_eq!(named(1 << 14), ["SIGINT", "SIGHUP"]);
+        // `SIGPIPE`, which every Rust program ignores, is none of them.
+        assert_eq!(named(1 << 12), ["SIGTERM", "SIGINT", "SIGHUP"]);
+        assert!(named(u64::MAX).is_empty());
+    }
 
     #[test]
     fn no_arguments_means_run_the_daemon() {

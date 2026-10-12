@@ -54,8 +54,8 @@ pub mod voice;
 /// Run the daemon until every one of its tasks has stopped.
 ///
 /// Built where the socket is, because a daemon with no interface is not one:
-/// nothing could ask it what it had seen, and nothing could stop it short of
-/// killing it. The platform that needs a named pipe instead gains its own.
+/// nothing could ask it what it had seen. The platform that needs a named
+/// pipe instead gains its own.
 ///
 /// Two supervised tasks over state they share: detection, which reads the
 /// platform and publishes what it saw, and the socket, which answers clients

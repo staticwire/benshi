@@ -17,43 +17,20 @@
 mod common;
 
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Write};
-use std::os::fd::OwnedFd;
+use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Daemon, Directory, NO_SOURCE, NO_TRAY, PATIENCE, SUCCEEDED, sources_of};
+use common::{
+    Daemon, Directory, NO_SOURCE, NO_TRAY, PATIENCE, SUCCEEDED, nobody_reads, sources_of,
+};
 
 /// How many times detection has reached for the session bus once it has been
 /// started again twice.
 const AGAIN_TWICE: usize = 3;
-
-/// A stream that is full, and the end of it that nobody reads.
-///
-/// The test keeps that end for as long as the daemon runs: a write to a
-/// stream whose other end has gone fails, where a write to this one waits.
-fn nobody_reads() -> (UnixStream, Stdio) {
-    let (unread, full) = UnixStream::pair().expect("a pair of sockets can be made");
-    // Filled without waiting, and handed over as a stream that waits.
-    full.set_nonblocking(true)
-        .expect("a socket can be kept from waiting");
-    let filling = [b'.'; 4096];
-    loop {
-        match (&full).write(&filling) {
-            Ok(_taken) => {}
-            Err(waits) if waits.kind() == ErrorKind::WouldBlock => break,
-            Err(other) => panic!("the stream could not be filled: {other}"),
-        }
-    }
-    full.set_nonblocking(false)
-        .expect("a socket can be made to wait");
-
-    (unread, OwnedFd::from(full).into())
-}
 
 /// A session bus that lets a connection in and lets go of it, so that an
 /// attempt of detection fails in a way that passes.
