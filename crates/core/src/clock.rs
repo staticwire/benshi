@@ -132,10 +132,15 @@ mod tests {
 
     #[test]
     fn twenty_seconds_of_pause_cost_no_wall_clock_time() {
+        // A clock that waited would take the twenty seconds. The bound is
+        // real time, so it allows for a thread that a busy machine keeps
+        // from running: a second, which is far from the twenty.
         let started = std::time::Instant::now();
         let clock = TestClock::new();
         clock.advance(Duration::from_secs(20));
-        assert!(started.elapsed() < Duration::from_millis(50));
+        let spent = started.elapsed();
+
+        assert!(spent < Duration::from_secs(1), "the clock spent {spent:?}");
     }
 
     #[test]

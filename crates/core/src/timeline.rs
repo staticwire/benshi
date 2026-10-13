@@ -1038,8 +1038,12 @@ mod tests {
         let spent = started.elapsed();
 
         assert!(watched > Duration::ZERO, "the fold counted nothing");
+        // The bound is real time, so it allows for a thread that a busy
+        // machine keeps from running: half a second, which is under the
+        // shortest interval the recording holds, so a fold that waited out
+        // even one of them is over it.
         assert!(
-            spent < Duration::from_millis(50),
+            spent < Duration::from_millis(500),
             "the fold spent {spent:?}"
         );
     }
