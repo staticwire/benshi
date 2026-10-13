@@ -27,7 +27,7 @@ use benshi_detect::replay::ReplayWatcher;
 use benshi_store::Store;
 use tokio::time::timeout;
 
-/// The recording under test, taken on 2026-09-18 from a live session bus.
+/// The recording under test, taken from a live session bus.
 ///
 /// One mpv playing a ten-minute file, paused for twenty seconds and seeked
 /// twenty back. Two other players were open and are declared in its header
@@ -155,9 +155,8 @@ async fn the_fixture_is_worth_replaying() {
             .any(|position| position.subsec_nanos() != 0),
         "every position is a whole second, so the file has been rounded"
     );
-    // The listing is the half a reading cannot carry, and the fixture was taken
-    // with two other players open precisely so that it holds a declared source
-    // with nothing to say.
+    // The listing is the half a reading cannot carry, and the fixture declares
+    // two other players so that it holds a declared source with nothing to say.
     let reading_sources: Vec<&PlayerId> = recorded
         .snapshots
         .iter()

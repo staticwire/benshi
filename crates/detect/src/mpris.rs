@@ -1,10 +1,10 @@
 //! The MPRIS adapter: every media player that publishes itself on the session
 //! bus.
 //!
-//! Confirmed against zbus 5.19.0 before this module was written, because the
-//! surface moves between major versions: the attribute macro is `zbus::proxy`,
-//! a session connection comes from `Connection::session()`, and the bus names
-//! come from `fdo::DBusProxy::list_names()`. The two proxies this module needs,
+//! The surface of zbus moves between major versions. In 5.19.0, which this
+//! module is written against, the attribute macro is `zbus::proxy`, a session
+//! connection comes from `Connection::session()`, and the bus names come from
+//! `fdo::DBusProxy::list_names()`. The two proxies this module needs,
 //! `fdo::DBusProxy` and `fdo::PropertiesProxy`, are supplied by zbus itself and
 //! are used rather than redeclared.
 //!
@@ -72,11 +72,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Half the interval is the largest deadline that keeps a whole round inside
 /// one interval.
 ///
-/// Nothing is given up to get it. Measured on one desktop machine on
-/// 2026-09-16, a listing and a reading across three players cost about ten
-/// milliseconds together over eight calls, so one call costs a little over a
-/// millisecond and this deadline is some four hundred times what a healthy
-/// player needs.
+/// Nothing is given up to get it. On one desktop machine a listing and a
+/// reading across three players cost about ten milliseconds together over
+/// eight calls, so one call costs a little over a millisecond and this deadline
+/// is some four hundred times what a healthy player needs.
 pub const SOURCE_DEADLINE: Duration = Duration::from_millis(500);
 
 // The relationship between the two is why either holds the value it does, so it
@@ -251,7 +250,7 @@ fn micros(properties: &Properties, key: &str) -> Option<i64> {
 /// player holding a filename that is not valid UTF-8 percent-encodes those
 /// bytes into the URL, where they survive exactly; by the time the same name
 /// reaches `xesam:title` it has been through a lossy conversion and is
-/// destroyed. Observed on mpv 0.41.0 with a Shift-JIS filename.
+/// destroyed. mpv 0.41.0 does this to a Shift-JIS filename.
 fn media_from(metadata: &Properties) -> Option<MediaRef> {
     if let Some(url) = non_empty_text(metadata, "xesam:url") {
         return Some(match url.strip_prefix(LOCAL_FILE_SCHEME) {
@@ -622,10 +621,11 @@ mod tests {
 
     #[test]
     fn an_instance_qualifier_is_not_part_of_the_application_name() {
-        // Observed on the live session bus: chromium published
-        // org.mpris.MediaPlayer2.chromium.instance16481, having published
-        // instance30062 two days earlier. The qualifier carries a process id, so
-        // an identity is not stable across restarts and cannot key policy.
+        // Two runs of chromium publish
+        // org.mpris.MediaPlayer2.chromium.instance16481 and
+        // org.mpris.MediaPlayer2.chromium.instance30062. The qualifier carries
+        // a process id, so an identity is not stable across restarts and cannot
+        // key policy.
         assert_eq!(
             app_from_identity(&id("chromium.instance16481")),
             AppName("chromium".to_owned())
@@ -646,12 +646,12 @@ mod tests {
 
     #[test]
     fn an_instance_qualifier_need_not_be_a_number() {
-        // Observed on 2026-09-16 by opening a second mpv: it took the name
+        // mpv publishes names like
         // org.mpris.MediaPlayer2.mpv.instance-mZlVuXZe. The specification's
         // example is a process id, so a rule demanding digits looks right and
-        // would have made this source's application `mpv.instance-mZlVuXZe`,
-        // which the policy table does not name - so a second mpv window would
-        // have been silently denied.
+        // would make this source's application `mpv.instance-mZlVuXZe`, which
+        // the policy table does not name - so such a window would be silently
+        // denied.
         assert_eq!(
             app_from_identity(&id("mpv.instance-mZlVuXZe")),
             AppName("mpv".to_owned())
@@ -737,10 +737,10 @@ mod tests {
 
     #[test]
     fn a_location_is_declared_by_publishing_one_at_all() {
-        // Observed live: mpv publishes xesam:url for everything it opens, and
-        // Chromium and Feishin publish none. A remote address is a location as
-        // much as a path is, so both declare the capability. Reading the scheme
-        // here instead would make the declaration change with the track.
+        // mpv publishes xesam:url for everything it opens, and Chromium and
+        // Feishin publish none. A remote address is a location as much as a
+        // path is, so both declare the capability. Reading the scheme here
+        // instead would make the declaration change with the track.
         let local = properties(vec![(
             "xesam:url",
             a_string("file:///anime/show%20-%2003.mkv"),
@@ -830,10 +830,10 @@ mod tests {
 
     #[test]
     fn a_position_of_zero_is_the_start_of_a_file_and_not_an_absence() {
-        // Observed on mpv 0.41.0 paused at the beginning: Position is x 0. Zero
-        // is a reading. Treating it as absence would leave the opening of every
-        // file unobserved, and it is why position and length are guarded
-        // differently rather than by one rule.
+        // mpv 0.41.0 paused at the beginning reports Position as x 0. Zero is a
+        // reading. Treating it as absence would leave the opening of every file
+        // unobserved, and it is why position and length are guarded differently
+        // rather than by one rule.
         let player = properties(vec![("Position", OwnedValue::from(0_i64))]);
 
         assert_eq!(position_of(&player, true), Known::Value(Duration::ZERO));
@@ -919,9 +919,9 @@ mod tests {
 
     #[test]
     fn a_shift_jis_filename_survives_percent_decoding_byte_for_byte() {
-        // Taken from mpv 0.41.0 on 2026-09-16, which published this URL for a
-        // file whose name is not valid UTF-8. The same name in xesam:title came
-        // back as U+FFFD replacement characters.
+        // The URL mpv 0.41.0 publishes for a file whose name is not valid
+        // UTF-8. The same name in xesam:title comes back as U+FFFD replacement
+        // characters.
         let decoded = percent_decode("/anime/%83%5C%83%8C%83b%83%5E%20-%2003.oga");
 
         assert_eq!(
@@ -962,8 +962,9 @@ mod tests {
 
     #[test]
     fn a_url_of_another_scheme_becomes_a_remote_reference() {
-        // Observed on mpv 0.41.0 opened on an HTTP address. The address is what
-        // recognition would work from, so it is carried rather than discarded.
+        // mpv 0.41.0 opened on an HTTP address publishes that address as
+        // xesam:url. The address is what recognition would work from, so it is
+        // carried rather than discarded.
         let address = "http://127.0.0.1:34715/remote-episode.oga";
         let metadata = properties(vec![("xesam:url", a_string(address))]);
 

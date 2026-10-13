@@ -38,8 +38,7 @@ pub use benshi_core::SourceInfo;
 /// [`PollOutcome::failures`] as a pair, and `BusEvent::SourceFailed` carries
 /// the player and the reason as two fields so that a client can lay them out.
 /// A message that named the source as well would print it twice on the one
-/// line a person reads, which is what `benshi watch` did until three suspended
-/// players on a real session bus showed it:
+/// line a person reads:
 ///
 /// ```text
 /// mpv.instance-X  failed: PlayerId("mpv.instance-X") did not answer within 500ms
