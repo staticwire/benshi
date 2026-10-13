@@ -113,10 +113,10 @@ impl Platform {
     /// How many watchers have been built so far.
     ///
     /// Counted where the body is called, which is when a restart is scheduled
-    /// rather than when the attempt runs. Measured: waiting on this to decide
-    /// that an attempt has *finished* is what made the first version of
+    /// rather than when the attempt runs. Waiting on this to decide that an
+    /// attempt has *finished* would let
     /// `detection_giving_up_for_good_leaves_the_socket_answering` pass a daemon
-    /// whose two loops were one task.
+    /// whose two loops are one task.
     fn watchers(&self) -> usize {
         self.built.load(Ordering::SeqCst)
     }

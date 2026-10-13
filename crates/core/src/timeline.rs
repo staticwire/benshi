@@ -67,10 +67,10 @@ pub struct Progress {
 /// 1.890852 ms from the elapsed time. That is the best case of one player and
 /// the threshold is not set from it.
 ///
-/// **The jump an arrow key makes is the ceiling.** Read on 2026-09-18 out of
-/// the defaults each player ships: a bare arrow moves mpv five seconds, and VLC
-/// does not seek on a bare arrow at all, its smallest arrow-key jump being
-/// three seconds on shift. Anything below three seconds catches both.
+/// **The jump an arrow key makes is the ceiling.** In the defaults mpv 0.41.0
+/// and VLC 3.0 ship, a bare arrow moves mpv five seconds, and VLC does not seek
+/// on a bare arrow at all, its smallest arrow-key jump being three seconds on
+/// shift. Anything below three seconds catches both.
 ///
 /// Smaller deliberate seeks exist and this number does not claim to catch them.
 /// mpv binds shift and an arrow to an exact one second step, and catching that
@@ -93,13 +93,12 @@ pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 ///
 /// **What produces one today is a source that stops answering**, since a round
 /// that times out publishes no reading at all. The two other explanations that
-/// come to mind are both wrong here, and are written down so that nobody
-/// reaches for them twice. A machine suspended to memory produces no gap,
-/// because [`Instant`](std::time::Instant) reads `CLOCK_MONOTONIC` on Linux and
-/// that clock does not count suspended time. A restarted daemon produces none
-/// either, because a timeline that begins has no earlier reading at all,
-/// whether or not it resumes a total, and its first one is a first reading
-/// rather than the far end of a gap.
+/// come to mind are both wrong here. A machine suspended to memory produces no
+/// gap, because [`Instant`](std::time::Instant) reads `CLOCK_MONOTONIC` on
+/// Linux and that clock does not count suspended time. A restarted daemon
+/// produces none either, because a timeline that begins has no earlier reading
+/// at all, whether or not it resumes a total, and its first one is a first
+/// reading rather than the far end of a gap.
 ///
 /// **A gap is discarded even when the position resumes exactly where playing
 /// through it would have left it**, and that is the point rather than a
@@ -177,11 +176,11 @@ pub const WATCHED_PERCENT_MAX: u8 = 80;
 /// and the percentage alone cannot tell the two apart. One minute can.
 ///
 /// **It never demands more than [`WATCHED_PERCENT_MAX`] of the media itself**,
-/// and that cap is not a nicety. Checked against MyAnimeList on 2026-09-19:
-/// `Jigazou` runs twelve seconds, `Sora Iro no Tane` thirty and
-/// `Doubutsu Sumo Taikai` fifty-two, so media shorter than this minimum exists
-/// and is catalogued. Without the cap, playing one of those through would not
-/// register it, and nothing would say why.
+/// and that cap is not a nicety. MyAnimeList lists `Jigazou` at twelve seconds,
+/// `Sora Iro no Tane` at thirty and `Doubutsu Sumo Taikai` at fifty-two, so
+/// media shorter than this minimum exists and is catalogued. Without the cap,
+/// playing one of those through would not register it, and nothing would say
+/// why.
 ///
 /// Below a handful of seconds the poll cadence decides rather than this number:
 /// the first reading arrives a poll into playback, so a file of a few seconds
@@ -658,9 +657,8 @@ mod tests {
     /// playing and 20 are a single pause, and one backward seek near the end.
     const RECORDING: &str = include_str!("../tests/fixtures/mpv-one-episode.jsonl");
 
-    // What the recording holds, measured from it on 2026-09-18. One note for
-    // every constant below, so not a doc comment on the first of them. It said
-    // "all three" until there were five, which is what a count in prose does.
+    // What the recording holds, measured from it. One note for every constant
+    // below, so not a doc comment on the first of them.
     //
     // The readings are a second apart but not exactly: the shortest interval
     // is 998.109148 ms and the longest 1002.104074 ms, so a test that assumes
@@ -669,8 +667,8 @@ mod tests {
     // and span 39.001189719 s together, while 20 begin paused and span
     // 19.998711057 s; the two add up to the 58.999900776 s it covers.
     //
-    // Nanoseconds and not microseconds, because the first measurement of this
-    // divided them away and the total below was wrong by 719 of them.
+    // Nanoseconds and not microseconds: the recording stamps a reading to the
+    // nanosecond, and microseconds would drop 719 of them from the total below.
     const PLAYING_INTERVALS: usize = 39;
     const PAUSED_INTERVALS: usize = 20;
     const WATCHED_IN_FULL: Duration = Duration::from_nanos(39_001_189_719);
@@ -1383,9 +1381,9 @@ mod tests {
     ///
     /// A plain loop, because folding with a side effect through an iterator
     /// chain is a trap: `.map(..).next_back()` reads as "the last answer" and
-    /// advances the timeline exactly once, over the last reading. It was
-    /// written that way first and the total came out zero. This helper is
-    /// where the chain is most tempting, so the warning belongs here.
+    /// advances the timeline exactly once, over the last reading, so the total
+    /// comes out zero. This helper is where the chain is most tempting, so the
+    /// warning belongs here.
     fn progress_over(run: &[PlayerSnapshot]) -> Progress {
         let mut timeline = Timeline::new();
         let mut progress = None;
@@ -1808,10 +1806,10 @@ mod tests {
 
     #[test]
     fn the_minimum_never_asks_more_of_a_file_than_the_largest_setting_would() {
-        // Media shorter than the minimum itself exists and is catalogued: read
-        // off MyAnimeList on 2026-09-19, `Jigazou` runs twelve seconds. Without
-        // the cap its threshold would be a minute, five times the file, and it
-        // could never be registered at all while nothing said why.
+        // Media shorter than the minimum itself exists and is catalogued:
+        // MyAnimeList lists `Jigazou` at twelve seconds. Without the cap its
+        // threshold would be a minute, five times the file, and it could never
+        // be registered at all while nothing said why.
         //
         // Twelve seconds, so the cap decides and the percentage does not: four
         // fifths of the file is 9.6 s, and the default half of it is 6 s.

@@ -40,7 +40,7 @@ use crate::AppName;
 /// name here carries punctuation: the one measurement there is says
 /// punctuation does not survive.
 const VIDEO_PLAYERS: &[&str] = &[
-    // Measured on this machine, 2026-09-17.
+    // Measured.
     "mpv",
     "vlc",
     // Written as it is published rather than lowercased on the way in, so
@@ -105,10 +105,8 @@ impl Policy {
 
 /// The policy in force for each application.
 ///
-/// Keys are compared whole and without regard to case. The predecessor matched
-/// a regular expression against bus names, compiled without `IGNORECASE`, and
-/// of its four default players exactly one matched - by luck. A whole-name
-/// comparison cannot half-match, which is the entire point.
+/// Keys are compared whole and without regard to case. A whole-name comparison
+/// cannot half-match, which is the entire point.
 #[derive(Debug, Clone)]
 pub struct PolicyTable {
     entries: BTreeMap<String, Policy>,
@@ -180,11 +178,11 @@ mod tests {
     #[test]
     fn a_player_is_allowed_however_it_capitalises_its_own_name() {
         // Not hypothetical, and the reason the list holds published names
-        // rather than commands. Read out of the shipped binary on 2026-09-17,
-        // mpc-qt registers org.mpris.MediaPlayer2.MpcQt - neither the command
-        // a user types nor the spelling written in the list. A lookup
-        // lowercases, which is the only reason the published name and the
-        // entry meet; the command spelling never does, hyphen and all.
+        // rather than commands. mpc-qt registers
+        // org.mpris.MediaPlayer2.MpcQt, which is not the command a user types.
+        // The constructor and a lookup both lowercase, so the published name
+        // and the entry meet however either is capitalised; the command
+        // spelling never does, hyphen and all.
         let table = PolicyTable::allowing_video_players();
 
         assert_eq!(table.policy_for(&app("MpcQt")), Policy::Auto);
@@ -216,8 +214,7 @@ mod tests {
         // carries this: written as the player publishes it, it is filed by a
         // constructor that lowercases and found by a lookup that lowercases,
         // and dropping either would file it under a key nothing ever asks for.
-        // Measured by removing the constructor's `to_lowercase`, which fails
-        // this and nothing else.
+        // Without the constructor's `to_lowercase` this test fails.
         let table = PolicyTable::allowing_video_players();
 
         for name in VIDEO_PLAYERS {
@@ -227,12 +224,11 @@ mod tests {
 
     #[test]
     fn an_instance_qualified_source_is_answered_by_its_application_name() {
-        // Observed on the live session bus: chromium published
-        // org.mpris.MediaPlayer2.chromium.instance30062 on 2026-09-14, mpv
-        // org.mpris.MediaPlayer2.mpv unqualified on 2026-09-17. Policy is
-        // keyed on the application the adapter declares, never on the unique
-        // identity - otherwise a second window of an allowed player would be
-        // answered as an unknown one.
+        // A bus name can carry an instance qualifier, as in
+        // org.mpris.MediaPlayer2.chromium.instance30062. Policy is keyed on the
+        // application the adapter declares, never on the unique identity -
+        // otherwise a second window of an allowed player would be answered as
+        // an unknown one.
         let table = PolicyTable::allowing_video_players();
 
         assert_eq!(table.policy_for(&app("mpv")), Policy::Auto);
@@ -254,10 +250,9 @@ mod tests {
 
     #[test]
     fn an_application_name_is_matched_whole_and_case_insensitively() {
-        // The predecessor matched a regular expression against bus names, and
-        // a whole-name comparison replaced it. This is the test that holds it
-        // there. A loose comparison now admits a stranger rather than
-        // silencing a player: the quieter failure, and the worse one.
+        // A name is compared whole, and this is the test that holds it there.
+        // A loose comparison admits a stranger rather than silencing a player:
+        // the quieter failure, and the worse one.
         let table = PolicyTable::allowing_video_players();
 
         assert_eq!(table.policy_for(&app("MPV")), Policy::Auto);

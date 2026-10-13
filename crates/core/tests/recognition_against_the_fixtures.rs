@@ -21,13 +21,6 @@
 //! A score is never pinned. A fixture carrying one would break on every change
 //! to the arithmetic while holding no rule of its own; whether the best
 //! candidate was scored at all is the fact a refusal is checked for.
-//!
-//! What this file does **not** do is catch something alone, and that was
-//! measured rather than assumed. Of the 147 breaks in the list that proves the
-//! recognition tests can fail, 69 redden the test here, and every one of those
-//! reddens a module test as well. That is a fact about the breaks the list
-//! holds and not a reason to drop the file; a break that reaches only here is
-//! the thing to write when one is wanted.
 
 use benshi_core::path::RawPath;
 use benshi_core::recognise::altname::Altnames;

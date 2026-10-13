@@ -14,13 +14,6 @@
 //! single rule can be checked for. The other four have twins in the module and
 //! are here because they arrive through the public API instead.
 //!
-//! What this file does **not** currently do is catch something alone, and that
-//! was measured rather than assumed. Of the fifty-two breaks in the list that
-//! proves these tests can fail, sixteen redden a test here and every one of
-//! those reddens a test in the module as well. That is a fact about today's
-//! breaks and not a reason to drop the file; a break that reaches only here is
-//! the thing to write when one is wanted.
-//!
 //! The recording is sixty readings of one mpv playing one episode: a pause of
 //! twenty seconds, one backward seek, and no dishonesty anywhere. It holds
 //! thirty-nine seconds of playback against a file of six hundred, which no
@@ -38,9 +31,8 @@ use benshi_core::{Known, PlayerSnapshot};
 
 const RECORDING: &str = include_str!("fixtures/mpv-one-episode.jsonl");
 
-// What the recording holds. The watched time was measured from it on
-// 2026-09-18 in whole nanoseconds, because an earlier measurement divided them
-// away and came out 719 of them wrong; the other two are counts. Restated here
+// What the recording holds. The watched time is in whole nanoseconds, because
+// microseconds would drop 719 of them; the other two are counts. Restated here
 // rather than shared with the module's own tests, which cannot export a
 // `#[cfg(test)]` constant across a crate boundary, and two literals that have to
 // agree is the cost of reaching the crate from outside.
