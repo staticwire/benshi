@@ -143,10 +143,54 @@ pub struct Run {
 /// Runs the binary until it ends, hearing what it answers and what it says
 /// where the command left that to be heard.
 pub fn run(mut binary: Command) -> Run {
-    let mut running = binary
+    let running = binary
         .stdout(Stdio::piped())
         .spawn()
         .expect("the binary runs");
+
+    ends(running)
+}
+
+/// A `watch` of the daemon at `socket`, started and left running, which is
+/// heard once it has ended.
+// Dead in a test binary that watches no daemon.
+#[allow(dead_code)]
+pub fn watching(socket: &Path) -> Child {
+    the_binary(
+        &[
+            OsStr::new("watch"),
+            OsStr::new("--socket"),
+            socket.as_os_str(),
+        ],
+        &[],
+        Descriptors::Plenty,
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("the binary runs")
+}
+
+/// Whether the daemon at `socket` has accepted a connection.
+///
+/// Read from `/proc/net/unix`, which lists every connection to a socket
+/// under the socket's path: the listener with its state `01`, a connection
+/// waiting in the backlog with `02`, and one that was accepted with `03`.
+// Dead in a test binary that connects no client of its own.
+#[allow(dead_code)]
+pub fn has_a_connection(socket: &Path) -> bool {
+    let path = socket.to_str().expect("the socket's path is text");
+    let listed = std::fs::read_to_string("/proc/net/unix").expect("`/proc/net/unix` can be read");
+
+    listed.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(5) == Some(&"03") && fields.last() == Some(&path)
+    })
+}
+
+/// Waits for `running` until it ends, hearing what it answered and what it
+/// said where the command left that to be heard.
+pub fn ends(mut running: Child) -> Run {
     let ended = ends_within(&mut running, PATIENCE);
     if ended.is_none() {
         // Neither is worth a panic: the code that is missing says that the

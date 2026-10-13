@@ -15,9 +15,13 @@
 mod common;
 
 use std::ffi::OsStr;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Daemon, Directory, NO_TRAY, SUCCEEDED, nobody_reads, sources_of};
+use common::{
+    Daemon, Directory, NO_TRAY, PATIENCE, SUCCEEDED, ends, has_a_connection, nobody_reads,
+    sources_of, watching,
+};
 
 /// How a process ends on Linux whose `main` answered `ExitCode::FAILURE`.
 const FAILED: Option<i32> = Some(1);
@@ -72,6 +76,56 @@ fn a_daemon_sent_a_signal_says_what_stopped_it_and_ends_as_a_success() {
             Some(format!("benshi: stopped by SIG{signal}").as_str())
         );
     }
+}
+
+#[test]
+fn a_client_watching_a_daemon_that_is_stopped_says_so_and_fails() {
+    // The signal is sent once the daemon has accepted the client. By then
+    // the client has sent its request and read the answer, or it has not,
+    // which is the timing of the two processes: the client says that the
+    // daemon closed the connection, with or without answering. In the
+    // moment between the accept and the client's request, the request
+    // itself is what fails.
+    let temporary = Directory::of("s-watched");
+    let runtime = temporary.path().join("run");
+    let data = temporary.path().join("data");
+    let socket = runtime.join("benshi.sock");
+    let mut daemon = Daemon::start(&[
+        ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+        ("BENSHI_DATA_DIR", data.as_os_str()),
+    ]);
+    let started = daemon.says();
+    assert!(
+        started
+            .last()
+            .is_some_and(|line| line.starts_with("benshi: recording in ")),
+        "the daemon did not start: {started:?}"
+    );
+    let client = watching(&socket);
+    let waited_from = Instant::now();
+    while !has_a_connection(&socket) {
+        assert!(
+            waited_from.elapsed() < PATIENCE,
+            "the daemon accepted no connection in {PATIENCE:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    daemon.is_sent("TERM");
+
+    let client = ends(client);
+    assert_eq!(client.code, FAILED, "the client ended {client:?}");
+    assert!(
+        client.said.starts_with("benshi: daemon closed connection")
+            || client
+                .said
+                .starts_with("benshi: request could not be sent: Broken pipe"),
+        "the client said {:?}",
+        client.said
+    );
+    assert_eq!(client.shown, "", "the client showed {:?}", client.shown);
+    let ended = daemon.ended().expect("a daemon that is stopped ends");
+    assert_eq!(ended.code(), SUCCEEDED, "it ended {ended}");
 }
 
 #[test]
