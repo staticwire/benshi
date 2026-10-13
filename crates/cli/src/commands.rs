@@ -403,9 +403,9 @@ async fn record(
 /// Written out a line at a time rather than gathered up and written at the end,
 /// so that a recording interrupted after fifty seconds holds fifty seconds. A
 /// `File` does not buffer in this process, so `write_all` alone already has
-/// that property and the flush does nothing today. It is kept because deleting
-/// it would leave the property resting on the type this argument happens to
-/// have, and a `BufWriter` put here later would take it away silently.
+/// that property and the flush does nothing. It is kept because deleting it
+/// would leave the property resting on the type this argument happens to have,
+/// and a `BufWriter` put here later would take it away silently.
 fn append(file: &mut File, line: &str, output: &Path) -> Result<()> {
     file.write_all(line.as_bytes())
         .and_then(|()| file.flush())

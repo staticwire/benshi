@@ -60,7 +60,7 @@ const FAILED: u8 = 1;
 enum Invocation {
     /// Run the daemon.
     Daemon {
-        /// What the user asked for, which is not yet what exists.
+        /// Whether a tray was asked for.
         tray: bool,
     },
     /// Run the client, which parses the rest of the line itself.
@@ -203,9 +203,9 @@ fn gives_up_after(patience: Duration, code: u8) {
 /// The runtime is built rather than declared with an attribute, because the
 /// attribute takes the main thread and does not give it back. A tray has to own
 /// the main thread on macOS and on Windows, so the thread is spent here
-/// deliberately: when the tray lands it takes this thread and the runtime keeps
-/// the workers it already has. Until then the main thread has nothing else to
-/// do, and blocking on the runtime is the whole of the difference.
+/// deliberately: a tray would take this thread and the runtime would keep the
+/// workers it already has. There is no tray, so the main thread has nothing
+/// else to do, and blocking on the runtime is the whole of the difference.
 ///
 /// Gated on the platform whose adapter exists rather than on the family of
 /// platforms whose socket exists. macOS is a unix and has no detection adapter,
@@ -375,7 +375,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
 ///
 /// Not async, and no runtime is built. A runtime with nothing to watch would
 /// start, find one task, and report that it stopped, which says the daemon
-/// failed rather than that this platform has no daemon yet.
+/// failed rather than that this platform has no daemon.
 #[cfg(not(target_os = "linux"))]
 fn daemon(_tray: bool) -> ExitCode {
     say(format_args!("this platform has no detection adapter yet"));
