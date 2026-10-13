@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use benshi_daemon::protocol::{Request, Response};
 use humantime::format_duration;
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout_at};
@@ -89,8 +90,7 @@ impl Daemon {
     /// where the request is not sent within [`DEADLINE`] of the start of the
     /// connection.
     pub async fn ask(&mut self, request: &Request) -> Result<()> {
-        let mut line = serde_json::to_vec(request).context("request could not be written")?;
-        line.push(b'\n');
+        let line = line(request)?;
 
         let sent = timeout_at(self.answer_by, async {
             self.writer.write_all(&line).await?;
@@ -157,6 +157,14 @@ impl Daemon {
     }
 }
 
+/// One request as a line, newline included.
+fn line<T: Serialize>(request: &T) -> Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(request).context("request could not be written")?;
+    line.push(b'\n');
+
+    Ok(line)
+}
+
 /// What is said of a daemon that closed the connection before its first
 /// answer.
 const CLOSED_WITHOUT_ANSWERING: &str = "daemon closed connection without answering";
@@ -168,4 +176,22 @@ fn did_not_answer(socket: &Path) -> anyhow::Error {
         socket.display(),
         format_duration(DEADLINE)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_request_that_cannot_be_written_says_what_the_serialiser_said() {
+        // A map keyed by a pair is one JSON cannot spell.
+        let unwritable = std::collections::BTreeMap::from([((1, 2), 3)]);
+        let cause = serde_json::to_vec(&unwritable).expect_err("JSON has no such key");
+
+        let failure = super::line(&unwritable).expect_err("JSON has no such key");
+
+        // As the client prints a failure: the cause beside what failed.
+        assert_eq!(
+            format!("{failure:#}"),
+            format!("request could not be written: {cause}")
+        );
+    }
 }

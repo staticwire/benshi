@@ -129,8 +129,27 @@ impl Voice {
     ///
     /// Returns what the operating system answered where the thread cannot be
     /// started.
-    pub fn on(sink: impl Write + Send + 'static) -> io::Result<Self> {
+    pub(crate) fn on(sink: impl Write + Send + 'static) -> io::Result<Self> {
         Self::holding(sink, HELD)
+    }
+
+    /// The voice of a process: it writes what it is handed to `sink`, on a
+    /// thread it starts, and the panics of the process are said through it,
+    /// but for those that [`crate::panics`] leaves to the hook that was
+    /// there.
+    ///
+    /// It is the one way to a voice from outside this crate, so a process
+    /// that has a voice has that hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the operating system answered where the thread cannot be
+    /// started.
+    pub fn of_the_process(sink: impl Write + Send + 'static) -> io::Result<Arc<Self>> {
+        let voice = Arc::new(Self::on(sink)?);
+        crate::panics::are_said_through(&voice);
+
+        Ok(voice)
     }
 
     /// A voice that holds this many lines that are said and not written.

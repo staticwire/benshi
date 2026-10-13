@@ -142,6 +142,7 @@ dependencies = [
  "benshi-store",
  "clap",
  "humantime",
+ "serde",
  "serde_json",
  "socket2",
  "tempfile",

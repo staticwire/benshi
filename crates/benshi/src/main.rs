@@ -183,6 +183,36 @@ impl Stops {
     }
 }
 
+/// What the daemon waits for a signal with, made by the two steps it is
+/// handed: `ignored` reads which signals the process ignores, and `taken`
+/// takes the others. What either could not do is said through `say`.
+///
+/// `ignored` is called ahead of `taken`: a signal that is taken is ignored no
+/// longer. Where `ignored` cannot say, `taken` is handed every signal as
+/// ignored, so that none is taken and one that is ignored stays so.
+///
+/// # Errors
+///
+/// Returns the code the daemon ends with where `taken` fails.
+#[cfg(target_os = "linux")]
+fn waited_for<S>(
+    ignored: impl FnOnce() -> io::Result<u64>,
+    taken: impl FnOnce(u64) -> io::Result<S>,
+    say: impl Fn(fmt::Arguments<'_>),
+) -> Result<S, u8> {
+    let ignored = ignored().unwrap_or_else(|untold| {
+        say(format_args!(
+            "{STATUS} does not say which signals are ignored, so none is waited for: {untold}"
+        ));
+        u64::MAX
+    });
+
+    taken(ignored).map_err(|untaken| {
+        say(format_args!("cannot wait for a signal: {untaken}"));
+        FAILED
+    })
+}
+
 /// Ends the process with `code` once `patience` has passed, whatever it
 /// waits for by then.
 #[cfg(target_os = "linux")]
@@ -213,9 +243,11 @@ fn gives_up_after(patience: Duration, code: u8) {
 #[cfg(target_os = "linux")]
 fn daemon(tray: bool) -> ExitCode {
     // The first thing made and so the last to go: it goes once it has
-    // written what the daemon said as it ended.
-    let voice = match Voice::on(io::stderr()) {
-        Ok(voice) => Arc::new(voice),
+    // written what the daemon said as it ended. Panics are said through it:
+    // one written by the thread that panicked waits where stderr is full and
+    // nobody reads, and holds its task for as long.
+    let voice = match Voice::of_the_process(io::stderr()) {
+        Ok(voice) => voice,
         Err(unstarted) => {
             say(format_args!(
                 "thread that writes to stderr could not be started: {unstarted}"
@@ -223,9 +255,6 @@ fn daemon(tray: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A panic written by the thread that panicked would hold its task for
-    // as long as nobody reads.
-    benshi_daemon::panics::are_said_through(&voice);
 
     if tray {
         // Said rather than passed over. A tray that was asked for and is
@@ -267,30 +296,14 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
     use benshi_store::Store;
 
-    // Read ahead of the first signal that is taken: one that is taken is
-    // ignored no longer.
-    let ignored = match ignored() {
-        Ok(ignored) => ignored,
-        Err(untold) => {
-            voice.say(format_args!(
-                "{STATUS} does not say which signals are ignored, so none is waited for: {untold}"
-            ));
-            // As though every signal were ignored, so that none is taken and
-            // one that is ignored stays so.
-            u64::MAX
-        }
-    };
     // Taken ahead of the socket and the database, so that a signal sent
     // while one is bound and the other opened stops the daemon once its
     // tasks run. A signal sent ahead of this, while the runtime is built, is
     // the system's to deal with, and where it ends the daemon nothing says
     // so.
-    let mut stops = match Stops::taken(ignored) {
+    let mut stops = match waited_for(ignored, Stops::taken, |line| voice.say(line)) {
         Ok(stops) => stops,
-        Err(untaken) => {
-            voice.say(format_args!("cannot wait for a signal: {untaken}"));
-            return FAILED;
-        }
+        Err(code) => return code,
     };
     let socket = benshi_daemon::ipc::socket_path();
     // The XDG Base Directory Specification asks for a warning where the
@@ -385,7 +398,65 @@ fn daemon(_tray: bool) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::cell::RefCell;
+    #[cfg(target_os = "linux")]
+    use std::io;
+
     use super::Invocation;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_status_that_does_not_say_what_is_ignored_is_said_and_read_as_all_ignored() {
+        let said = RefCell::new(Vec::new());
+
+        let waited = super::waited_for(
+            || Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
+            // The mask it is handed, for the test to read.
+            Ok,
+            |line| said.borrow_mut().push(line.to_string()),
+        );
+
+        // Every signal as though it were ignored: of those, none stops a
+        // daemon.
+        assert_eq!(waited, Ok(u64::MAX));
+        assert_eq!(
+            said.into_inner(),
+            ["/proc/self/status does not say which signals are ignored, \
+              so none is waited for: no such file"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signals_that_cannot_be_taken_are_said_and_the_daemon_fails() {
+        let said = RefCell::new(Vec::new());
+
+        let waited = super::waited_for(
+            || Ok(0),
+            |_ignored| Err::<(), _>(io::Error::other("refused")),
+            |line| said.borrow_mut().push(line.to_string()),
+        );
+
+        assert_eq!(waited, Err(super::FAILED));
+        assert_eq!(said.into_inner(), ["cannot wait for a signal: refused"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_signals_read_as_ignored_are_handed_to_what_takes_the_rest() {
+        let said = RefCell::new(Vec::<String>::new());
+
+        // What `nohup` leaves: signal 1, which is `SIGHUP`.
+        let waited = super::waited_for(
+            || Ok(0b1),
+            Ok,
+            |line| said.borrow_mut().push(line.to_string()),
+        );
+
+        assert_eq!(waited, Ok(0b1));
+        assert!(said.into_inner().is_empty());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

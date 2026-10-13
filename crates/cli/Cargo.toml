@@ -14,6 +14,7 @@ benshi-core = { path = "../core" }
 benshi-daemon = { path = "../daemon" }
 clap = { version = "4.6.7", features = ["derive"] }
 humantime = "2.4.0"
+serde = "1.0.229"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "time"] }
 

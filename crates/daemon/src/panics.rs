@@ -9,6 +9,14 @@
 //! A panic is said as one line: the thread, the place and the message. A
 //! backtrace stands under it where the environment asks for one, and the
 //! first panic that has none is followed by how to ask.
+//!
+//! Three panics are left to the hook that was there, which writes them where
+//! they stand. One is a panic of the thread that writes for the voice: that
+//! thread ends with its panic. Another is a panic after that thread has
+//! ended, since a line said to the voice from then on is written by nobody.
+//! The last is a panic once the voice has gone. Where a process makes more
+//! than one voice, the one made last says its panics for as long as it is
+//! there.
 
 use std::backtrace::Backtrace;
 use std::env;
@@ -27,20 +35,15 @@ const NO_MESSAGE: &str = "no message";
 /// What is said once, at the first panic, where no backtrace is asked for.
 const HOW_TO_ASK: &str = "run with RUST_BACKTRACE=1 for a backtrace";
 
-/// Has every panic of the process said through `voice`.
+/// Has the panics of the process said through `voice`, but for the three
+/// the text of this module leaves to the hook that was there.
 ///
 /// A backtrace is asked for as the hook that was there reads it:
 /// `RUST_BACKTRACE` is set, to anything but `0`.
 ///
-/// Three panics are left to the hook that was there, which writes them
-/// where they stand. One is a panic of the thread that writes for the
-/// voice: that thread ends with its panic. Another is a panic after that
-/// thread has ended, since a line said to the voice from then on is
-/// written by nobody. The last is a panic once the voice has gone.
-///
 /// The hook holds the voice weakly, and takes hold of it for as long as it
 /// says one panic.
-pub fn are_said_through(voice: &Arc<Voice>) {
+pub(crate) fn are_said_through(voice: &Arc<Voice>) {
     let voice = Arc::downgrade(voice);
     let found = panic::take_hook();
     let traced = env::var_os("RUST_BACKTRACE").is_some_and(|asked| asked != "0");

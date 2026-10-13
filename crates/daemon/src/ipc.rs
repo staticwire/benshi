@@ -1073,6 +1073,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_path_too_long_for_an_address_is_the_failure_binding_answers() {
+        // The address of a unix socket has room for a path under 108 bytes,
+        // and this one is longer. Nothing is wrong with the directory, so the
+        // failure is that of the call that binds, handed back as it is.
+        let home = tempfile::tempdir().expect("a directory of our own");
+        let path = home.path().join("run").join("s".repeat(120));
+        let said = std::os::unix::net::UnixListener::bind(&path)
+            .expect_err("a path this long is no address");
+
+        let refused = bind(&path).expect_err("a path this long is no address");
+
+        assert_eq!(refused.kind(), said.kind());
+        assert_eq!(refused.to_string(), said.to_string());
+    }
+
     #[test]
     fn a_path_with_no_directory_is_refused() {
         let refused = bind(Path::new("/")).expect_err("the root has no directory above it");

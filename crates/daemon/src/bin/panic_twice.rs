@@ -23,7 +23,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use benshi_daemon::panics;
 use benshi_daemon::supervisor::Supervisor;
 use benshi_daemon::voice::Voice;
 
@@ -105,8 +104,9 @@ fn main() {
 }
 
 fn a_task_panics() {
-    let voice = Arc::new(Voice::on(io::stderr()).expect("a thread starts"));
-    panics::are_said_through(&voice);
+    // Kept for as long as the task runs, so that the hook finds a voice that
+    // is still there.
+    let _voice = Voice::of_the_process(io::stderr()).expect("a thread starts");
 
     let mut supervisor = Supervisor::telling(|notice| println!("told: {notice}"));
     let attempts = Arc::new(AtomicU32::new(0));
@@ -136,8 +136,7 @@ fn a_task_panics() {
 /// handed.
 fn the_voice_panics() -> Arc<Voice> {
     let (unwound, has_unwound) = mpsc::channel();
-    let voice = Arc::new(Voice::on(Panics { _unwound: unwound }).expect("a thread starts"));
-    panics::are_said_through(&voice);
+    let voice = Voice::of_the_process(Panics { _unwound: unwound }).expect("a thread starts");
 
     voice.say(format_args!("a line the sink panics at"));
     // Kept until the thread has unwound, so that the hook finds a voice
@@ -153,14 +152,11 @@ fn the_voice_panics() -> Arc<Voice> {
 fn the_voice_is_let_go_of_by_its_own_thread() {
     let (hand_over, held) = mpsc::channel();
     let (ended, has_ended) = mpsc::channel();
-    let voice = Arc::new(
-        Voice::on(LetsGo {
-            held,
-            _ended: ended,
-        })
-        .expect("a thread starts"),
-    );
-    panics::are_said_through(&voice);
+    let voice = Voice::of_the_process(LetsGo {
+        held,
+        _ended: ended,
+    })
+    .expect("a thread starts");
 
     voice.say(format_args!("a line the sink lets go of the voice at"));
     // The one hold on the voice, which the sink lets go of as it writes.
@@ -172,8 +168,7 @@ fn the_voice_is_let_go_of_by_its_own_thread() {
 }
 
 fn the_voice_goes() {
-    let voice = Arc::new(Voice::on(Slow).expect("a thread starts"));
-    panics::are_said_through(&voice);
+    let voice = Voice::of_the_process(Slow).expect("a thread starts");
 
     for line in ["one", "two", "three"] {
         voice.say(format_args!("{line}"));

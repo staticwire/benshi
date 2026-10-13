@@ -427,7 +427,7 @@ mod tests {
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
-    use benshi_daemon::protocol::Response;
+    use benshi_daemon::protocol::{Request, Response};
     use benshi_daemon::recognition::{Decided, Decision, Recogniser};
     use benshi_daemon::supervisor::TaskError;
     use socket2::{Domain, SockAddr, Socket, Type};
@@ -828,25 +828,39 @@ mod tests {
     /// and nothing more. The daemon never answers so; the client is written
     /// for the protocol, and this is what holds it to that.
     fn a_daemon_that_answers_with(answer: &Response) -> (TempDir, PathBuf, JoinHandle<()>) {
+        a_daemon_that_writes(line_of(answer))
+    }
+
+    /// One answer as the daemon writes it: a line, newline included.
+    fn line_of(answer: &Response) -> Vec<u8> {
         let mut line = serde_json::to_vec(answer).expect("serialise");
         line.push(b'\n');
 
-        a_daemon_that_writes(line)
+        line
     }
 
     /// A socket served by something that answers every request with `line`,
     /// byte for byte.
     fn a_daemon_that_writes(line: Vec<u8>) -> (TempDir, PathBuf, JoinHandle<()>) {
+        a_daemon_that_answers(move |_request| line.clone())
+    }
+
+    /// A socket served by something that answers each request with what
+    /// `answer` makes of its line, byte for byte.
+    fn a_daemon_that_answers(
+        answer: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+    ) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let answer = Arc::new(answer);
         let (home, socket, listener) = a_socket_bound_and_not_served();
         let answering = tokio::spawn(async move {
             loop {
                 let (stream, _peer) = listener.accept().await.expect("a client arrived");
-                let line = line.clone();
+                let answer = Arc::clone(&answer);
                 drop(tokio::spawn(async move {
                     let (reader, mut writer) = tokio::io::split(stream);
                     let mut requests = BufReader::new(reader).lines();
-                    while let Ok(Some(_request)) = requests.next_line().await {
-                        if writer.write_all(&line).await.is_err() {
+                    while let Ok(Some(request)) = requests.next_line().await {
+                        if writer.write_all(&answer(&request)).await.is_err() {
                             break;
                         }
                     }
@@ -855,6 +869,31 @@ mod tests {
         });
 
         (home, socket, answering)
+    }
+
+    /// A socket served by something that answers a listing with no source,
+    /// and a subscription with the answer that the stream is on and then
+    /// with `carried`.
+    fn a_daemon_whose_stream_carries(carried: &Response) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let listed = line_of(&Response::Sources(Vec::new()));
+        let stream = [line_of(&Response::Ok), line_of(carried)].concat();
+
+        a_daemon_that_answers(move |request| {
+            match serde_json::from_str(request).expect("a request") {
+                Request::Watch => stream.clone(),
+                Request::Sources => listed.clone(),
+                other => panic!("{other:?} is asked by no reader of a stream"),
+            }
+        })
+    }
+
+    /// The answers a stream does not carry, each with how it is named.
+    fn answers_no_stream_carries() -> [(Response, &'static str); 3] {
+        [
+            (Response::Ok, "Ok"),
+            (Response::Sources(Vec::new()), "Sources([])"),
+            (Response::Why(None), "Why(None)"),
+        ]
     }
 
     async fn go(command: Command, socket: &Path) -> (ExitCode, String, String) {
@@ -1550,20 +1589,49 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_that_carries_another_answer_is_a_failure_that_names_it() {
-        // After the answer that it is on, a stream carries events. A second
-        // answer in their place is named and not printed.
-        let mut on = serde_json::to_vec(&Response::Ok).expect("serialise");
-        on.push(b'\n');
-        let (_home, socket, answering) = a_daemon_that_writes(on.repeat(2));
+        // After the answer that it is on, a stream carries events, and word
+        // of a lag or of an error. Any other answer is named and not printed.
+        for (answer, named) in answers_no_stream_carries() {
+            let (_home, socket, answering) = a_daemon_whose_stream_carries(&answer);
 
-        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Watch, &socket))
-            .await
-            .expect("the client ended");
-        answering.abort();
+            let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Watch, &socket))
+                .await
+                .expect("the watch ends at the answer");
+            answering.abort();
 
-        assert_eq!(outcome, ExitCode::FAILURE);
-        assert!(shown.is_empty(), "printed {shown:?}");
-        assert_eq!(complained, "benshi: daemon sent Ok on a stream\n");
+            assert_eq!(outcome, ExitCode::FAILURE, "went on past {named}");
+            assert!(shown.is_empty(), "printed {shown:?}");
+            assert_eq!(
+                complained,
+                format!("benshi: daemon sent {named} on a stream\n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recording_whose_stream_carries_another_answer_is_a_failure_that_names_it() {
+        // A recorder that passed the answer over would go on recording, and
+        // neither the file nor the summary would say what the daemon had
+        // sent.
+        for (answer, named) in answers_no_stream_carries() {
+            let (home, socket, answering) = a_daemon_whose_stream_carries(&answer);
+            let recording = Command::Record {
+                duration: Duration::from_secs(60),
+                output: home.path().join("trace.jsonl"),
+            };
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(recording, &socket))
+                .await
+                .expect("the recording ends at the answer");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE, "went on past {named}");
+            assert!(shown.is_empty(), "printed {shown:?}");
+            assert_eq!(
+                complained,
+                format!("benshi: daemon sent {named} on a stream\n")
+            );
+        }
     }
 
     #[tokio::test]
@@ -1572,8 +1640,7 @@ mod tests {
         // stream is on. Passed over, or taken for the end of the stream, the
         // line and what was wrong with it would be lost.
         let line = "not a response";
-        let mut on = serde_json::to_vec(&Response::Ok).expect("serialise");
-        on.push(b'\n');
+        let mut on = line_of(&Response::Ok);
         on.extend_from_slice(format!("{line}\n").as_bytes());
         let (_home, socket, answering) = a_daemon_that_writes(on);
         let unread = serde_json::from_str::<Response>(line).expect_err("the line is no response");
