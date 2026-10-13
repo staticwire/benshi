@@ -8,12 +8,15 @@
 //! answer to a question back through [`Session::resumed`].
 //!
 //! **A sitting is one episode open, in one player or in several.** It begins
-//! when a player opens an episode no player has open, and it is over when
-//! the last player that has the episode open leaves it. A player leaves at
-//! its first reading that names another episode or none, and when the caller
-//! says it is [gone](Session::gone). A reading that names the same episode in
-//! another file leaves nothing: the player goes on in the sitting with the
-//! file it has open now.
+//! at the reading of a player that opens an episode no sitting is of, and it
+//! is over when a round ends with no player in it. A player leaves at its
+//! first reading that names another episode or none, and when the caller
+//! says it is gone. The caller ends every round with [`Session::end_round`],
+//! and a sitting its last player left stays until then, so an episode that
+//! one player leaves and another opens in one round is one sitting,
+//! whichever of the two readings is taken first. A reading that names the
+//! same episode in another file leaves nothing: the player goes on in the
+//! sitting with the file it has open now.
 //!
 //! **The total and the mark are the episode's.** A store keeps one total for
 //! an episode, so a sitting asks one question, keeps one total and records
@@ -53,9 +56,8 @@
 //! **What names no episode begins no sitting.** That is a reading that names
 //! no file, a reading recognition was not asked about, a name it refused or
 //! found under several entries, a file of several episodes, and a half
-//! episode. Nothing is kept or recorded for any of them, and the one effect
-//! such a reading answers with is the [`Close`](Effect::Close) of a sitting
-//! its player was the last to leave.
+//! episode. Nothing is kept or recorded for any of them, and such a reading
+//! answers with no effect: its player leaves the sitting it was in.
 
 use std::mem;
 use std::time::Duration;
@@ -67,8 +69,7 @@ use crate::recognise::parse::Episode;
 use crate::timeline::{Progress, Timeline, WatchedPolicy};
 use crate::{Known, MediaRef, PlayerId, PlayerSnapshot};
 
-/// What a store is to do, in answer to a reading or to a player that is
-/// gone.
+/// What a store is to do, in answer to a reading or to the end of a round.
 ///
 /// A title is the title as the corpus spells it. An episode is in the
 /// release's numbering, and a film has none.
@@ -264,7 +265,8 @@ enum Count {
     },
 }
 
-/// One episode open, in one player or in several.
+/// One episode open, in one player or in several, and in none from the
+/// reading its last player left at until the round is over.
 #[derive(Debug)]
 struct Sitting {
     /// The title as the corpus spells it.
@@ -317,16 +319,20 @@ impl Sitting {
         }
     }
 
-    /// Let a player go, and say whether it was the last.
-    fn leave(&mut self, player: &PlayerId) -> bool {
+    /// Whether no player has the episode open.
+    fn is_empty(&self) -> bool {
+        match &self.count {
+            Count::Asked { held, .. } => held.is_empty(),
+            Count::Counting { players, .. } => players.is_empty(),
+        }
+    }
+
+    /// Let a player go.
+    fn leave(&mut self, player: &PlayerId) {
         match &mut self.count {
-            Count::Asked { held, .. } => {
-                held.retain(|held| held.reading.player != *player);
-                held.is_empty()
-            }
+            Count::Asked { held, .. } => held.retain(|held| held.reading.player != *player),
             Count::Counting { players, .. } => {
                 players.retain(|counted| counted.player != *player);
-                players.is_empty()
             }
         }
     }
@@ -451,7 +457,8 @@ impl Sitting {
     }
 }
 
-/// The sittings that are open, one for each episode a player has open.
+/// The sittings that are open: one for each episode a player has open, and
+/// one for each episode its last player left, until the round ends.
 #[derive(Debug)]
 pub struct Session {
     /// The episodes that are open. A player is in one of them at most.
@@ -478,9 +485,10 @@ impl Session {
     ///
     /// `decision` is what recognition answered for the file the reading
     /// names, and nothing where recognition was not asked. The effects are
-    /// in the order they are to be carried out: a sitting that is over is
-    /// closed before the next one asks, and a total is kept before its
-    /// episode is recorded.
+    /// in the order they are to be carried out: a total is kept before its
+    /// episode is recorded. No reading closes a sitting: the player of a
+    /// reading that names another episode or none leaves the sitting it was
+    /// in, and [`Session::end_round`] closes a sitting no player is in.
     ///
     /// Every reading is stamped from the clock every other reading of this
     /// session is stamped from.
@@ -501,12 +509,12 @@ impl Session {
             return sitting.read(named.media, reading, &self.policy);
         }
 
-        let mut effects: Vec<Effect> = self.leave(&reading.player).into_iter().collect();
-        if let Some(named) = named {
-            effects.extend(self.open(named, reading));
-        }
+        self.leave(&reading.player);
 
-        effects
+        named
+            .and_then(|named| self.open(named, reading))
+            .into_iter()
+            .collect()
     }
 
     /// Take the answer to an [`Effect::Resume`].
@@ -529,35 +537,35 @@ impl Session {
         }
     }
 
-    /// Let these players leave what they had open, and close what the last
-    /// of them leaves.
+    /// End a round: let these players leave what they had open, and close
+    /// every sitting no player is in.
     ///
-    /// For a player that left and for one that has nothing open any more,
-    /// neither of which sends a reading to say so. A player with nothing
-    /// open is passed over.
+    /// `gone` names each player that left and each that has nothing open
+    /// any more, neither of which sends a reading to say so. A player with
+    /// nothing open is passed over.
     ///
-    /// Called after the readings of its round have been taken. An episode
-    /// that one player closes and another opens in one round then stays
-    /// open, where called before them it would be closed and asked about
-    /// again.
+    /// Called once a round, after its readings have been taken, with no
+    /// player where none is gone. No reading closes a sitting, so an
+    /// episode that one player leaves and another opens in one round stays
+    /// open with its total and its mark, whichever of the two readings was
+    /// taken first. Sittings are closed in the order they began.
     #[must_use = "an effect that is dropped is one nobody carries out"]
-    pub fn gone(&mut self, players: &[PlayerId]) -> Vec<Effect> {
-        players
-            .iter()
-            .filter_map(|player| self.leave(player))
+    pub fn end_round(&mut self, gone: &[PlayerId]) -> Vec<Effect> {
+        for player in gone {
+            self.leave(player);
+        }
+
+        self.sittings
+            .extract_if(.., |sitting| sitting.is_empty())
+            .map(Sitting::close)
             .collect()
     }
 
-    /// Take a player out of the sitting it is in, and close the sitting
-    /// where it was the last.
-    fn leave(&mut self, player: &PlayerId) -> Option<Effect> {
-        let at = self
-            .sittings
-            .iter()
-            .position(|sitting| sitting.has(player))?;
-        let last = self.sittings[at].leave(player);
-
-        last.then(|| self.sittings.remove(at).close())
+    /// Take a player out of the sitting it is in.
+    fn leave(&mut self, player: &PlayerId) {
+        if let Some(sitting) = self.sittings.iter_mut().find(|sitting| sitting.has(player)) {
+            sitting.leave(player);
+        }
     }
 
     /// Put a player into the sitting of what it opened, and begin one with
@@ -996,11 +1004,13 @@ mod tests {
 
         advance(&mut session, &player.playing(THIRD));
         advance(&mut session, &player.playing(FOURTH));
+        let over = session.end_round(&[]);
         session.resumed(Question(1), Some(unregistered(99)));
         let still_asking = advance(&mut session, &player.playing(FOURTH));
         session.resumed(Question(2), None);
         let counted = advance(&mut session, &player.playing(FOURTH));
 
+        assert_eq!(over, [close(SERIES, Some(3))]);
         assert_eq!(still_asking, NOTHING);
         assert_eq!(counted, [keep(SERIES, Some(4), FOURTH, 1)]);
     }
@@ -1021,7 +1031,7 @@ mod tests {
         });
 
         let first = advance(&mut session, &player.playing(THIRD));
-        let closed = session.gone(std::slice::from_ref(&player.id));
+        let closed = session.end_round(std::slice::from_ref(&player.id));
         let second = advance(&mut session, &player.playing(THIRD));
         session.resumed(Question(1), before_the_close);
         let still_asking = advance(&mut session, &player.playing(THIRD));
@@ -1129,7 +1139,7 @@ mod tests {
         let player = Player::named("mpv");
 
         let first = watch(&mut session, &player, THIRD, 61, None);
-        let closed = session.gone(std::slice::from_ref(&player.id));
+        let closed = session.end_round(std::slice::from_ref(&player.id));
         let second = watch(&mut session, &player, THIRD, 61, Some(unregistered(60)));
 
         assert_eq!(first[60], [keep(SERIES, Some(3), THIRD, 60)]);
@@ -1344,17 +1354,16 @@ mod tests {
     }
 
     #[test]
-    fn another_file_closes_the_episode_and_asks_about_the_next() {
+    fn another_file_asks_about_the_next_episode_and_the_round_closes_the_one_before() {
         let mut session = Session::new(half());
         let player = Player::named("mpv");
 
         watch(&mut session, &player, THIRD, 3, None);
-        let effects = advance(&mut session, &player.playing(FOURTH));
+        let opened = advance(&mut session, &player.playing(FOURTH));
+        let over = session.end_round(&[]);
 
-        assert_eq!(
-            effects,
-            [close(SERIES, Some(3)), resume(2, SERIES, Some(4))]
-        );
+        assert_eq!(opened, [resume(2, SERIES, Some(4))]);
+        assert_eq!(over, [close(SERIES, Some(3))]);
     }
 
     #[test]
@@ -1427,8 +1436,8 @@ mod tests {
         let gone = std::slice::from_ref(&player.id);
 
         watch(&mut session, &player, THIRD, 3, None);
-        let closed = session.gone(gone);
-        let closed_again = session.gone(gone);
+        let closed = session.end_round(gone);
+        let closed_again = session.end_round(gone);
         let opened_again = advance(&mut session, &player.playing(THIRD));
 
         assert_eq!(closed, [close(SERIES, Some(3))]);
@@ -1446,7 +1455,7 @@ mod tests {
 
         watch(&mut session, &mpv, THIRD, 2, None);
         watch(&mut session, &vlc, FOURTH, 2, None);
-        let closed = session.gone(std::slice::from_ref(&mpv.id));
+        let closed = session.end_round(std::slice::from_ref(&mpv.id));
         let the_other = advance(&mut session, &vlc.playing(FOURTH));
 
         assert_eq!(closed, [close(SERIES, Some(3))]);
@@ -1455,8 +1464,8 @@ mod tests {
 
     #[test]
     fn every_player_that_is_gone_closes_what_it_had_open() {
-        // Two of three leave in one round. Each closes its own episode, in
-        // the order they were named, and the third counts on.
+        // Two of three leave in one round. The episode of each is closed, in
+        // the order the episodes were opened, and the third counts on.
         let mut session = Session::new(half());
         let mpv = Player::named("mpv");
         let vlc = Player::named("vlc");
@@ -1465,10 +1474,10 @@ mod tests {
         watch(&mut session, &mpv, THIRD, 2, None);
         watch(&mut session, &vlc, FOURTH, 2, None);
         watch(&mut session, &celluloid, THE_FILM, 2, None);
-        let closed = session.gone(&[vlc.id.clone(), mpv.id.clone()]);
+        let closed = session.end_round(&[vlc.id.clone(), mpv.id.clone()]);
         let the_third = advance(&mut session, &celluloid.playing(THE_FILM));
 
-        assert_eq!(closed, [close(SERIES, Some(4)), close(SERIES, Some(3))]);
+        assert_eq!(closed, [close(SERIES, Some(3)), close(SERIES, Some(4))]);
         assert_eq!(the_third, [keep(FILM, None, THE_FILM, 2)]);
     }
 
@@ -1700,7 +1709,7 @@ mod tests {
                 answering(&mut session, &reading, None);
             }
         }
-        let left = session.gone(&[a_player("celluloid")]);
+        let left = session.end_round(&[a_player("celluloid")]);
         let earlier = advance(&mut session, &stamps.playing("vlc", THIRD, 3002));
         let later = advance(&mut session, &stamps.playing("mpv", THIRD, 3300));
 
@@ -1759,10 +1768,10 @@ mod tests {
                 answering(&mut session, &reading, None);
             }
         }
-        let first = session.gone(&[a_player("mpv")]);
+        let first = session.end_round(&[a_player("mpv")]);
         let into_playing = advance(&mut session, &stamps.playing("vlc", THIRD, 4200));
         let playing = advance(&mut session, &stamps.playing("vlc", THIRD, 5200));
-        let last = session.gone(&[a_player("vlc")]);
+        let last = session.end_round(&[a_player("vlc")]);
         let opened_again = advance(&mut session, &stamps.playing("mpv", THIRD, 6000));
 
         assert_eq!(first, NOTHING);
@@ -1779,22 +1788,22 @@ mod tests {
 
         answering(&mut session, &stamps.playing("mpv", THIRD, 1000), None);
         answering(&mut session, &stamps.playing("vlc", THIRD, 1200), None);
-        let closed = session.gone(&[a_player("vlc"), a_player("mpv")]);
+        let closed = session.end_round(&[a_player("vlc"), a_player("mpv")]);
 
         assert_eq!(closed, [close(SERIES, Some(3))]);
     }
 
     #[test]
     fn a_player_that_moves_on_leaves_the_episode_open_for_the_other() {
-        // It asks about the episode it moves to and closes nothing. Coming
-        // back, it closes the one it left and asks nothing, the episode
-        // having been open all along.
+        // It asks about the episode it moves to and nothing is closed.
+        // Coming back, it asks nothing, the episode having been open all
+        // along, and the round closes the one it left.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
         let mut round = |mpv: &str, at: u64| {
             let first = answering(&mut session, &stamps.playing("mpv", mpv, at), None);
             let second = answering(&mut session, &stamps.paused("vlc", THIRD, at + 200), None);
-            [first, second]
+            [first, second, session.end_round(&[])]
         };
 
         let opened = round(THIRD, 1000);
@@ -1804,12 +1813,21 @@ mod tests {
         let back = round(THIRD, 5000);
         let again = round(THIRD, 6000);
 
-        assert_eq!(opened, [vec![resume(1, SERIES, Some(3))], vec![]]);
-        assert_eq!(played, [vec![keep(SERIES, Some(3), THIRD, 1)], vec![]]);
-        assert_eq!(moved, [vec![resume(2, SERIES, Some(4))], vec![]]);
-        assert_eq!(elsewhere, [vec![keep(SERIES, Some(4), FOURTH, 1)], vec![]]);
-        assert_eq!(back, [vec![close(SERIES, Some(4))], vec![]]);
-        assert_eq!(again, [vec![keep(SERIES, Some(3), THIRD, 2)], vec![]]);
+        assert_eq!(opened, [vec![resume(1, SERIES, Some(3))], vec![], vec![]]);
+        assert_eq!(
+            played,
+            [vec![keep(SERIES, Some(3), THIRD, 1)], vec![], vec![]]
+        );
+        assert_eq!(moved, [vec![resume(2, SERIES, Some(4))], vec![], vec![]]);
+        assert_eq!(
+            elsewhere,
+            [vec![keep(SERIES, Some(4), FOURTH, 1)], vec![], vec![]]
+        );
+        assert_eq!(back, [vec![], vec![], vec![close(SERIES, Some(4))]]);
+        assert_eq!(
+            again,
+            [vec![keep(SERIES, Some(3), THIRD, 2)], vec![], vec![]]
+        );
     }
 
     #[test]
@@ -1888,15 +1906,155 @@ mod tests {
             })
             .collect();
         let opened = advance(&mut session, &stamps.playing("vlc", THIRD, 103_000));
-        let left = session.gone(&[a_player("mpv")]);
+        let left = session.end_round(&[a_player("mpv")]);
         let second = advance(&mut session, &stamps.playing("vlc", THIRD, 104_000));
-        let closed = session.gone(&[a_player("vlc")]);
+        let closed = session.end_round(&[a_player("vlc")]);
 
         assert_eq!(recorded_at(&first), [ASKED_AT]);
         assert_eq!(opened, NOTHING);
         assert_eq!(left, NOTHING);
         assert_eq!(second, [keep(SERIES, Some(3), THIRD, 102)]);
         assert_eq!(closed, [close(SERIES, Some(3))]);
+    }
+
+    #[test]
+    fn an_episode_one_player_moves_on_from_and_another_opens_in_one_round_stays_open() {
+        // The first player is not gone: it opens the next episode in the
+        // round the second opens this one in. Whichever of the two readings
+        // is taken first, it is one sitting: nothing is closed, nothing is
+        // asked about the episode again, the total goes on, and nothing is
+        // recorded again.
+        for the_one_that_moves_on_is_read_first in [true, false] {
+            let mut session = Session::new(half());
+            let stamps = Stamps::new();
+
+            let first: Vec<Vec<Effect>> = (1..=102)
+                .map(|second| {
+                    answering(
+                        &mut session,
+                        &stamps.playing("mpv", THIRD, second * 1000),
+                        None,
+                    )
+                })
+                .collect();
+            let moves_on = stamps.playing("mpv", FOURTH, 103_000);
+            let opens = stamps.playing("vlc", THIRD, 103_200);
+            let (moved, opened) = if the_one_that_moves_on_is_read_first {
+                let moved = answering(&mut session, &moves_on, None);
+                (moved, answering(&mut session, &opens, None))
+            } else {
+                let opened = answering(&mut session, &opens, None);
+                (answering(&mut session, &moves_on, None), opened)
+            };
+            let over = session.end_round(&[]);
+            let second = advance(&mut session, &stamps.playing("vlc", THIRD, 104_200));
+
+            let order = format!("read first: {the_one_that_moves_on_is_read_first}");
+            assert_eq!(recorded_at(&first), [ASKED_AT], "{order}");
+            assert_eq!(moved, [resume(2, SERIES, Some(4))], "{order}");
+            assert_eq!(opened, NOTHING, "{order}");
+            assert_eq!(over, NOTHING, "{order}");
+            assert_eq!(second, [keep(SERIES, Some(3), THIRD, 102)], "{order}");
+        }
+    }
+
+    #[test]
+    fn two_players_that_swap_episodes_in_one_round_close_neither() {
+        // Whichever is read first leaves its episode before the other has
+        // opened it, and the other leaves its own with the first in it
+        // already. Both totals go on.
+        let mut session = Session::new(half());
+        let stamps = Stamps::new();
+        let mut round = |mpv: &str, vlc: &str, at: u64| {
+            let first = answering(&mut session, &stamps.playing("mpv", mpv, at), None);
+            let second = answering(&mut session, &stamps.playing("vlc", vlc, at + 200), None);
+            [first, second, session.end_round(&[])]
+        };
+
+        let opened = round(THIRD, FOURTH, 1000);
+        let played = round(THIRD, FOURTH, 2000);
+        let swapped = round(FOURTH, THIRD, 3000);
+        let after = round(FOURTH, THIRD, 4000);
+
+        assert_eq!(
+            opened,
+            [
+                vec![resume(1, SERIES, Some(3))],
+                vec![resume(2, SERIES, Some(4))],
+                vec![]
+            ]
+        );
+        assert_eq!(
+            played,
+            [
+                vec![keep(SERIES, Some(3), THIRD, 1)],
+                vec![keep(SERIES, Some(4), FOURTH, 1)],
+                vec![]
+            ]
+        );
+        assert_eq!(swapped, [vec![], vec![], vec![]]);
+        assert_eq!(
+            after,
+            [
+                vec![keep(SERIES, Some(4), FOURTH, 2)],
+                vec![keep(SERIES, Some(3), THIRD, 2)],
+                vec![]
+            ]
+        );
+    }
+
+    #[test]
+    fn an_episode_left_with_its_question_out_is_joined_whenever_the_answer_comes() {
+        // The player that asked moves on before the answer, and another
+        // opens the episode in that round. It asks nothing and the round
+        // closes nothing, and it counts on from what the store had, with
+        // the answer come before it opened the episode and after.
+        for the_answer_comes_first in [true, false] {
+            let mut session = Session::new(half());
+            let stamps = Stamps::new();
+            let kept = Some(unregistered(61));
+
+            let asked = advance(&mut session, &stamps.playing("mpv", THIRD, 1000));
+            let moved = advance(&mut session, &stamps.playing("mpv", FOURTH, 2000));
+            if the_answer_comes_first {
+                session.resumed(Question(1), kept);
+            }
+            let opened = advance(&mut session, &stamps.playing("vlc", THIRD, 2200));
+            let over = session.end_round(&[]);
+            if !the_answer_comes_first {
+                session.resumed(Question(1), kept);
+            }
+            let counted = advance(&mut session, &stamps.playing("vlc", THIRD, 3200));
+
+            let order = format!("the answer first: {the_answer_comes_first}");
+            assert_eq!(asked, [resume(1, SERIES, Some(3))], "{order}");
+            assert_eq!(moved, [resume(2, SERIES, Some(4))], "{order}");
+            assert_eq!(opened, NOTHING, "{order}");
+            assert_eq!(over, NOTHING, "{order}");
+            assert_eq!(counted, [keep(SERIES, Some(3), THIRD, 62)], "{order}");
+        }
+    }
+
+    #[test]
+    fn sittings_are_closed_in_the_order_they_began_whatever_came_between() {
+        // The first of three is closed in a round of its own, and a player
+        // joins the second. Neither moves the two that are left.
+        let mut session = Session::new(half());
+        let mpv = Player::named("mpv");
+        let vlc = Player::named("vlc");
+        let celluloid = Player::named("celluloid");
+        let smplayer = Player::named("smplayer");
+
+        watch(&mut session, &mpv, THIRD, 2, None);
+        watch(&mut session, &vlc, FOURTH, 2, None);
+        watch(&mut session, &celluloid, THE_FILM, 2, None);
+        let first = session.end_round(std::slice::from_ref(&mpv.id));
+        let joined = advance(&mut session, &smplayer.playing(FOURTH));
+        let rest = session.end_round(&[vlc.id.clone(), smplayer.id.clone(), celluloid.id.clone()]);
+
+        assert_eq!(first, [close(SERIES, Some(3))]);
+        assert_eq!(joined, NOTHING);
+        assert_eq!(rest, [close(SERIES, Some(4)), close(FILM, None)]);
     }
 
     #[test]
@@ -2037,7 +2195,9 @@ mod tests {
             best: None,
         });
 
-        let answers: Vec<Vec<Effect>> = [
+        // A round each: what the reading answered, and what the end of the
+        // round did.
+        let answers: Vec<[Vec<Effect>; 2]> = [
             &the_third,
             &the_fourth,
             &of_the_second,
@@ -2045,46 +2205,58 @@ mod tests {
             &the_third,
         ]
         .into_iter()
-        .map(|decision| session.advance(&player.playing(THIRD), Some(decision)))
+        .map(|decision| {
+            let read = session.advance(&player.playing(THIRD), Some(decision));
+            [read, session.end_round(&[])]
+        })
         .collect();
 
-        assert_eq!(answers[0], [resume(1, SERIES, Some(3))]);
+        assert_eq!(answers[0], [vec![resume(1, SERIES, Some(3))], vec![]]);
         assert_eq!(
             answers[1],
-            [close(SERIES, Some(3)), resume(2, SERIES, Some(4))]
+            [
+                vec![resume(2, SERIES, Some(4))],
+                vec![close(SERIES, Some(3))]
+            ]
         );
         assert_eq!(
             answers[2],
-            [close(SERIES, Some(4)), resume(3, SECOND_SERIES, Some(4))]
+            [
+                vec![resume(3, SECOND_SERIES, Some(4))],
+                vec![close(SERIES, Some(4))]
+            ]
         );
-        assert_eq!(answers[3], [close(SECOND_SERIES, Some(4))]);
-        assert_eq!(answers[4], [resume(4, SERIES, Some(3))]);
+        assert_eq!(answers[3], [vec![], vec![close(SECOND_SERIES, Some(4))]]);
+        assert_eq!(answers[4], [vec![resume(4, SERIES, Some(3))], vec![]]);
     }
 
     #[test]
     fn a_file_two_players_have_open_decided_otherwise_moves_them_one_by_one() {
         // The first to be read leaves the episode to the second and asks
-        // about the new one. The second, the last to leave, closes the old
-        // one and joins the new one, which has its question out already.
+        // about the new one. The second, the last to leave, joins the new
+        // one, which has its question out already, and the round closes the
+        // old one.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
         let the_third = recognised(SERIES, Episode::Only(3));
         let the_fourth = recognised(SERIES, Episode::Only(4));
+        let mut round = |at: u64, decision: &Recognition| {
+            let first = session.advance(&stamps.playing("mpv", THIRD, at), Some(decision));
+            let second = session.advance(&stamps.playing("vlc", THIRD, at + 200), Some(decision));
+            [first, second, session.end_round(&[])]
+        };
 
-        let answers: Vec<Vec<Effect>> = [(1000, &the_third), (2000, &the_fourth)]
-            .into_iter()
-            .flat_map(|(round, decision)| {
-                [
-                    (stamps.playing("mpv", THIRD, round), decision),
-                    (stamps.playing("vlc", THIRD, round + 200), decision),
-                ]
-            })
-            .map(|(reading, decision)| session.advance(&reading, Some(decision)))
-            .collect();
+        let opened = round(1000, &the_third);
+        let moved = round(2000, &the_fourth);
 
-        assert_eq!(answers[0], [resume(1, SERIES, Some(3))]);
-        assert_eq!(answers[1], NOTHING);
-        assert_eq!(answers[2], [resume(2, SERIES, Some(4))]);
-        assert_eq!(answers[3], [close(SERIES, Some(3))]);
+        assert_eq!(opened, [vec![resume(1, SERIES, Some(3))], vec![], vec![]]);
+        assert_eq!(
+            moved,
+            [
+                vec![resume(2, SERIES, Some(4))],
+                vec![],
+                vec![close(SERIES, Some(3))]
+            ]
+        );
     }
 }
