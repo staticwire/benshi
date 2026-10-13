@@ -16,8 +16,8 @@ use benshi_core::BoxError;
 
 /// A remote list a local record can be synchronised to.
 ///
-/// Provisional: the methods below are a placeholder and will change when the
-/// first backend is written.
+/// Provisional: no backend is written, and the methods below are a
+/// placeholder.
 pub trait ListBackend {
     /// Name of this backend, as shown to the user.
     fn name(&self) -> &str;

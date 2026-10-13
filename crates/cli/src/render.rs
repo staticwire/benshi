@@ -158,7 +158,7 @@ pub fn listing(sources: &[SourceListing]) -> String {
 /// characters as bytes, so every entry is padded to the same count. What would
 /// misalign a column is a glyph the terminal draws double width, which neither
 /// count sees. A D-Bus bus name is ASCII by the specification, so on the one
-/// platform benshi reads today neither arises.
+/// platform benshi reads neither arises.
 fn width<'a>(entries: impl Iterator<Item = &'a str>) -> usize {
     entries.map(str::len).max().unwrap_or_default()
 }

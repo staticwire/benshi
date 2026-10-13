@@ -4,10 +4,6 @@
 //! be tested in full without mocking a platform. Detection adapters translate
 //! platform readings into the types defined here; all decisions are taken in
 //! this crate, never in an adapter.
-//!
-//! Types marked *provisional* have a name and a purpose but not yet a settled
-//! shape; they are expected to change once the logic that consumes them is
-//! written.
 
 pub mod clock;
 pub mod encoding;
@@ -26,11 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Timestamp;
 use crate::path::RawPath;
 
-/// Provisional error placeholder.
-///
-/// Each crate gains a concrete error enum once `thiserror` is added as a
-/// dependency; until then a boxed error keeps signatures honest without
-/// inventing variants that have no call sites yet.
+/// An error whose type is not named: boxed, and able to cross threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// A value a media source may or may not be able to report.
@@ -103,10 +95,8 @@ pub struct AppName(pub String);
 /// Three cases and not two. A source that names what it opened and a source
 /// that can only describe it are different things: mpv playing a stream knows
 /// the address, a browser knows only what the page calls itself. Collapsing the
-/// first into the second throws away an identifier that recognition can work
+/// first into the second throws away an identifier that recognition could work
 /// from, and leaves an adapter no way to report what it actually has.
-///
-/// Provisional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaRef {
     /// A local file the source opened, as the platform spelled its path.
@@ -130,10 +120,9 @@ pub enum PlayState {
 
 // Both of these exist so that `{}` compiles. Without them the only formatting
 // that does is `{:?}`, which prints `PlayerId("mpv")` - and `#[error("...")]`
-// attributes are exactly where the easy form gets reached for. That happened:
-// `benshi watch` printed a source's name in its debug form to a terminal for
-// three commits, and every correct site in the workspace was writing `.0` by
-// hand. A newtype over a name displays as that name.
+// attributes are exactly where the easy form gets reached for, while every
+// correct site has to write `.0` by hand. A newtype over a name displays as
+// that name.
 impl fmt::Display for PlayerId {
     fn fmt(&self, into: &mut fmt::Formatter<'_>) -> fmt::Result {
         into.write_str(&self.0)
@@ -191,11 +180,13 @@ pub struct PlayerSnapshot {
 
 /// The state a sink renders.
 ///
-/// Provisional. Derived from playback, never from whether a sync to a list
-/// backend succeeded: what a presence card shows depends on what is playing.
+/// Provisional: no sink is written and nothing in the daemon publishes one, so
+/// its shape is a placeholder. Derived from playback, never from whether a sync
+/// to a list backend succeeded: what a presence card shows depends on what is
+/// playing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
-    /// The reading the session was last advanced by.
+    /// The reading the state is of.
     pub snapshot: PlayerSnapshot,
 }
 
@@ -210,7 +201,7 @@ mod tests {
     fn a_name_displays_as_the_name_and_not_as_its_type() {
         // The reason this impl exists. `{:?}` on a newtype prints the type
         // around the value, which is right for a debugger and wrong for a
-        // terminal, and for three commits it reached one: a failure line read
+        // terminal, where a failure line would read
         // `failed: PlayerId("mpv") did not answer within 500ms`.
         assert_eq!(
             PlayerId("mpv.instance-1701".to_owned()).to_string(),

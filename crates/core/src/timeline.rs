@@ -82,7 +82,7 @@ pub struct Progress {
 /// reports and which looks exactly like a position running ahead of the clock:
 /// at a one second cadence, three times speed puts it exactly two seconds ahead
 /// each interval. The comparison is strict so that exactly two seconds is not a
-/// seek, and reading the playback rate is the real answer, not written yet.
+/// seek. The playback rate is what would tell faster playback from a seek.
 pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// The longest interval between two readings the timeline counts as observed.
@@ -91,7 +91,7 @@ pub const SEEK_THRESHOLD: Duration = Duration::from_secs(2);
 /// nothing inside it is judged or counted, and the reading that ends it becomes
 /// the anchor the next one is measured against.
 ///
-/// **What produces one today is a source that stops answering**, since a round
+/// **A source that stops answering produces one**, since a round
 /// that times out publishes no reading at all. The two other explanations that
 /// come to mind are both wrong here. A machine suspended to memory produces no
 /// gap, because [`Instant`](std::time::Instant) reads `CLOCK_MONOTONIC` on
@@ -379,8 +379,8 @@ impl WatchedPolicy {
 ///
 /// **This is the second place the rule lives.** The MPRIS adapter refuses the
 /// same two values before a reading is ever built. It is repeated here because a
-/// recording is a text file anyone can edit, and because the adapter that has
-/// not been written yet is not bound by the one that has.
+/// recording is a text file anyone can edit, and because another adapter is not
+/// bound by what this one refuses.
 fn duration_of(reading: &PlayerSnapshot) -> Known<Duration> {
     let Known::Value(duration) = reading.duration else {
         return reading.duration;

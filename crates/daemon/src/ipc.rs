@@ -5,8 +5,8 @@
 //! in [`crate::protocol`]; this module is the transport and the answering.
 //!
 //! Answering is written over any byte stream rather than over a socket, so the
-//! protocol can be exercised without a filesystem, and so that the named pipe
-//! Windows will need has to supply only its own binding and accept loop.
+//! protocol can be exercised without a filesystem and the answering does not
+//! depend on what carries it.
 
 use std::env;
 use std::fmt;

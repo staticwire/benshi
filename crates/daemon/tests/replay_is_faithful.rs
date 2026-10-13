@@ -1,15 +1,14 @@
 //! A recorded trace replays to the readings that were recorded.
 //!
-//! The test that makes every later milestone's fixtures worth having. Nothing
-//! else in the suite compares a real recording against what the daemon does
-//! with it: the fixture was taken from a live session bus, through the
+//! Nothing else in the suite compares a real recording against what the daemon
+//! does with it: the fixture was taken from a live session bus, through the
 //! production adapter, and every part below this test except the platform is
 //! the article that runs in the binary.
 //!
 //! What it proves is narrow and load-bearing. A reading that a recording
 //! preserved but a replay altered - a rounded position, a dropped nanosecond, a
-//! reordering - would make every fixture in later milestones prove a timeline
-//! that never happened, and nothing downstream of the file could tell.
+//! reordering - would make a test built on a replay prove a timeline that never
+//! happened, and nothing downstream of the file could tell.
 
 #![cfg(unix)]
 

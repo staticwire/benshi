@@ -1,8 +1,7 @@
 //! A watcher whose platform is a file.
 //!
 //! Replaying a recording through the interface a platform implements is what
-//! makes a trace worth keeping: everything above the adapter - policy, the bus,
-//! the session state, whatever a later milestone puts on top - runs against a
+//! makes a trace worth keeping: everything above the adapter runs against a
 //! real session without one being open, and does it in milliseconds.
 //!
 //! **The readings are handed back exactly as recorded, one per round.** A trace
