@@ -2163,7 +2163,10 @@ mod tests {
         let failure = stopped_after(&mut detection, 1).await;
 
         assert!(matches!(failure, TaskError::Permanent(_)), "{failure:?}");
-        assert!(failure.to_string().contains("before 1970"), "{failure}");
+        assert_eq!(
+            failure.to_string(),
+            "clock reads Unix time -1, which is before 1970"
+        );
     }
 
     #[tokio::test]

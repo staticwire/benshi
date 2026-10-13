@@ -24,6 +24,7 @@ pub mod watching;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
@@ -124,11 +125,30 @@ pub enum Error {
     ///
     /// A clock reading either is broken, and the answer is to say so rather
     /// than to write a date that is not the one it read.
-    #[error("clock reads {at:?}, which is before 1970 or after 9999")]
+    #[error("clock reads Unix time {}", out_of_range(.at))]
     Instant {
         /// What the clock read.
-        at: std::time::SystemTime,
+        at: SystemTime,
     },
+}
+
+/// The Unix time of a reading the columns cannot hold, and which side of
+/// what they hold it lies on.
+///
+/// The whole second the reading lies in, as `date +%s` prints it: below
+/// nought before 1970, and the second that began before a reading between
+/// two. A reading that is not before 1970 is taken to be one after 9999,
+/// since the store raises [`Error::Instant`] for no other.
+fn out_of_range(at: &SystemTime) -> String {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(since) => format!("{}, which is after 9999", since.as_secs()),
+        Err(before) => {
+            let before = before.duration();
+            let seconds = before.as_secs() + u64::from(before.subsec_nanos() > 0);
+
+            format!("-{seconds}, which is before 1970")
+        }
+    }
 }
 
 /// What a statement failed with on a database that is open: [`Error::Busy`]
@@ -619,9 +639,29 @@ mod tests {
             .to_string(),
             "media of row 7 in `watching` is not an escaped path: \"%zz\""
         );
+    }
+
+    #[test]
+    fn a_clock_reading_is_said_as_the_unix_time_of_the_second_it_lies_in() {
+        // What `date +%s` prints: a reading between two seconds is said as
+        // the earlier of them, on either side of 1970. Each reading here is
+        // a microsecond from the second it is not said as, which is the one
+        // a reading rounded to the nearest would be said as.
+        let the_year_ten_thousand = Duration::from_hours(70_389_528);
+
         assert_eq!(
-            Error::Instant { at: UNIX_EPOCH }.to_string(),
-            format!("clock reads {UNIX_EPOCH:?}, which is before 1970 or after 9999")
+            Error::Instant {
+                at: UNIX_EPOCH - Duration::from_micros(12_000_001)
+            }
+            .to_string(),
+            "clock reads Unix time -13, which is before 1970"
+        );
+        assert_eq!(
+            Error::Instant {
+                at: UNIX_EPOCH + the_year_ten_thousand + Duration::from_micros(999_999)
+            }
+            .to_string(),
+            "clock reads Unix time 253402300800, which is after 9999"
         );
     }
 }
