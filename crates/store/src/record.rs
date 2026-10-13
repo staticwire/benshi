@@ -292,7 +292,16 @@ mod tests {
         // The first second of the year 10000, in hours since the epoch.
         let the_year_ten_thousand = UNIX_EPOCH + Duration::from_hours(70_389_528);
 
-        for at in [before_the_epoch, the_year_ten_thousand] {
+        for (at, said) in [
+            (
+                before_the_epoch,
+                "clock reads Unix time -1, which is before 1970",
+            ),
+            (
+                the_year_ten_thousand,
+                "clock reads Unix time 253402300800, which is after 9999",
+            ),
+        ] {
             let refused = store.record(&Viewing {
                 at,
                 ..viewing("Show Title", Some(3), b"Show Title - 03.mkv")
@@ -302,6 +311,7 @@ mod tests {
                 matches!(refused, Err(Error::Instant { at: refused_at }) if refused_at == at),
                 "got {refused:?}"
             );
+            assert_eq!(refused.expect_err("refused").to_string(), said);
         }
         assert_eq!(count(&store, "episodes_seen"), 0);
         assert_eq!(count(&store, "sync_queue"), 0);
