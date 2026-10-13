@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn a_line_that_cannot_be_written_says_what_the_serialiser_said() {
-        // A map whose keys are not text is one JSON cannot spell.
+        // A map keyed by a pair is one JSON cannot spell.
         let unwritable = std::collections::BTreeMap::from([((1, 2), 3)]);
 
         let cause = serde_json::to_string(&unwritable).expect_err("JSON has no such key");
