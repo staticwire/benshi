@@ -202,11 +202,12 @@ async fn subscribe(daemon: &mut Daemon) -> Result<()> {
     }
 }
 
-/// Print the daemon's events until it stops sending them.
+/// Print the daemon's events for as long as the daemon sends them.
 ///
-/// Ends when the daemon closes the connection. A client run from a terminal is
-/// ended by the user instead, which the daemon sees as the connection going
-/// away and treats as the ordinary end of a stream.
+/// The stream has no end of its own, so the daemon closing the connection is
+/// the daemon going away, and that is said and is a failure. A client run
+/// from a terminal is ended by the user instead, which the daemon sees as the
+/// connection going away and treats as the ordinary end of a stream.
 async fn watch(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
     subscribe(daemon).await?;
 
@@ -225,7 +226,7 @@ async fn watch(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
         out.flush().context("stream could not be printed")?;
     }
 
-    Ok(())
+    bail!("daemon closed connection")
 }
 
 /// Set what the daemon does with readings from an application.
@@ -987,6 +988,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_says_that_the_daemon_closed_the_connection_and_fails() {
+        // The stream has no end of its own, so the daemon closing it is the
+        // daemon going away. A watch that ended as a success there would
+        // read as a desktop that went quiet, to a person and to a script.
+        let daemon = Daemon::listening(Vec::new());
+        let (watching, out, err) = daemon.watching().await;
+
+        daemon.goes_away();
+        let outcome = timeout(PATIENCE, watching)
+            .await
+            .expect("the watch ends once the daemon is gone")
+            .expect("the watch ran");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(err.text(), "benshi: daemon closed connection\n");
+        assert!(out.text().is_empty(), "printed {:?}", out.text());
+    }
+
+    #[tokio::test]
     async fn why_prints_the_most_recent_decision() {
         let daemon = Daemon::listening(vec![a_source(PLAYER, "mpv")]);
         daemon.has_decided("/anime/[Group] Show Title - 03.mkv");
@@ -1544,6 +1564,31 @@ mod tests {
         assert_eq!(outcome, ExitCode::FAILURE);
         assert!(shown.is_empty(), "printed {shown:?}");
         assert_eq!(complained, "benshi: daemon sent Ok on a stream\n");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_carries_a_line_the_client_cannot_read_is_a_failure_that_names_it() {
+        // A line that is no response at all, after the answer that the
+        // stream is on. Passed over, or taken for the end of the stream, the
+        // line and what was wrong with it would be lost.
+        let line = "not a response";
+        let mut on = serde_json::to_vec(&Response::Ok).expect("serialise");
+        on.push(b'\n');
+        on.extend_from_slice(format!("{line}\n").as_bytes());
+        let (_home, socket, answering) = a_daemon_that_writes(on);
+        let unread = serde_json::from_str::<Response>(line).expect_err("the line is no response");
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Watch, &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "printed {shown:?}");
+        assert_eq!(
+            complained,
+            format!("benshi: daemon sent a line this client cannot read: {line}: {unread}\n")
+        );
     }
 
     #[tokio::test]
