@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 
 /// How long a test waits for a line, or for a helper to end, before calling
 /// it lost. Only ever spent on a failure.
-const PATIENCE: Duration = Duration::from_secs(5);
+///
+/// Real time, and far above the 0.3 s the slowest helper sleeps: a busy
+/// machine can hold a helper up for seconds.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// How a helper ends whose `main` returned.
 const RETURNED: Option<i32> = Some(0);
@@ -140,7 +143,10 @@ fn heard(helper: &mut Command) -> Heard {
         if let Some(ended) = running.0.try_wait().expect("the helper can be waited for") {
             break ended;
         }
-        assert!(waited_from.elapsed() < PATIENCE, "the helper did not end");
+        assert!(
+            waited_from.elapsed() < PATIENCE,
+            "the helper did not end in {PATIENCE:?}"
+        );
         thread::sleep(Duration::from_millis(2));
     };
 
