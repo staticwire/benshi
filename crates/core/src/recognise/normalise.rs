@@ -4,8 +4,9 @@
 //! apart, so neither is compared as it stands. Both are brought to a [`Key`],
 //! so that a filename's key can be compared with the keys the list's entries
 //! are filed under. A key forgives case, width, whitespace and punctuation
-//! between words, the way a season or a part is spelled, a release group, and a
-//! year or a type in brackets.
+//! between words, the way a season or a part is spelled, a release group, a
+//! year or a type in brackets, and a keyword the parser reports as `Other`,
+//! such as `Remastered`.
 //!
 //! **The marks at the very end of a title stay in the key.** `K-ON!` and
 //! `K-ON!!` are different seasons, as are `Nisekoi` and `Nisekoi:`, and nothing
@@ -41,7 +42,11 @@
 //! word of its own is dropped wherever it stands, and so is a type in brackets,
 //! because neither reaches the key from a filename: a list tells a series from
 //! the film of its name by `(TV)` and `(Movie)`, and the parser takes the year
-//! it reads, and a bracketed type, out of the title it reports. Case goes by
+//! it reads, and a bracketed type, out of the title it reports. A keyword the
+//! parser reports as `Other`, in brackets or standing as a word of its own, is
+//! dropped for the same reason, and before the season is read:
+//! `Show Title II Remastered` is the second season of `Show Title`, as a
+//! filename spelling it is. Case goes by
 //! `str::to_lowercase` rather than full case folding, which differs on a few
 //! letters such as German `ß` and Greek `ς`. A combining mark belongs to the
 //! letter it sits on, so a Thai tone mark is neither erased nor taken for
@@ -69,8 +74,8 @@ pub struct Key {
 impl Key {
     /// The key a list entry spelled this way is filed under.
     ///
-    /// Nothing where no letter or digit is left once the season, the part and
-    /// the year are taken out: `Season 2` alone names no entry.
+    /// Nothing where no letter or digit is left once what a key forgives is
+    /// taken out: `Season 2` alone names no entry.
     #[must_use]
     pub fn from_title(title: &str) -> Option<Self> {
         let spelled = Spelled::read(title, Reported::default());
@@ -219,12 +224,12 @@ pub struct Wording {
 /// The words a title spells, and the season and the part it spelled among
 /// them.
 ///
-/// Case, width, a year and a bracketed type are gone from the words, because
-/// each of them is a thing one side writes and the other does not. A season
-/// and a part are gone from them whole, number and all, and are handed back
-/// beside them, as [`Key::from_title`] holds them. What is left is cut on
-/// anything that is not a letter or a digit, so `Fate/Zero` spells `fate` and
-/// `zero`.
+/// Case, width, a year, a bracketed type and a keyword the parser reports as
+/// `Other` are gone from the words, because each of them is a thing one side
+/// writes and the other does not. A season and a part are gone from them
+/// whole, number and all, and are handed back beside them, as
+/// [`Key::from_title`] holds them. What is left is cut on anything that is not
+/// a letter or a digit, so `Fate/Zero` spells `fate` and `zero`.
 ///
 /// No words where the title spells no letters at all, which is the same
 /// answer [`Key::from_title`] gives such a title.
@@ -301,34 +306,39 @@ fn is_dash(c: char) -> bool {
     matches!(c, '-' | '\u{00AD}' | '\u{2010}'..='\u{2015}' | '\u{2212}')
 }
 
-/// The text with every year and every bracketed type taken out.
+/// The text with every year, every bracketed type and every keyword the parser
+/// reports as `Other` taken out.
 ///
 /// A year is four digits from 1900 to 2099, and a type is one of the words the
 /// parser reads as one. A type counts only inside brackets, here as in the
 /// parser: `Show (Movie)` is a film of `Show`, while a bare `TV` is part of a
 /// name. Brackets alone are not enough either, so `[Oshi no Ko]` keeps its name
 /// and `(12)` keeps its number. A year counts in brackets and as a word of its
-/// own, because the parser reports one of either kind apart from the title.
-/// The parser's own range is narrower, and a year outside it is dropped here
-/// from a list entry and a filename's title alike, so the two still meet.
+/// own, because the parser reports one of either kind apart from the title. So
+/// does a keyword such as `Remastered`, for the same reason. The parser's own
+/// range of years is narrower, and a year outside it is dropped here from a
+/// list entry and a filename's title alike, so the two still meet.
 fn without_markers(text: &str) -> String {
-    without_bare_years(&without_bracketed_markers(text))
+    without_bare_markers(&without_bracketed_markers(text))
 }
 
-/// The text with every year standing as a word of its own taken out.
+/// The text with every year and every `Other` keyword taken out where it
+/// stands as a word of its own.
 ///
 /// Digits joined to anything else are part of the name, as they are to the
 /// parser, which reads a year only where the whole token is one: `Show/1999`
-/// and `Maji LOVE 2000%` keep their digits.
-fn without_bare_years(text: &str) -> String {
+/// and `Maji LOVE 2000%` keep their digits. It reads a keyword the same way, so
+/// `Remastered!` stays.
+fn without_bare_markers(text: &str) -> String {
     let mut kept = text.to_owned();
     // From the end, so that a word's range still lines up with `kept` once the
-    // years behind it have gone.
+    // words behind it have gone.
     for word in words(text).into_iter().rev() {
         let before = text[..word.start].chars().next_back();
         let after = text[word.end..].chars().next();
         let stands_alone = before.is_none_or(is_token_break) && after.is_none_or(is_token_break);
-        if stands_alone && is_year(&text[word.start..word.end]) {
+        let spelled = &text[word.start..word.end];
+        if stands_alone && (is_year(spelled) || is_other(spelled)) {
             kept.replace_range(word, " ");
         }
     }
@@ -398,6 +408,25 @@ fn is_type(word: &str) -> bool {
     ];
 
     TYPES.iter().any(|kind| kind.eq_ignore_ascii_case(word))
+}
+
+/// A word the parser reports as `Other` rather than as a name.
+///
+/// The keywords `anitomy-ng` lists for that kind, matched ignoring ASCII case
+/// as it matches them. It reports one in brackets or not.
+fn is_other(word: &str) -> bool {
+    const OTHER: [&str; 8] = [
+        "Remaster",
+        "Remastered",
+        "Uncensored",
+        "Uncut",
+        "TS",
+        "VFR",
+        "Widescreen",
+        "WS",
+    ];
+
+    OTHER.iter().any(|other| other.eq_ignore_ascii_case(word))
 }
 
 /// A number the text spells, and the bytes that spell it.
@@ -992,6 +1021,58 @@ mod tests {
     }
 
     #[test]
+    fn a_keyword_the_parser_reports_as_other_is_not_in_the_key() {
+        // The parser reports such a keyword apart from the title, in any case
+        // and in brackets or not, so a list entry has to lose it as well.
+        for spelling in [
+            "Show Title Remaster",
+            "Show Title Remastered",
+            "Show Title Uncensored",
+            "Show Title Uncut",
+            "Show Title TS",
+            "Show Title VFR",
+            "Show Title Widescreen",
+            "Show Title WS",
+            "Show Title UNCUT",
+            "Show Title (Uncut)",
+        ] {
+            assert_eq!(listed(spelling), listed("Show Title"), "{spelling}");
+            assert_eq!(
+                named(&format!("{spelling} - 03.mkv")),
+                listed("Show Title"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyword_the_parser_reports_as_other_goes_before_the_season_is_read() {
+        // The numeral ends the title the parser reports, so the list reads it
+        // as the season once the keyword after it has gone.
+        assert_eq!(
+            listed("Show Title II Remastered"),
+            listed("Show Title Season 2")
+        );
+        assert_eq!(
+            named("Show Title II Remastered - 03.mkv"),
+            listed("Show Title II Remastered")
+        );
+    }
+
+    #[test]
+    fn a_keyword_that_is_not_a_whole_token_stays() {
+        // The parser reads a keyword only where the whole token is one, so it
+        // reads none in `Remastered!` or in `Show/Uncut`. Each is compared with
+        // the same spelling less the word, as digits joined to a name are.
+        assert_ne!(listed("Show Title Remastered!"), listed("Show Title !"));
+        assert_eq!(
+            named("Show Title Remastered! - 03.mkv"),
+            listed("Show Title Remastered!")
+        );
+        assert_ne!(listed("Show/Uncut"), listed("Show/"));
+    }
+
+    #[test]
     fn a_number_that_is_not_a_year_stays() {
         assert_ne!(listed("Show Title (12)"), listed("Show Title"));
         assert_ne!(listed("Show Title (2150)"), listed("Show Title"));
@@ -1149,6 +1230,7 @@ mod tests {
         assert_eq!(words_in("Fate/Zero"), ["fate", "zero"]);
         assert_eq!(words_in("ＳＨＯＷ　Title (2019)"), ["show", "title"]);
         assert_eq!(words_in("Show Title (TV) 2nd Season"), ["show", "title"]);
+        assert_eq!(words_in("Show Title Remastered"), ["show", "title"]);
         assert!(words_in("(2019)").is_empty());
     }
 }
