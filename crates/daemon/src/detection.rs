@@ -170,6 +170,8 @@ fn refused(error: benshi_store::Error) -> TaskError {
         | Error::Write(_)
         | Error::Operation { .. }
         | Error::Orphan { .. }
+        | Error::Entry { .. }
+        | Error::Showless { .. }
         | Error::Media { .. }
         | Error::Instant { .. } => TaskError::Permanent(error.into()),
     }

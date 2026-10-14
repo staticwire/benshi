@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Written by hand rather than computed, so that adding a migration is a
 /// change in two places that a test holds together.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Every migration, in order, each a script of statements.
 ///
@@ -67,6 +67,39 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     INSERT INTO new_shows (id, title) SELECT id, title FROM shows;
     DROP TABLE shows;
     ALTER TABLE new_shows RENAME TO shows;",
+    // `backend_ids` says which entry of which backend a show is, and a show
+    // is at most one entry of a backend. A link outlives its entry leaving
+    // the list, so an entry that comes back is the show it was. `entry` is
+    // the service's number for the work. `list_entries` is what each list
+    // held when it was last read, a row per entry, and every row of a
+    // backend is replaced when its list is filed. `spellings` is a JSON array
+    // of text, `episode_ms` the length of one episode in milliseconds,
+    // `format` and `status` the names serde gives them in `benshi_core::list`,
+    // `released` a flag, 0 or 1, and `score` from 1 to 100, NULL where there
+    // is none.
+    "CREATE TABLE backend_ids (
+        show INTEGER NOT NULL REFERENCES shows(id),
+        backend TEXT NOT NULL,
+        entry INTEGER NOT NULL,
+        PRIMARY KEY (backend, entry),
+        UNIQUE (show, backend)
+    );
+    CREATE TABLE list_entries (
+        backend TEXT NOT NULL,
+        entry INTEGER NOT NULL,
+        spellings TEXT NOT NULL,
+        format TEXT,
+        episodes INTEGER,
+        episode_ms INTEGER,
+        year INTEGER,
+        released INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        progress INTEGER NOT NULL,
+        rewatches INTEGER NOT NULL,
+        score INTEGER,
+        PRIMARY KEY (backend, entry),
+        FOREIGN KEY (backend, entry) REFERENCES backend_ids(backend, entry)
+    );",
 ];
 
 /// Apply every migration the database has not seen, in order.
@@ -282,7 +315,7 @@ mod tests {
             .expect("a row goes into every table");
         let before = every_row(&connection);
 
-        apply(&mut connection, MIGRATIONS).expect("the second migration applies");
+        apply(&mut connection, &MIGRATIONS[..2]).expect("the second migration applies");
 
         assert_eq!(version(&connection), 2);
         assert_eq!(every_row(&connection), before);
@@ -296,6 +329,114 @@ mod tests {
             })
             .expect("the check runs");
         assert_eq!(broken, 0, "every row points at a show that is there");
+    }
+
+    #[test]
+    fn migration_three_creates_the_two_tables_of_a_list() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+
+        apply(&mut connection, &MIGRATIONS[..3]).expect("the third migration applies");
+
+        assert_eq!(
+            columns(&connection, "backend_ids"),
+            ["show", "backend", "entry"]
+        );
+        assert_eq!(
+            columns(&connection, "list_entries"),
+            [
+                "backend",
+                "entry",
+                "spellings",
+                "format",
+                "episodes",
+                "episode_ms",
+                "year",
+                "released",
+                "status",
+                "progress",
+                "rewatches",
+                "score"
+            ]
+        );
+    }
+
+    /// A database at every migration with the foreign keys on, as a store's
+    /// connection has them, and one show in it, of `id` 1.
+    fn a_database_with_a_show() -> Connection {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("the foreign keys are enforced");
+        apply(&mut connection, MIGRATIONS).expect("every migration applies");
+        connection
+            .execute("INSERT INTO shows (id, title) VALUES (1, 'Show Title')", [])
+            .expect("the show goes in");
+        connection
+    }
+
+    /// Link the show of this `id` to an entry of a backend.
+    fn link(
+        connection: &Connection,
+        show: i64,
+        backend: &str,
+        entry: i64,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO backend_ids (show, backend, entry) VALUES (?1, ?2, ?3)",
+            rusqlite::params![show, backend, entry],
+        )
+    }
+
+    /// Whether a statement was refused by a constraint of this kind, and not
+    /// for anything else, such as a table that is not there.
+    fn refused_by(result: &rusqlite::Result<usize>, constraint: std::ffi::c_int) -> bool {
+        matches!(
+            result,
+            Err(rusqlite::Error::SqliteFailure(failure, _)) if failure.extended_code == constraint
+        )
+    }
+
+    #[test]
+    fn a_link_to_a_show_that_is_not_there_is_refused() {
+        let connection = a_database_with_a_show();
+
+        let refused = link(&connection, 2, "anilist", 21);
+
+        assert!(
+            refused_by(&refused, rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            "got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_show_is_at_most_one_entry_of_a_backend() {
+        // An episode of the show will be sent to the entry its link names.
+        let connection = a_database_with_a_show();
+        link(&connection, 1, "anilist", 21).expect("the first link goes in");
+
+        let refused = link(&connection, 1, "anilist", 22);
+
+        assert!(
+            refused_by(&refused, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            "got {refused:?}"
+        );
+        link(&connection, 1, "another", 22).expect("a link to another backend goes in");
+    }
+
+    #[test]
+    fn an_entry_of_a_list_with_no_link_is_refused() {
+        let connection = a_database_with_a_show();
+
+        let refused = connection.execute(
+            "INSERT INTO list_entries (backend, entry, spellings, released, status, \
+             progress, rewatches) VALUES ('anilist', 21, '[]', 1, 'watching', 3, 0)",
+            [],
+        );
+
+        assert!(
+            refused_by(&refused, rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            "got {refused:?}"
+        );
     }
 
     #[test]
