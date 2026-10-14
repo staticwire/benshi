@@ -26,6 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use benshi_core::ShowId;
 use rusqlite::Connection;
 
 pub use migrate::SCHEMA_VERSION;
@@ -230,16 +231,25 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("every SQLite file has user_version in its header")
     }
-}
 
-/// File a show under its title where it is not filed, and answer its row.
-pub(crate) fn filed(connection: &Connection, title: &str) -> Result<i64, Error> {
-    connection.execute("INSERT OR IGNORE INTO shows (title) VALUES (?1)", [title])?;
-    let show = connection.query_row("SELECT id FROM shows WHERE title = ?1", [title], |row| {
-        row.get(0)
-    })?;
+    /// File a show with this title, and answer the show it is filed as.
+    ///
+    /// A row of its own every time: two entries of one list can share a
+    /// title, and each is a show.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when another connection has the database, and
+    /// [`Error::Write`] when the statement fails for any other reason.
+    pub fn new_show(&self, title: &str) -> Result<ShowId, Error> {
+        let id = self.connection.query_row(
+            "INSERT INTO shows (title) VALUES (?1) RETURNING id",
+            [title],
+            |row| row.get(0),
+        )?;
 
-    Ok(show)
+        Ok(ShowId(id))
+    }
 }
 
 /// Make sure the database's directory exists, private where this call is what
@@ -286,6 +296,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use benshi_core::ShowId;
     use benshi_core::path::RawPath;
     use tempfile::TempDir;
 
@@ -387,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn every_show_filed_is_a_row_of_its_own_whatever_its_title() {
+        let (_home, database) = a_home();
+        let store = Store::open(&database).expect("a fresh database opens");
+
+        let one = store.new_show("Show Title").expect("the show is filed");
+        let other = store.new_show("Show Title").expect("the show is filed");
+
+        assert_ne!(one, other);
+        let titles: Vec<(i64, String)> = store
+            .connection
+            .prepare("SELECT id, title FROM shows ORDER BY id")
+            .expect("the table is there")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("the rows are read")
+            .collect::<Result<_, _>>()
+            .expect("every row is read");
+        assert_eq!(
+            titles,
+            [
+                (one.0, "Show Title".to_owned()),
+                (other.0, "Show Title".to_owned())
+            ]
+        );
+    }
+
+    #[test]
     fn the_database_is_in_wal_mode_and_syncs_only_at_checkpoints() {
         // The store is built for a write a second while anything plays. The
         // default rollback journal at FULL syncs the journal and then the
@@ -433,13 +470,16 @@ mod tests {
 
     const MEDIA: &[u8] = b"/anime/[Group] Show Title - 03.mkv";
 
+    /// The show a store in a hurry files first.
+    const SHOW: ShowId = ShowId(1);
+
     fn an_instant() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_790_000_000)
     }
 
     fn a_total() -> Total {
         Total {
-            title: "Show Title".to_owned(),
+            show: SHOW,
             episode: Some(3),
             media: RawPath::from_bytes(MEDIA.to_vec()),
             watched: Duration::from_mins(9),
@@ -449,7 +489,7 @@ mod tests {
 
     fn a_viewing() -> Viewing {
         Viewing {
-            title: "Show Title".to_owned(),
+            show: SHOW,
             episode: Some(3),
             media: RawPath::from_bytes(MEDIA.to_vec()),
             at: an_instant(),
@@ -458,9 +498,14 @@ mod tests {
 
     /// A store that waits a twentieth of a second for a lock, where one a
     /// daemon opens waits a second. What it answers once it has waited is
-    /// the same, and a test of that need not take the second.
+    /// the same, and a test of that need not take the second. It has the
+    /// show filed.
     fn a_store_in_a_hurry(database: &Path) -> Store {
         let store = Store::open(database).expect("a fresh database opens");
+        assert_eq!(
+            store.new_show("Show Title").expect("the show is filed"),
+            SHOW
+        );
         store
             .connection
             .pragma_update(None, "busy_timeout", 50)
@@ -492,6 +537,17 @@ mod tests {
     }
 
     #[test]
+    fn a_show_filed_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.new_show("Another Show");
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
     fn an_episode_recorded_while_another_connection_writes_is_refused_as_busy() {
         let (_home, database) = a_home();
         let mut store = a_store_in_a_hurry(&database);
@@ -508,7 +564,7 @@ mod tests {
         let store = a_store_in_a_hurry(&database);
         let _writer = a_writer(&database);
 
-        let refused = store.close("Show Title", Some(3));
+        let refused = store.close(SHOW, Some(3));
 
         assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
     }
@@ -522,7 +578,7 @@ mod tests {
         store.keep(&a_total()).expect("the total is kept");
         let _writer = a_writer(&database);
 
-        let asked = store.resume("Show Title", Some(3));
+        let asked = store.resume(SHOW, Some(3));
 
         assert!(matches!(asked, Ok(Some(_))), "got {asked:?}");
     }
@@ -558,7 +614,7 @@ mod tests {
         let store = a_store_without_wal(&database);
         let _alone = a_connection_with_the_file_to_itself(&database);
 
-        let refused = store.resume("Show Title", Some(3));
+        let refused = store.resume(SHOW, Some(3));
 
         assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
     }

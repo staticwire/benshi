@@ -16,17 +16,18 @@
 
 use std::time::{Duration, SystemTime};
 
+use benshi_core::ShowId;
 use benshi_core::path::RawPath;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::record::rfc3339;
-use crate::{Error, Store, filed};
+use crate::{Error, Store};
 
 /// What has been watched of one episode, as it reaches [`Store::keep`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Total {
-    /// The title as the corpus spells it.
-    pub title: String,
+    /// The show that is open, one the store has filed.
+    pub show: ShowId,
     /// The episode in the release's numbering, and none for a film.
     pub episode: Option<u32>,
     /// The file that is open.
@@ -52,9 +53,7 @@ impl Store {
     /// Keep the total watched of an episode.
     ///
     /// The total takes the place of the one kept before, with its media and
-    /// its instant. Whether the episode registered stays as it was. The show
-    /// is filed if it is not, because a total is kept before any episode of
-    /// the show registers.
+    /// its instant. Whether the episode registered stays as it was.
     ///
     /// The column holds whole milliseconds. What is under one is dropped,
     /// and a total longer than the column holds is kept as the longest it
@@ -65,15 +64,15 @@ impl Store {
     /// [`Error::Instant`] for a clock reading before 1970 or past the year
     /// 9999, before anything is written. [`Error::Busy`] when another
     /// connection has the database, and [`Error::Write`] when a statement
-    /// fails for any other reason. The transaction is rolled back with
-    /// either.
+    /// fails for any other reason, a show the store has not filed among
+    /// them. The transaction is rolled back with either.
     pub fn keep(&mut self, total: &Total) -> Result<(), Error> {
         let at = rfc3339(total.at).ok_or(Error::Instant { at: total.at })?;
         let media = total.media.escaped();
         let watched = i64::try_from(total.watched.as_millis()).unwrap_or(i64::MAX);
 
+        let show = total.show.0;
         let transaction = self.connection.transaction()?;
-        let show = filed(&transaction, &total.title)?;
         let kept = transaction.execute(
             "UPDATE watching SET media = ?3, watched_ms = ?4, updated_at = ?5 \
              WHERE show = ?1 AND episode IS ?2",
@@ -100,14 +99,13 @@ impl Store {
     /// not cause. [`Error::Write`] when the row cannot be read for any other
     /// reason, a total below nought included. [`Error::Media`] for a row
     /// whose media is not a path as this store writes one.
-    pub fn resume(&self, title: &str, episode: Option<u32>) -> Result<Option<Kept>, Error> {
+    pub fn resume(&self, show: ShowId, episode: Option<u32>) -> Result<Option<Kept>, Error> {
         let row = self
             .connection
             .query_row(
-                "SELECT watching.id, media, watched_ms, registered \
-                 FROM watching JOIN shows ON shows.id = watching.show \
-                 WHERE shows.title = ?1 AND episode IS ?2",
-                params![title, episode],
+                "SELECT id, media, watched_ms, registered FROM watching \
+                 WHERE show = ?1 AND episode IS ?2",
+                params![show.0, episode],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -143,12 +141,10 @@ impl Store {
     ///
     /// [`Error::Busy`] when another connection has the database, and
     /// [`Error::Write`] when the statement fails for any other reason.
-    pub fn close(&self, title: &str, episode: Option<u32>) -> Result<(), Error> {
+    pub fn close(&self, show: ShowId, episode: Option<u32>) -> Result<(), Error> {
         self.connection.execute(
-            "DELETE FROM watching \
-             WHERE registered = 1 AND episode IS ?2 \
-             AND show = (SELECT id FROM shows WHERE title = ?1)",
-            params![title, episode],
+            "DELETE FROM watching WHERE registered = 1 AND show = ?1 AND episode IS ?2",
+            params![show.0, episode],
         )?;
         Ok(())
     }
@@ -175,6 +171,7 @@ pub(crate) fn registered(
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use benshi_core::ShowId;
     use benshi_core::path::RawPath;
     use tempfile::TempDir;
 
@@ -192,15 +189,30 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(1_790_000_000)
     }
 
+    /// The series a fresh store files first.
+    const SERIES: ShowId = ShowId(1);
+    /// Another show, filed second.
+    const ANOTHER: ShowId = ShowId(2);
+    /// A film, filed third.
+    const FILM: ShowId = ShowId(3);
+
+    /// A store with the series, another show and a film filed.
     fn a_store() -> (TempDir, Store) {
         let home = tempfile::tempdir().expect("a directory of our own");
         let store = Store::open(&home.path().join("benshi.db")).expect("a fresh database opens");
+        for (show, title) in [
+            (SERIES, "Show Title"),
+            (ANOTHER, "Another Show"),
+            (FILM, "A Film"),
+        ] {
+            assert_eq!(store.new_show(title).expect("the show is filed"), show);
+        }
         (home, store)
     }
 
-    fn total(title: &str, episode: Option<u32>, watched: Duration) -> Total {
+    fn total(show: ShowId, episode: Option<u32>, watched: Duration) -> Total {
         Total {
-            title: title.to_owned(),
+            show,
             episode,
             media: RawPath::from_bytes(MEDIA.to_vec()),
             watched,
@@ -208,9 +220,9 @@ mod tests {
         }
     }
 
-    fn viewing(title: &str, episode: Option<u32>) -> Viewing {
+    fn viewing(show: ShowId, episode: Option<u32>) -> Viewing {
         Viewing {
-            title: title.to_owned(),
+            show,
             episode,
             media: RawPath::from_bytes(MEDIA.to_vec()),
             at: an_instant(),
@@ -236,12 +248,12 @@ mod tests {
     fn an_episode_never_opened_has_nothing_to_resume() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
-        let another_episode = store.resume("Show Title", Some(4));
-        let another_show = store.resume("Another Show", Some(3));
-        let the_film = store.resume("Show Title", None);
+        let another_episode = store.resume(SERIES, Some(4));
+        let another_show = store.resume(ANOTHER, Some(3));
+        let the_film = store.resume(SERIES, None);
 
         assert_eq!(rows(&store), 1, "the one that was opened is there");
         assert_eq!(another_episode.expect("the store answers"), None);
@@ -254,13 +266,11 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(A_SITTING, false))
         );
     }
@@ -270,7 +280,7 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
         let (title, episode, media, watched_ms, registered, updated_at): (
@@ -315,22 +325,20 @@ mod tests {
         // arrives here is the sum, and it is kept as it arrives.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
         store
             .keep(&Total {
                 media: RawPath::from_bytes(b"/anime/[Other] Show Title - 03.mkv".to_vec()),
                 at: an_instant() + Duration::from_secs(3600),
-                ..total("Show Title", Some(3), TWO_SITTINGS)
+                ..total(SERIES, Some(3), TWO_SITTINGS)
             })
             .expect("the total is kept");
 
         assert_eq!(rows(&store), 1);
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(Kept {
                 media: RawPath::from_bytes(b"/anime/[Other] Show Title - 03.mkv".to_vec()),
                 watched: TWO_SITTINGS,
@@ -355,15 +363,15 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total("A Film", None, A_SITTING))
+            .keep(&total(FILM, None, A_SITTING))
             .expect("the total is kept");
         store
-            .keep(&total("A Film", None, TWO_SITTINGS))
+            .keep(&total(FILM, None, TWO_SITTINGS))
             .expect("the total is kept");
 
         assert_eq!(rows(&store), 1);
         assert_eq!(
-            store.resume("A Film", None).expect("the store answers"),
+            store.resume(FILM, None).expect("the store answers"),
             Some(kept(TWO_SITTINGS, false))
         );
     }
@@ -373,41 +381,26 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
         store
-            .keep(&total("Show Title", Some(4), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(4), TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .keep(&total(
-                "Another Show",
-                Some(3),
-                Duration::from_millis(5_000),
-            ))
+            .keep(&total(ANOTHER, Some(3), Duration::from_millis(5_000)))
             .expect("the total is kept");
 
         assert_eq!(rows(&store), 3);
-        let shows: u32 = store
-            .connection
-            .query_row("SELECT count(*) FROM shows", [], |row| row.get(0))
-            .expect("the table is there");
-        assert_eq!(shows, 2, "two episodes of one show are one show");
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(A_SITTING, false))
         );
         assert_eq!(
-            store
-                .resume("Show Title", Some(4))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(4)).expect("the store answers"),
             Some(kept(TWO_SITTINGS, false))
         );
         assert_eq!(
-            store
-                .resume("Another Show", Some(3))
-                .expect("the store answers"),
+            store.resume(ANOTHER, Some(3)).expect("the store answers"),
             Some(kept(Duration::from_millis(5_000), false))
         );
     }
@@ -416,36 +409,30 @@ mod tests {
     fn recording_an_episode_marks_its_total_registered() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .keep(&total("Show Title", Some(4), A_SITTING))
+            .keep(&total(SERIES, Some(4), A_SITTING))
             .expect("the total is kept");
         store
-            .keep(&total("Another Show", Some(3), A_SITTING))
+            .keep(&total(ANOTHER, Some(3), A_SITTING))
             .expect("the total is kept");
 
         store
-            .record(&viewing("Show Title", Some(3)))
+            .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(TWO_SITTINGS, true))
         );
         assert_eq!(
-            store
-                .resume("Show Title", Some(4))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(4)).expect("the store answers"),
             Some(kept(A_SITTING, false)),
             "another episode of the show did not register"
         );
         assert_eq!(
-            store
-                .resume("Another Show", Some(3))
-                .expect("the store answers"),
+            store.resume(ANOTHER, Some(3)).expect("the store answers"),
             Some(kept(A_SITTING, false)),
             "the same episode of another show did not register"
         );
@@ -455,15 +442,15 @@ mod tests {
     fn recording_a_film_marks_its_total_registered() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("A Film", None, TWO_SITTINGS))
+            .keep(&total(FILM, None, TWO_SITTINGS))
             .expect("the total is kept");
 
         store
-            .record(&viewing("A Film", None))
+            .record(&viewing(FILM, None))
             .expect("recording cannot fail");
 
         assert_eq!(
-            store.resume("A Film", None).expect("the store answers"),
+            store.resume(FILM, None).expect("the store answers"),
             Some(kept(TWO_SITTINGS, true))
         );
     }
@@ -475,14 +462,12 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .record(&viewing("Show Title", Some(3)))
+            .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
 
         assert_eq!(rows(&store), 0);
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             None
         );
     }
@@ -493,7 +478,7 @@ mod tests {
         // did not happen must not leave an episode that looks registered.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
             .connection
@@ -503,13 +488,11 @@ mod tests {
             )
             .expect("a trigger on this connection");
 
-        let refused = store.record(&viewing("Show Title", Some(3)));
+        let refused = store.record(&viewing(SERIES, Some(3)));
 
         assert!(matches!(refused, Err(Error::Write(_))), "got {refused:?}");
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(TWO_SITTINGS, false))
         );
     }
@@ -521,7 +504,7 @@ mod tests {
         // not outlive the mark.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
             .connection
@@ -531,7 +514,7 @@ mod tests {
             )
             .expect("a trigger on this connection");
 
-        let refused = store.record(&viewing("Show Title", Some(3)));
+        let refused = store.record(&viewing(SERIES, Some(3)));
 
         assert!(matches!(refused, Err(Error::Write(_))), "got {refused:?}");
         let (episodes, operations): (u32, u32) = store
@@ -553,20 +536,18 @@ mod tests {
         // total goes on growing.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
         store
-            .record(&viewing("Show Title", Some(3)))
+            .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
 
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(TWO_SITTINGS, true))
         );
     }
@@ -575,21 +556,17 @@ mod tests {
     fn closing_an_episode_that_registered_drops_its_total() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .record(&viewing("Show Title", Some(3)))
+            .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
         assert_eq!(rows(&store), 1, "there is a total to drop");
 
-        store
-            .close("Show Title", Some(3))
-            .expect("the store closes");
+        store.close(SERIES, Some(3)).expect("the store closes");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             None
         );
         assert_eq!(rows(&store), 0);
@@ -601,17 +578,13 @@ mod tests {
         // they are only if the first two survive the file being closed.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
-        store
-            .close("Show Title", Some(3))
-            .expect("the store closes");
+        store.close(SERIES, Some(3)).expect("the store closes");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(A_SITTING, false))
         );
     }
@@ -619,39 +592,31 @@ mod tests {
     #[test]
     fn closing_an_episode_closes_that_episode_alone() {
         let (_home, mut store) = a_store();
-        for (title, episode) in [
-            ("Show Title", Some(3)),
-            ("Show Title", Some(4)),
-            ("Show Title", None),
-            ("Another Show", Some(3)),
+        for (show, episode) in [
+            (SERIES, Some(3)),
+            (SERIES, Some(4)),
+            (SERIES, None),
+            (ANOTHER, Some(3)),
         ] {
             store
-                .keep(&total(title, episode, TWO_SITTINGS))
+                .keep(&total(show, episode, TWO_SITTINGS))
                 .expect("the total is kept");
             store
-                .record(&viewing(title, episode))
+                .record(&viewing(show, episode))
                 .expect("recording cannot fail");
         }
 
-        store
-            .close("Show Title", Some(3))
-            .expect("the store closes");
+        store.close(SERIES, Some(3)).expect("the store closes");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             None
         );
-        for (title, episode) in [
-            ("Show Title", Some(4)),
-            ("Show Title", None),
-            ("Another Show", Some(3)),
-        ] {
+        for (show, episode) in [(SERIES, Some(4)), (SERIES, None), (ANOTHER, Some(3))] {
             assert_eq!(
-                store.resume(title, episode).expect("the store answers"),
+                store.resume(show, episode).expect("the store answers"),
                 Some(kept(TWO_SITTINGS, true)),
-                "{title} {episode:?} was closed with it"
+                "{show:?} {episode:?} was closed with it"
             );
         }
     }
@@ -660,53 +625,46 @@ mod tests {
     fn closing_a_film_that_registered_drops_its_total() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("A Film", None, TWO_SITTINGS))
+            .keep(&total(FILM, None, TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .record(&viewing("A Film", None))
+            .record(&viewing(FILM, None))
             .expect("recording cannot fail");
         assert_eq!(rows(&store), 1, "there is a total to drop");
 
-        store.close("A Film", None).expect("the store closes");
+        store.close(FILM, None).expect("the store closes");
 
-        assert_eq!(
-            store.resume("A Film", None).expect("the store answers"),
-            None
-        );
+        assert_eq!(store.resume(FILM, None).expect("the store answers"), None);
     }
 
     #[test]
     fn an_episode_opened_again_after_it_closed_begins_from_nothing() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .record(&viewing("Show Title", Some(3)))
+            .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
-        store
-            .close("Show Title", Some(3))
-            .expect("the store closes");
+        store.close(SERIES, Some(3)).expect("the store closes");
 
         store
-            .keep(&total("Show Title", Some(3), Duration::from_millis(5_000)))
+            .keep(&total(SERIES, Some(3), Duration::from_millis(5_000)))
             .expect("the total is kept");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(Duration::from_millis(5_000), false))
         );
     }
 
     #[test]
     fn closing_an_episode_never_opened_is_nothing() {
+        // Whether or not the store has filed the show.
         let (_home, store) = a_store();
 
-        store
-            .close("Show Title", Some(3))
-            .expect("the store closes");
+        store.close(SERIES, Some(3)).expect("the store closes");
+        store.close(ShowId(42), Some(3)).expect("the store closes");
 
         assert_eq!(rows(&store), 0);
     }
@@ -716,17 +674,11 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total(
-                "Show Title",
-                Some(3),
-                Duration::from_nanos(1_999_999_999),
-            ))
+            .keep(&total(SERIES, Some(3), Duration::from_nanos(1_999_999_999)))
             .expect("the total is kept");
 
         assert_eq!(
-            store
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            store.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(Duration::from_millis(1_999), false))
         );
     }
@@ -736,7 +688,7 @@ mod tests {
         let (_home, mut store) = a_store();
 
         store
-            .keep(&total("Show Title", Some(3), Duration::MAX))
+            .keep(&total(SERIES, Some(3), Duration::MAX))
             .expect("the total is kept");
 
         let watched_ms: i64 = store
@@ -754,12 +706,12 @@ mod tests {
         store
             .keep(&Total {
                 media: RawPath::from_bytes(shift_jis.to_vec()),
-                ..total("Show Title", Some(3), A_SITTING)
+                ..total(SERIES, Some(3), A_SITTING)
             })
             .expect("the total is kept");
 
         let resumed = store
-            .resume("Show Title", Some(3))
+            .resume(SERIES, Some(3))
             .expect("the store answers")
             .expect("the total is there");
         assert_eq!(resumed.media.as_bytes(), shift_jis);
@@ -769,14 +721,14 @@ mod tests {
     fn media_that_is_not_a_path_as_the_store_writes_one_is_refused_and_the_row_is_named() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
         store
             .connection
             .execute("UPDATE watching SET media = '/anime/100% - 03.mkv'", [])
             .expect("the row is edited by hand");
 
-        let refused = store.resume("Show Title", Some(3));
+        let refused = store.resume(SERIES, Some(3));
 
         assert!(
             matches!(
@@ -793,14 +745,14 @@ mod tests {
         // total anybody watched.
         let (_home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
         store
             .connection
             .execute("UPDATE watching SET watched_ms = -5", [])
             .expect("the row is edited by hand");
 
-        let refused = store.resume("Show Title", Some(3));
+        let refused = store.resume(SERIES, Some(3));
 
         assert!(
             matches!(
@@ -820,7 +772,7 @@ mod tests {
 
         let refused = store.keep(&Total {
             at: UNIX_EPOCH - Duration::from_secs(1),
-            ..total("Show Title", Some(3), A_SITTING)
+            ..total(SERIES, Some(3), A_SITTING)
         });
 
         assert!(
@@ -828,24 +780,19 @@ mod tests {
             "got {refused:?}"
         );
         assert_eq!(rows(&store), 0);
-        let shows: u32 = store
-            .connection
-            .query_row("SELECT count(*) FROM shows", [], |row| row.get(0))
-            .expect("the table is there");
-        assert_eq!(shows, 0);
     }
 
     #[test]
     fn a_total_is_still_there_after_the_store_is_opened_again() {
         let (home, mut store) = a_store();
         store
-            .keep(&total("Show Title", Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
         store
-            .keep(&total("Show Title", Some(4), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(4), TWO_SITTINGS))
             .expect("the total is kept");
         store
-            .record(&viewing("Show Title", Some(4)))
+            .record(&viewing(SERIES, Some(4)))
             .expect("recording cannot fail");
         drop(store);
 
@@ -853,42 +800,51 @@ mod tests {
             Store::open(&home.path().join("benshi.db")).expect("the database opens again");
 
         assert_eq!(
-            reopened
-                .resume("Show Title", Some(3))
-                .expect("the store answers"),
+            reopened.resume(SERIES, Some(3)).expect("the store answers"),
             Some(kept(A_SITTING, false))
         );
         assert_eq!(
-            reopened
-                .resume("Show Title", Some(4))
-                .expect("the store answers"),
+            reopened.resume(SERIES, Some(4)).expect("the store answers"),
             Some(kept(TWO_SITTINGS, true)),
             "and so is the mark on the one that registered"
         );
     }
 
     #[test]
-    fn a_total_that_cannot_be_kept_leaves_no_show_behind() {
-        // The show is filed before the total is written, so the two are one
-        // transaction: a show with nothing pointing at it is a title the
-        // store never heard anything about.
+    fn a_total_of_a_show_that_is_not_filed_is_refused() {
         let (_home, mut store) = a_store();
-        store
-            .connection
-            .execute_batch(
-                "CREATE TEMP TRIGGER refuse_totals BEFORE INSERT ON watching \
-                 BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
-            )
-            .expect("a trigger on this connection");
 
-        let refused = store.keep(&total("Show Title", Some(3), A_SITTING));
+        let refused = store.keep(&total(ShowId(42), Some(3), A_SITTING));
 
         assert!(matches!(refused, Err(Error::Write(_))), "got {refused:?}");
-        let shows: u32 = store
-            .connection
-            .query_row("SELECT count(*) FROM shows", [], |row| row.get(0))
-            .expect("the table is there");
-        assert_eq!(shows, 0);
         assert_eq!(rows(&store), 0);
+    }
+
+    #[test]
+    fn two_shows_of_one_title_keep_their_totals_apart() {
+        // A title does not name an entry, so the store reaches a total by
+        // the show and never by its title.
+        let (_home, mut store) = a_store();
+        let namesake = store.new_show("Show Title").expect("the show is filed");
+        store
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
+            .expect("the total is kept");
+        store
+            .keep(&total(namesake, Some(3), A_SITTING))
+            .expect("the total is kept");
+        store
+            .record(&viewing(SERIES, Some(3)))
+            .expect("recording cannot fail");
+
+        store.close(SERIES, Some(3)).expect("the store closes");
+
+        assert_eq!(
+            store.resume(SERIES, Some(3)).expect("the store answers"),
+            None
+        );
+        assert_eq!(
+            store.resume(namesake, Some(3)).expect("the store answers"),
+            Some(kept(A_SITTING, false))
+        );
     }
 }

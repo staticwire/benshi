@@ -21,6 +21,7 @@ pub mod normalise;
 pub mod parse;
 pub mod score;
 
+use crate::ShowId;
 use crate::recognise::altname::{Altnames, Assignment};
 use crate::recognise::corpus::Corpus;
 use crate::recognise::index::Index;
@@ -66,6 +67,7 @@ pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Ind
 pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
     let assignment = altnames.assigned(&Key::from_parsed(parsed)?)?;
     Some(Match {
+        show: assignment.show,
         title: assignment.title.clone(),
         episode: parsed.episode,
         stage: Stage::Altname(assignment.clone()),
@@ -82,23 +84,32 @@ pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
 /// Several entries under one key is an answer, and the answer is that the name
 /// does not say. Two list entries share a key honestly - a remake spelled like
 /// its original, a season told from the one before it by a mark a filename
-/// cannot carry - and picking whichever was filed first writes progress against
-/// a title nobody named.
+/// cannot carry, a series and a special that carry one romaji title - and
+/// picking whichever was filed first writes progress against an entry nobody
+/// named.
 #[must_use]
 pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
     let spelled = parsed.title.as_deref()?;
-    let candidates = corpus.candidates(&Key::from_parsed(parsed)?);
+    let candidates: Vec<Candidate> = corpus
+        .candidates(&Key::from_parsed(parsed)?)
+        .into_iter()
+        .map(|show| Candidate {
+            show,
+            title: corpus.title_of(show).unwrap_or_default().to_owned(),
+        })
+        .collect();
 
     match candidates.as_slice() {
         [] => None,
-        [title] => Some(Recognition::Recognised(Match {
-            title: (*title).to_owned(),
+        [one] => Some(Recognition::Recognised(Match {
+            show: one.show,
+            title: one.title.clone(),
             episode: parsed.episode,
             stage: Stage::Key,
         })),
-        several => Some(Recognition::Ambiguous(Ambiguity {
+        _ => Some(Recognition::Ambiguous(Ambiguity {
             parsed: spelled.to_owned(),
-            candidates: several.iter().map(|title| (*title).to_owned()).collect(),
+            candidates,
         })),
     }
 }
@@ -164,11 +175,13 @@ pub enum Stage {
 
 /// A filename that was recognised.
 ///
-/// The title is the corpus entry that matched, rather than the text the filename
+/// The show is the corpus entry that matched, rather than the text the filename
 /// spelled. A [`Refusal`] carries that second thing, and confusing the two is how
 /// a near miss gets written down as a title.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
+    /// The show the corpus filed the entry as.
+    pub show: ShowId,
     /// The title as the corpus spells it.
     pub title: String,
     /// The episode in the release's numbering, as it was read from the name.
@@ -220,29 +233,37 @@ pub struct Refusal {
 ///
 /// Apart from a [`Refusal`] because the two send a reader to different places.
 /// A refusal says the corpus was searched and nothing in it was the title; an
-/// ambiguity says the corpus holds the title more than once and the name does
-/// not say which. What settles it is the entries' own data - a format, an
+/// ambiguity says the name reaches more than one entry and does not say
+/// which. What settles it is the entries' own data - a format, an
 /// episode count, a date - which is the list's to answer and not the text's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ambiguity {
     /// The title as the filename spelled it.
     pub parsed: String,
-    /// The entries it reaches, as the corpus spells them, in the order the
-    /// corpus filed them.
+    /// The entries it reaches, in the order the corpus filed them.
     ///
     /// More than one wherever [`by_key`] built it: one candidate is a [`Match`]
     /// and none is no ambiguity at all. Reserved rather than enforced, as
     /// [`Refusal::best`] is - the field is public and nothing here refuses a
     /// shorter list.
-    pub candidates: Vec<String>,
+    pub candidates: Vec<Candidate>,
+}
+
+/// One entry of several that a name reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// The show the corpus filed the entry as.
+    pub show: ShowId,
+    /// The title as the corpus spells it.
+    pub title: String,
 }
 
 /// What recognition answers with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Recognition {
-    /// A title, and the stage that decided it.
+    /// A show, and the stage that decided it.
     Recognised(Match),
-    /// Several titles, and nothing in the name to choose between them.
+    /// Several entries, and nothing in the name to choose between them.
     ///
     /// A variant of its own rather than a refusal carrying a list, because a
     /// consumer that treats it as a refusal loses the one thing that makes it
@@ -260,7 +281,8 @@ pub enum Recognition {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ambiguity, Match, Recognition, Refusal, Score, Stage, by_key, decide};
+    use super::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage, by_key, decide};
+    use crate::ShowId;
     use crate::path::RawPath;
     use crate::recognise::altname::{Altnames, Assignment};
     use crate::recognise::corpus::Corpus;
@@ -283,13 +305,22 @@ mod tests {
         by_key(&named(name), corpus)
     }
 
-    /// A recognition of this title by this stage, for comparing against.
-    fn recognised(title: &str, episode: Episode) -> Recognition {
+    /// A recognition of this show by this stage, for comparing against.
+    fn recognised(show: i64, title: &str, episode: Episode) -> Recognition {
         Recognition::Recognised(Match {
+            show: ShowId(show),
             title: title.to_owned(),
             episode,
             stage: Stage::Key,
         })
+    }
+
+    /// One of several entries a name reaches.
+    fn candidate(show: i64, title: &str) -> Candidate {
+        Candidate {
+            show: ShowId(show),
+            title: title.to_owned(),
+        }
     }
 
     #[test]
@@ -300,6 +331,7 @@ mod tests {
         // certainty, and a stage on its own does not say how close the call
         // was. The two travel together or neither is worth printing.
         let scored = Recognition::Recognised(Match {
+            show: ShowId(1),
             title: "Show".to_owned(),
             episode: Episode::Only(3),
             stage: Stage::Scored(a_score(0.91)),
@@ -322,6 +354,7 @@ mod tests {
             spelled: "SnK".to_owned(),
             season: None,
             part: None,
+            show: ShowId(1),
             title: "Show".to_owned(),
         });
         let exact = Stage::Key;
@@ -342,6 +375,7 @@ mod tests {
         // own answer is carried rather than a number that may be missing: a
         // film can be marked watched and a file of twelve episodes cannot.
         let film = Match {
+            show: ShowId(1),
             title: "A Film".to_owned(),
             episode: Episode::Absent,
             stage: Stage::Key,
@@ -416,7 +450,7 @@ mod tests {
 
         assert_eq!(
             found("[Group] Show Title - 03 [1080p].mkv", &corpus),
-            Some(recognised("Show Title", Episode::Only(3)))
+            Some(recognised(1, "Show Title", Episode::Only(3)))
         );
     }
 
@@ -435,9 +469,44 @@ mod tests {
             Some(Recognition::Ambiguous(Ambiguity {
                 parsed: "Fruits Basket".to_owned(),
                 candidates: vec![
-                    "Fruits Basket".to_owned(),
-                    "Fruits Basket (2019)".to_owned()
+                    candidate(1, "Fruits Basket"),
+                    candidate(2, "Fruits Basket (2019)")
                 ],
+            }))
+        );
+    }
+
+    #[test]
+    fn two_shows_of_one_title_are_reported_rather_than_merged() {
+        // Two entries that share a title are two shows, and a name that
+        // reaches both names neither. Merged by their title, they would be
+        // one answer, and every file of one would be written to the other.
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(9), "Show Title", Vec::<&str>::new());
+
+        assert_eq!(
+            found("Show Title - 03.mkv", &corpus),
+            Some(Recognition::Ambiguous(Ambiguity {
+                parsed: "Show Title".to_owned(),
+                candidates: vec![candidate(7, "Show Title"), candidate(9, "Show Title")],
+            }))
+        );
+    }
+
+    #[test]
+    fn a_match_names_the_show_it_found() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(9), "Another Show", Vec::<&str>::new());
+
+        assert_eq!(
+            found("Another Show - 03.mkv", &corpus),
+            Some(Recognition::Recognised(Match {
+                show: ShowId(9),
+                title: "Another Show".to_owned(),
+                episode: Episode::Only(3),
+                stage: Stage::Key,
             }))
         );
     }
@@ -462,13 +531,13 @@ mod tests {
 
         assert_eq!(
             found("Nisekoi: - 03.mkv", &corpus),
-            Some(recognised("Nisekoi:", Episode::Only(3)))
+            Some(recognised(2, "Nisekoi:", Episode::Only(3)))
         );
         assert_eq!(
             found("Nisekoi - 03.mkv", &corpus),
             Some(Recognition::Ambiguous(Ambiguity {
                 parsed: "Nisekoi".to_owned(),
-                candidates: vec!["Nisekoi".to_owned(), "Nisekoi:".to_owned()],
+                candidates: vec![candidate(1, "Nisekoi"), candidate(2, "Nisekoi:")],
             }))
         );
     }
@@ -488,7 +557,7 @@ mod tests {
 
         assert_eq!(
             found("Gokushufudou S2 - 03.mkv", &corpus),
-            Some(recognised("Gokushufudou Season 2", Episode::Only(3)))
+            Some(recognised(3, "Gokushufudou Season 2", Episode::Only(3)))
         );
     }
 
@@ -502,7 +571,7 @@ mod tests {
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
         let mut altnames = Altnames::new();
         altnames
-            .name("Nisekoi", "Nisekoi:", &corpus)
+            .name("Nisekoi", ShowId(2), &corpus)
             .expect("two entries under one key are the user's to settle");
 
         assert_eq!(
@@ -513,12 +582,14 @@ mod tests {
                 &Index::of(&corpus)
             ),
             Recognition::Recognised(Match {
+                show: ShowId(2),
                 title: "Nisekoi:".to_owned(),
                 episode: Episode::Only(3),
                 stage: Stage::Altname(Assignment {
                     spelled: "Nisekoi".to_owned(),
                     season: None,
                     part: None,
+                    show: ShowId(2),
                     title: "Nisekoi:".to_owned(),
                 }),
             })
@@ -527,7 +598,7 @@ mod tests {
             by_key(&named("Nisekoi - 03.mkv"), &corpus),
             Some(Recognition::Ambiguous(Ambiguity {
                 parsed: "Nisekoi".to_owned(),
-                candidates: vec!["Nisekoi".to_owned(), "Nisekoi:".to_owned()],
+                candidates: vec![candidate(1, "Nisekoi"), candidate(2, "Nisekoi:")],
             }))
         );
     }
@@ -550,18 +621,20 @@ mod tests {
         let third = named("Kaguya-sama.Love.is.War.S03E03.1080p.WEB-DL.mkv");
         let mut altnames = Altnames::new();
         altnames
-            .name_as_parsed(&third, "Kaguya-sama: Love is War -Ultra Romantic-", &corpus)
+            .name_as_parsed(&third, ShowId(2), &corpus)
             .expect("the third season reaches no entry, so naming it takes nothing");
 
         assert_eq!(
             decide(&third, &altnames, &corpus, &Index::of(&corpus)),
             Recognition::Recognised(Match {
+                show: ShowId(2),
                 title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 episode: Episode::Only(3),
                 stage: Stage::Altname(Assignment {
                     spelled: "Kaguya-sama Love is War".to_owned(),
                     season: Some(3),
                     part: None,
+                    show: ShowId(2),
                     title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 }),
             })
@@ -573,7 +646,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            recognised("Kaguya-sama: Love is War", Episode::Only(3))
+            recognised(1, "Kaguya-sama: Love is War", Episode::Only(3))
         );
     }
 
@@ -591,7 +664,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            recognised("Show Title", Episode::Only(3))
+            recognised(1, "Show Title", Episode::Only(3))
         );
     }
 
@@ -668,7 +741,7 @@ mod tests {
 
         assert_eq!(
             found("[Group] Show Title 01-12 [BD].mkv", &corpus),
-            Some(recognised("Show Title", Episode::Several))
+            Some(recognised(1, "Show Title", Episode::Several))
         );
     }
 }

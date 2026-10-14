@@ -76,6 +76,13 @@ pub struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlayerId(pub String);
 
+/// A show, as the store files it: the `id` of its row in `shows`.
+///
+/// What recognition, a session and a store name a show by. A title is what a
+/// person is shown, and two entries of one list can share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ShowId(pub i64);
+
 /// The application a source belongs to, as the platform names it.
 ///
 /// Distinct from [`PlayerId`], and the distinction is not academic. A live

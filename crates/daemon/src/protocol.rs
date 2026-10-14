@@ -173,9 +173,10 @@ pub enum Outcome {
         /// Which stage decided, and what it decided by.
         stage: DecidedBy,
     },
-    /// Several titles the name reaches, and nothing in it to choose between.
+    /// Several entries the name reaches, and nothing in it to choose between.
     Ambiguous {
-        /// The entries it reaches, as the corpus spells them.
+        /// The title of each entry it reaches, as the corpus spells it. Two
+        /// entries can share one.
         candidates: Vec<String>,
     },
     /// Nothing matched.
@@ -194,7 +195,11 @@ impl Outcome {
                 stage: DecidedBy::of(&found.stage),
             },
             Recognition::Ambiguous(ambiguity) => Self::Ambiguous {
-                candidates: ambiguity.candidates.clone(),
+                candidates: ambiguity
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.title.clone())
+                    .collect(),
             },
             Recognition::Unrecognised(refusal) => Self::Unrecognised {
                 best: refusal.best.map(Score::value),
@@ -234,9 +239,9 @@ mod tests {
     use benshi_core::policy::Policy;
     use benshi_core::recognise::altname::Assignment;
     use benshi_core::recognise::parse::Episode;
-    use benshi_core::recognise::{Ambiguity, Match, Recognition, Refusal, Score, Stage};
+    use benshi_core::recognise::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage};
     use benshi_core::{
-        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
+        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_detect::SourceInfo;
     use std::time::Duration;
@@ -296,6 +301,7 @@ mod tests {
             spelled: "SnK".to_owned(),
             season: Some(3),
             part: None,
+            show: ShowId(1),
             title: "Shingeki no Kyojin".to_owned(),
         }
     }
@@ -303,6 +309,7 @@ mod tests {
     /// A match of this title by this stage, for building decisions from.
     fn found_by(stage: Stage) -> Recognition {
         Recognition::Recognised(Match {
+            show: ShowId(1),
             title: "Shingeki no Kyojin".to_owned(),
             episode: Episode::Only(3),
             stage,
@@ -319,8 +326,14 @@ mod tests {
             Recognition::Ambiguous(Ambiguity {
                 parsed: "Fruits Basket".to_owned(),
                 candidates: vec![
-                    "Fruits Basket".to_owned(),
-                    "Fruits Basket (2019)".to_owned(),
+                    Candidate {
+                        show: ShowId(1),
+                        title: "Fruits Basket".to_owned(),
+                    },
+                    Candidate {
+                        show: ShowId(2),
+                        title: "Fruits Basket (2019)".to_owned(),
+                    },
                 ],
             }),
             Recognition::Unrecognised(Refusal {
@@ -518,8 +531,14 @@ mod tests {
         let explained = Explanation::of(&a_decision(Recognition::Ambiguous(Ambiguity {
             parsed: "Fruits Basket".to_owned(),
             candidates: vec![
-                "Fruits Basket".to_owned(),
-                "Fruits Basket (2019)".to_owned(),
+                Candidate {
+                    show: ShowId(1),
+                    title: "Fruits Basket".to_owned(),
+                },
+                Candidate {
+                    show: ShowId(2),
+                    title: "Fruits Basket (2019)".to_owned(),
+                },
             ],
         })));
 

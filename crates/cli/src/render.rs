@@ -317,7 +317,7 @@ mod tests {
     use benshi_core::recognise::altname::Assignment;
     use benshi_core::recognise::parse::Episode;
     use benshi_core::{
-        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
+        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_daemon::bus::BusEvent;
     use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
@@ -719,6 +719,7 @@ mod tests {
                     spelled: "Kaguya-sama Love is War".to_owned(),
                     season: Some(3),
                     part: None,
+                    show: ShowId(2),
                     title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 }),
             ),
@@ -744,6 +745,7 @@ mod tests {
                     spelled: "SnK".to_owned(),
                     season: None,
                     part: None,
+                    show: ShowId(1),
                     title: "Show Title".to_owned(),
                 }),
                 "stage: altname",

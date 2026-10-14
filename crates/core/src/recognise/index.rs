@@ -31,8 +31,9 @@
 //! an episode number or by dropping the text it could not place. Nothing this
 //! stage does can find a title in `;`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::ShowId;
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::words_in;
 
@@ -61,11 +62,10 @@ pub const SHARED: usize = 2;
 /// The entries each word reaches.
 #[derive(Debug, Clone, Default)]
 pub struct Index {
-    /// Every entry, once, in whatever order the corpus hands its spellings
-    /// over.
-    entries: Vec<String>,
-    /// Which entries a word reaches, by their place in `entries`.
-    reached: HashMap<String, Vec<usize>>,
+    /// How many entries the corpus files under a spelling with a key.
+    entries: usize,
+    /// Which entries a word reaches.
+    reached: HashMap<String, Vec<ShowId>>,
 }
 
 impl Index {
@@ -76,23 +76,21 @@ impl Index {
     #[must_use]
     pub fn of(corpus: &Corpus) -> Self {
         let mut index = Self::default();
-        let mut at = HashMap::new();
-        for (spelled, title) in corpus.spellings() {
-            let entry = *at.entry(title).or_insert_with(|| {
-                index.entries.push(title.to_owned());
-                index.entries.len() - 1
-            });
+        let mut shows = HashSet::new();
+        for (spelled, show) in corpus.spellings() {
+            shows.insert(show);
             for word in words_in(spelled) {
                 let reaches = index.reached.entry(word).or_default();
-                if !reaches.contains(&entry) {
-                    reaches.push(entry);
+                if !reaches.contains(&show) {
+                    reaches.push(show);
                 }
             }
         }
+        index.entries = shows.len();
         index
     }
 
-    /// The entries a name reaches, by title, in one order.
+    /// The entries a name reaches, in the order of their shows.
     ///
     /// Sorted rather than left as they were found: a corpus files its entries
     /// into buckets by key, so the order they come back in is the order of a
@@ -102,20 +100,20 @@ impl Index {
     /// refusal: this stage decides nothing, and a name it cannot narrow is a
     /// name the scorer is not asked about.
     #[must_use]
-    pub fn candidates(&self, spelled: &str) -> Vec<&str> {
+    pub fn candidates(&self, spelled: &str) -> Vec<ShowId> {
         let asked = self.narrowing(&words_in(spelled));
-        let mut shared: HashMap<usize, usize> = HashMap::new();
+        let mut shared: HashMap<ShowId, usize> = HashMap::new();
         for reaches in &asked {
-            for &entry in *reaches {
-                *shared.entry(entry).or_default() += 1;
+            for &show in *reaches {
+                *shared.entry(show).or_default() += 1;
             }
         }
 
         let wanted = SHARED.min(asked.len());
-        let mut found: Vec<&str> = shared
+        let mut found: Vec<ShowId> = shared
             .into_iter()
             .filter(|&(_, carried)| carried >= wanted)
-            .map(|(entry, _)| self.entries[entry].as_str())
+            .map(|(show, _)| show)
             .collect();
         found.sort_unstable();
         found
@@ -126,13 +124,13 @@ impl Index {
     /// Where every word the corpus knows is crowded, the least crowded of them
     /// are used anyway: they narrow badly, and dropping them would lose the
     /// name altogether.
-    fn narrowing(&self, words: &[String]) -> Vec<&[usize]> {
-        let known: Vec<&[usize]> = words
+    fn narrowing(&self, words: &[String]) -> Vec<&[ShowId]> {
+        let known: Vec<&[ShowId]> = words
             .iter()
             .filter_map(|word| self.reached.get(word).map(Vec::as_slice))
             .collect();
-        let ceiling = (self.entries.len() / CROWDED).max(1);
-        let uncrowded: Vec<&[usize]> = known
+        let ceiling = (self.entries / CROWDED).max(1);
+        let uncrowded: Vec<&[ShowId]> = known
             .iter()
             .copied()
             .filter(|reaches| reaches.len() <= ceiling)
@@ -152,10 +150,19 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::Index;
+    use crate::ShowId;
     use crate::path::RawPath;
     use crate::recognise::by_key;
     use crate::recognise::corpus::Corpus;
     use crate::recognise::parse::parse;
+
+    /// The titles of these shows, in the order they are given.
+    fn titled(corpus: &Corpus, shows: Vec<ShowId>) -> Vec<&str> {
+        shows
+            .into_iter()
+            .map(|show| corpus.title_of(show).expect("a candidate is a show filed"))
+            .collect()
+    }
 
     /// A list big enough for a share of it to mean anything: four hundred
     /// entries, every one of them spelling `The` and `Show`.
@@ -171,7 +178,7 @@ mod tests {
         let corpus = a_long_list();
         let index = Index::of(&corpus);
 
-        let found = index.candidates("The Show 137");
+        let found = titled(&corpus, index.candidates("The Show 137"));
 
         assert!(
             found.contains(&"The Show 137"),
@@ -188,7 +195,10 @@ mod tests {
         let corpus = a_long_list();
         let index = Index::of(&corpus);
 
-        assert_eq!(index.candidates("The Show 137"), ["The Show 137"]);
+        assert_eq!(
+            titled(&corpus, index.candidates("The Show 137")),
+            ["The Show 137"]
+        );
     }
 
     #[test]
@@ -200,10 +210,28 @@ mod tests {
         let corpus = a_long_list();
         let index = Index::of(&corpus);
 
-        let found = index.candidates("The Show");
+        let found = titled(&corpus, index.candidates("The Show"));
 
         assert!(found.len() > 100, "nothing here narrows: {}", found.len());
         assert!(found.contains(&"The Show 137"));
+    }
+
+    #[test]
+    fn a_word_is_crowded_by_the_entries_that_carry_it_and_not_by_their_spellings() {
+        // Two hundred entries spelled two ways each, and three more. Two of
+        // the 203 entries carry `alpha`, one more than [`CROWDED`] allows, so
+        // it narrows nothing and `delta` answers alone. Counted by the 403
+        // spellings, two would be allowed, and a name of both words would
+        // reach no entry, since none carries both.
+        let mut corpus = Corpus::new();
+        for n in 0..200 {
+            corpus.file(ShowId(n), &format!("Entry {n}"), [format!("Eintrag {n}")]);
+        }
+        corpus.file(ShowId(200), "Alpha", Vec::<&str>::new());
+        corpus.file(ShowId(201), "Alpha Beta", Vec::<&str>::new());
+        corpus.file(ShowId(202), "Delta", Vec::<&str>::new());
+
+        assert_eq!(Index::of(&corpus).candidates("Alpha Delta"), [ShowId(202)]);
     }
 
     #[test]
@@ -216,7 +244,10 @@ mod tests {
             .collect();
         let index = Index::of(&corpus);
 
-        assert_eq!(index.candidates("Fate Zero"), ["Fate Zero"]);
+        assert_eq!(
+            titled(&corpus, index.candidates("Fate Zero")),
+            ["Fate Zero"]
+        );
     }
 
     #[test]
@@ -227,7 +258,7 @@ mod tests {
         let corpus: Corpus = ["Monster", "Another", "Bleach"].into_iter().collect();
         let index = Index::of(&corpus);
 
-        assert_eq!(index.candidates("Monster"), ["Monster"]);
+        assert_eq!(titled(&corpus, index.candidates("Monster")), ["Monster"]);
     }
 
     #[test]
@@ -249,9 +280,11 @@ mod tests {
 
         assert_eq!(by_key(&file, &corpus), None, "the exact key misses it");
         assert!(
-            index
-                .candidates(file.title.as_deref().expect("the name spells a title"))
-                .contains(&"Shingeki no Kyojin")
+            titled(
+                &corpus,
+                index.candidates(file.title.as_deref().expect("the name spells a title"))
+            )
+            .contains(&"Shingeki no Kyojin")
         );
     }
 
@@ -262,17 +295,14 @@ mod tests {
         // release carrying the romaji title and the English one does, and a
         // second entry would answer it with the title twice.
         let mut corpus = Corpus::new();
-        corpus.file("Shingeki no Kyojin", ["Attack on Titan"]);
+        corpus.file(ShowId(1), "Shingeki no Kyojin", ["Attack on Titan"]);
         let index = Index::of(&corpus);
 
-        assert_eq!(index.candidates("Attack on Titan"), ["Shingeki no Kyojin"]);
-        assert_eq!(
-            index.candidates("Shingeki no Kyojin"),
-            ["Shingeki no Kyojin"]
-        );
+        assert_eq!(index.candidates("Attack on Titan"), [ShowId(1)]);
+        assert_eq!(index.candidates("Shingeki no Kyojin"), [ShowId(1)]);
         assert_eq!(
             index.candidates("Shingeki no Kyojin (Attack on Titan)"),
-            ["Shingeki no Kyojin"]
+            [ShowId(1)]
         );
     }
 
@@ -283,7 +313,7 @@ mod tests {
         // is, and the entry looks to share more of the name's words than it
         // spells.
         let mut corpus: Corpus = ["Beta Gamma"].into_iter().collect();
-        corpus.file("Alpha Show", ["Show Alpha"]);
+        corpus.file(ShowId(2), "Alpha Show", ["Show Alpha"]);
         let index = Index::of(&corpus);
 
         assert!(index.candidates("Show Beta").is_empty());
@@ -293,7 +323,8 @@ mod tests {
     fn candidates_come_back_in_one_order_however_they_were_filed() {
         // A corpus files into buckets by key, so what comes back from it is in
         // the order of a hash map. Left alone, one name would answer in a
-        // different order between two runs of the same program.
+        // different order between two runs of the same program. The order is
+        // that of the shows, numbered here in the order the titles are given.
         //
         // Six entries rather than three, because three of them come back in
         // sorted order by chance about one run in six, and a test that passes
@@ -315,12 +346,12 @@ mod tests {
         assert_eq!(
             index.candidates("Alpha Beta Gamma"),
             [
-                "Alpha Beta",
-                "Alpha Gamma",
-                "Beta Alpha",
-                "Beta Gamma",
-                "Gamma Alpha",
-                "Gamma Beta"
+                ShowId(1),
+                ShowId(2),
+                ShowId(3),
+                ShowId(4),
+                ShowId(5),
+                ShowId(6)
             ]
         );
     }
