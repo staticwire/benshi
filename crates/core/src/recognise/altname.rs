@@ -10,12 +10,12 @@
 //! **An assignment is checked against the corpus while it is being made**,
 //! which is the one moment the user can still do something about it. Three
 //! things are refused, each named by [`Unnameable`]: text that spells no
-//! letters, a title no entry carries, and text that already means one entry of
-//! its own. The last is the dangerous one. An assignment names a *spelling*,
-//! not a file, so every file spelling that way follows it: text already
-//! reaching `Mushoku Tensei: Jobless Reincarnation Cour 2` and pointed at the
-//! special that extends the same name sends every file of the cour to the
-//! special, until somebody takes the assignment back.
+//! letters, a show the corpus does not hold, and text that already means one
+//! entry of its own. The last is the dangerous one. An assignment names a
+//! *spelling*, not a file, so every file spelling that way follows it: text
+//! already reaching `Mushoku Tensei: Jobless Reincarnation Cour 2` and pointed
+//! at the special that extends the same name sends every file of the cour to
+//! the special, until somebody takes the assignment back.
 //!
 //! **Text reaching several entries is not refused**, because there the corpus
 //! answers nothing: `Nisekoi` and `Nisekoi:` are two entries a filename cannot
@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ShowId;
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::Key;
 use crate::recognise::parse::Parsed;
@@ -46,7 +47,9 @@ pub struct Assignment {
     pub season: Option<u32>,
     /// The part the assignment is bound to, where its key holds one.
     pub part: Option<u32>,
-    /// The entry it names, as the corpus spells it.
+    /// The entry it names, as the corpus filed it.
+    pub show: ShowId,
+    /// The title of that entry, as the corpus spells it.
     pub title: String,
 }
 
@@ -72,11 +75,11 @@ pub enum Unnameable {
         /// The text that was given.
         spelled: String,
     },
-    /// No entry in the corpus carries that title.
-    #[error("no entry is titled `{title}`")]
+    /// The corpus holds no such show.
+    #[error("no entry is filed as show {}", .show.0)]
     NotOnTheList {
-        /// The title that was named.
-        title: String,
+        /// The show that was named.
+        show: ShowId,
     },
     /// The text already means one entry, and it is not the one being named.
     ///
@@ -87,7 +90,7 @@ pub enum Unnameable {
     AlreadyMeans {
         /// The text that was given.
         spelled: String,
-        /// The entry that text reaches today.
+        /// The title of the entry that text reaches today.
         entry: String,
     },
 }
@@ -114,13 +117,13 @@ impl Altnames {
     pub fn name(
         &mut self,
         spelled: &str,
-        title: &str,
+        show: ShowId,
         corpus: &Corpus,
     ) -> Result<Named, Unnameable> {
         let key = Key::from_title(spelled).ok_or_else(|| Unnameable::Unspellable {
             spelled: spelled.to_owned(),
         })?;
-        self.record(key, spelled.to_owned(), title, corpus)
+        self.record(key, spelled.to_owned(), show, corpus)
     }
 
     /// Name the entry a file means, from what that file spelled.
@@ -138,14 +141,14 @@ impl Altnames {
     pub fn name_as_parsed(
         &mut self,
         parsed: &Parsed,
-        title: &str,
+        show: ShowId,
         corpus: &Corpus,
     ) -> Result<Named, Unnameable> {
         let spelled = parsed.title.clone().unwrap_or_default();
         let key = Key::from_parsed(parsed).ok_or_else(|| Unnameable::Unspellable {
             spelled: spelled.clone(),
         })?;
-        self.record(key, spelled, title, corpus)
+        self.record(key, spelled, show, corpus)
     }
 
     /// File one assignment, once the corpus has been asked about it.
@@ -153,26 +156,18 @@ impl Altnames {
         &mut self,
         key: Key,
         spelled: String,
-        title: &str,
+        show: ShowId,
         corpus: &Corpus,
     ) -> Result<Named, Unnameable> {
-        // An entry answers to its own title, because the corpus files every
-        // entry under the key of the title as well as under its other
-        // spellings. A title its own key does not reach is a title no entry
-        // carries.
-        let carried = Key::from_title(title)
-            .is_some_and(|of_title| corpus.candidates(&of_title).contains(&title));
-        if !carried {
-            return Err(Unnameable::NotOnTheList {
-                title: title.to_owned(),
-            });
-        }
+        let title = corpus
+            .title_of(show)
+            .ok_or(Unnameable::NotOnTheList { show })?;
         if let [already] = corpus.candidates(&key).as_slice()
-            && *already != title
+            && *already != show
         {
             return Err(Unnameable::AlreadyMeans {
                 spelled,
-                entry: (*already).to_owned(),
+                entry: corpus.title_of(*already).unwrap_or_default().to_owned(),
             });
         }
 
@@ -180,6 +175,7 @@ impl Altnames {
             spelled,
             season: key.season(),
             part: key.part(),
+            show,
             title: title.to_owned(),
         };
         let replaced = self.named.insert(key, recorded.clone());
@@ -208,6 +204,7 @@ impl Altnames {
 #[cfg(test)]
 mod tests {
     use super::{Altnames, Assignment, Unnameable};
+    use crate::ShowId;
     use crate::path::RawPath;
     use crate::recognise::corpus::Corpus;
     use crate::recognise::normalise::Key;
@@ -226,7 +223,7 @@ mod tests {
         let mut altnames = Altnames::new();
 
         let named = altnames
-            .name("SnK", "Shingeki no Kyojin", &corpus)
+            .name("SnK", ShowId(1), &corpus)
             .expect("a text nothing else reaches is free to name");
 
         assert_eq!(
@@ -235,6 +232,7 @@ mod tests {
                 spelled: "SnK".to_owned(),
                 season: None,
                 part: None,
+                show: ShowId(1),
                 title: "Shingeki no Kyojin".to_owned(),
             }
         );
@@ -259,7 +257,7 @@ mod tests {
         let mut altnames = Altnames::new();
 
         let named = altnames
-            .name_as_parsed(&third, "Kaguya-sama: Love is War -Ultra Romantic-", &corpus)
+            .name_as_parsed(&third, ShowId(2), &corpus)
             .expect("the third season reaches no entry, so naming it takes nothing");
 
         assert_eq!(
@@ -268,6 +266,7 @@ mod tests {
                 spelled: "Kaguya-sama Love is War".to_owned(),
                 season: Some(3),
                 part: None,
+                show: ShowId(2),
                 title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
             }
         );
@@ -282,7 +281,7 @@ mod tests {
         let mut altnames = Altnames::new();
 
         let named = altnames
-            .name_as_parsed(&second, "Show Title Part 2", &corpus)
+            .name_as_parsed(&second, ShowId(2), &corpus)
             .expect("the file's key reaches the part it names, so naming it takes nothing");
 
         assert_eq!(named.recorded.spelled, "Show Title");
@@ -308,7 +307,7 @@ mod tests {
 
         let refused = altnames.name(
             "Mushoku Tensei: Jobless Reincarnation Cour 2",
-            "Mushoku Tensei: Jobless Reincarnation Cour 2 - Eris the Goblin Slayer",
+            ShowId(3),
             &corpus,
         );
 
@@ -331,7 +330,7 @@ mod tests {
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
         let mut altnames = Altnames::new();
 
-        assert!(altnames.name("Nisekoi", "Nisekoi:", &corpus).is_ok());
+        assert!(altnames.name("Nisekoi", ShowId(2), &corpus).is_ok());
         assert_eq!(
             altnames
                 .assigned(&Key::from_title("Nisekoi").unwrap())
@@ -341,18 +340,55 @@ mod tests {
     }
 
     #[test]
-    fn a_title_no_entry_carries_cannot_be_named() {
-        // A typo, or an English title the user's list does not carry. Caught
-        // while they are still at the terminal, rather than recorded as a
-        // title that outranks every heuristic and resolves to nothing.
+    fn an_assignment_names_one_show_of_a_title_two_share() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(9), "Show Title", Vec::<&str>::new());
+        let mut altnames = Altnames::new();
+
+        let named = altnames
+            .name("SnK", ShowId(9), &corpus)
+            .expect("a text nothing else reaches is free to name");
+
+        assert_eq!(
+            named.recorded,
+            Assignment {
+                spelled: "SnK".to_owned(),
+                season: None,
+                part: None,
+                show: ShowId(9),
+                title: "Show Title".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn text_that_means_one_show_is_refused_for_another_of_the_same_title() {
+        // The title is the same and the show is not, so the assignment would
+        // take every file of the one and give it to the other.
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", ["Shoo Taitoru"]);
+        corpus.file(ShowId(9), "Show Title", Vec::<&str>::new());
+
+        assert_eq!(
+            Altnames::new().name("Shoo Taitoru", ShowId(9), &corpus),
+            Err(Unnameable::AlreadyMeans {
+                spelled: "Shoo Taitoru".to_owned(),
+                entry: "Show Title".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_show_the_corpus_does_not_hold_cannot_be_named() {
+        // Refused when the assignment is made, rather than recorded as an
+        // entry that outranks every heuristic and resolves to nothing.
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
         let mut altnames = Altnames::new();
 
         assert_eq!(
-            altnames.name("Nisekoi", "False Love", &corpus),
-            Err(Unnameable::NotOnTheList {
-                title: "False Love".to_owned(),
-            })
+            altnames.name("Nisekoi", ShowId(3), &corpus),
+            Err(Unnameable::NotOnTheList { show: ShowId(3) })
         );
     }
 
@@ -365,13 +401,13 @@ mod tests {
         let mut altnames = Altnames::new();
 
         assert_eq!(
-            altnames.name("Season 2", "Show Title", &corpus),
+            altnames.name("Season 2", ShowId(1), &corpus),
             Err(Unnameable::Unspellable {
                 spelled: "Season 2".to_owned(),
             })
         );
         assert!(matches!(
-            altnames.name("P4", "Show Title", &corpus),
+            altnames.name("P4", ShowId(1), &corpus),
             Err(Unnameable::Unspellable { .. })
         ));
     }
@@ -382,10 +418,10 @@ mod tests {
         let mut altnames = Altnames::new();
 
         altnames
-            .name("SnK", "Show Title", &corpus)
+            .name("SnK", ShowId(1), &corpus)
             .expect("free to name");
         let again = altnames
-            .name("SnK", "Another Show", &corpus)
+            .name("SnK", ShowId(2), &corpus)
             .expect("the user may change their mind");
 
         assert_eq!(
@@ -394,6 +430,7 @@ mod tests {
                 spelled: "SnK".to_owned(),
                 season: None,
                 part: None,
+                show: ShowId(1),
                 title: "Show Title".to_owned(),
             })
         );
@@ -407,7 +444,7 @@ mod tests {
         let corpus: Corpus = ["Show Title"].into_iter().collect();
         let mut altnames = Altnames::new();
         altnames
-            .name("SnK", "Show Title", &corpus)
+            .name("SnK", ShowId(1), &corpus)
             .expect("free to name");
 
         let forgotten = altnames.forget("SnK");
@@ -439,7 +476,7 @@ mod tests {
         let mut altnames = Altnames::new();
 
         altnames
-            .name_as_parsed(&third, "Kaguya-sama: Love is War -Ultra Romantic-", &corpus)
+            .name_as_parsed(&third, ShowId(2), &corpus)
             .expect("the third season reaches no entry, so naming it takes nothing");
 
         assert_eq!(
@@ -465,7 +502,7 @@ mod tests {
         let mut altnames = Altnames::new();
 
         altnames
-            .name("ＳＨＯＷ　ＴＩＴＬＥ！", "Show Title", &corpus)
+            .name("ＳＨＯＷ　ＴＩＴＬＥ！", ShowId(1), &corpus)
             .expect("free to name");
 
         assert_eq!(

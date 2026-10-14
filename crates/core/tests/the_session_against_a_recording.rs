@@ -20,7 +20,7 @@ use benshi_core::recognise::{Match, Recognition, Stage, decide};
 use benshi_core::session::{Effect, Session};
 use benshi_core::timeline::{WATCHED_MINIMUM, WATCHED_PERCENT_MIN, WatchedPolicy};
 use benshi_core::trace::Trace;
-use benshi_core::{MediaRef, PlayerSnapshot};
+use benshi_core::{MediaRef, PlayerSnapshot, ShowId};
 
 const RECORDING: &str = include_str!("fixtures/mpv-one-episode.jsonl");
 
@@ -32,6 +32,9 @@ const PLAYING_INTERVALS: usize = 39;
 
 /// The title the list holds for what the recording plays.
 const TITLE: &str = "Test Show";
+
+/// The show the list files that title as.
+const SHOW: ShowId = ShowId(1);
 
 fn recording() -> Vec<PlayerSnapshot> {
     Trace::from_jsonl(RECORDING)
@@ -45,7 +48,8 @@ fn decided(reading: &PlayerSnapshot) -> Recognition {
     let MediaRef::LocalFile(path) = &reading.media else {
         panic!("the recording plays a file")
     };
-    let list: Corpus = [TITLE].into_iter().collect();
+    let mut list = Corpus::new();
+    list.file(SHOW, TITLE, Vec::<&str>::new());
     let name = RawPath::from_bytes(path.file_name().to_vec());
 
     decide(&parse(&name), &Altnames::new(), &list, &Index::of(&list))
@@ -64,6 +68,7 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
     assert_eq!(
         decided(&readings[0]),
         Recognition::Recognised(Match {
+            show: SHOW,
             title: TITLE.to_owned(),
             episode: Episode::Only(3),
             stage: Stage::Key,

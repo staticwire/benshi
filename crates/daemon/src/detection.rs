@@ -450,11 +450,11 @@ impl<W: PlayerWatcher> Detection<W> {
             match effect {
                 Effect::Resume {
                     question,
-                    title,
+                    show,
                     episode,
                 } => {
                     let kept = ask(Arc::clone(&self.store), move |store| {
-                        store.resume(&title, episode)
+                        store.resume(show, episode)
                     })
                     .await?;
                     self.session.resumed(
@@ -466,13 +466,13 @@ impl<W: PlayerWatcher> Detection<W> {
                     );
                 }
                 Effect::Keep {
-                    title,
+                    show,
                     episode,
                     media,
                     watched,
                 } => {
                     let total = Total {
-                        title,
+                        show,
                         episode,
                         media,
                         watched,
@@ -481,21 +481,21 @@ impl<W: PlayerWatcher> Detection<W> {
                     ask(Arc::clone(&self.store), move |store| store.keep(&total)).await?;
                 }
                 Effect::Record {
-                    title,
+                    show,
                     episode,
                     media,
                 } => {
                     let viewing = Viewing {
-                        title,
+                        show,
                         episode,
                         media,
                         at: (self.now)(),
                     };
                     ask(Arc::clone(&self.store), move |store| store.record(&viewing)).await?;
                 }
-                Effect::Close { title, episode } => {
+                Effect::Close { show, episode } => {
                     ask(Arc::clone(&self.store), move |store| {
-                        store.close(&title, episode)
+                        store.close(show, episode)
                     })
                     .await?;
                 }
@@ -543,9 +543,10 @@ mod tests {
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognise::Recognition;
     use benshi_core::recognise::altname::Altnames;
+    use benshi_core::recognise::corpus::Corpus;
     use benshi_core::recognise::parse::Episode;
     use benshi_core::{
-        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
+        AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
     use benshi_store::queue::{Kind, Operation};
@@ -586,6 +587,21 @@ mod tests {
 
     /// The title the list holds for the film.
     const FILM: &str = "A Film";
+
+    /// Two series and a film, each spelled one way, as a store files them.
+    const LIST: [(ShowId, &str); 3] = [
+        (ShowId(1), SERIES),
+        (ShowId(2), "Second Series"),
+        (ShowId(3), FILM),
+    ];
+
+    /// The show of the list with this title.
+    fn show_of(title: &str) -> ShowId {
+        LIST.iter()
+            .find(|(_, listed)| *listed == title)
+            .map(|&(show, _)| show)
+            .expect("the list holds the title")
+    }
 
     const THIRD: &str = "/anime/[Group] Show Title - 03 [1080p].mkv";
     const FOURTH: &str = "/anime/[Group] Show Title - 04 [1080p].mkv";
@@ -657,10 +673,14 @@ mod tests {
     }
 
     impl Database {
+        /// A database with the shows of the list filed.
         fn new() -> Self {
             let home = tempfile::tempdir().expect("a directory of our own");
             let path = home.path().join("data").join("benshi.db");
             let store = Store::open(&path).expect("the database opens");
+            for (show, title) in LIST {
+                assert_eq!(store.new_show(title).expect("the show is filed"), show);
+            }
 
             Self {
                 _home: home,
@@ -669,12 +689,13 @@ mod tests {
             }
         }
 
-        /// What the store holds of an episode.
+        /// What the store holds of an episode of the show of the list with
+        /// this title.
         fn kept(&self, title: &str, episode: Option<u32>) -> Option<Kept> {
             self.store
                 .lock()
                 .expect("the store")
-                .resume(title, episode)
+                .resume(show_of(title), episode)
                 .expect("the total reads")
         }
 
@@ -756,13 +777,14 @@ mod tests {
         }
     }
 
-    /// Two series and a film, each spelled one way, and nothing named by
-    /// hand.
+    /// The list, and nothing named by hand.
     fn a_list() -> Recogniser {
-        Recogniser::of(
-            [SERIES, "Second Series", FILM].into_iter().collect(),
-            Altnames::new(),
-        )
+        let mut corpus = Corpus::new();
+        for (show, title) in LIST {
+            corpus.file(show, title, Vec::<&str>::new());
+        }
+
+        Recogniser::of(corpus, Altnames::new())
     }
 
     /// Wiring to this database and [`the_time`], with the table a user starts
@@ -1646,6 +1668,7 @@ mod tests {
             database.queued(),
             [Operation {
                 id: 1,
+                show: show_of(SERIES),
                 title: SERIES.to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
             }]
@@ -1751,7 +1774,7 @@ mod tests {
             let mut store = database.store.lock().expect("the store");
             store
                 .keep(&Total {
-                    title: SERIES.to_owned(),
+                    show: show_of(SERIES),
                     episode: Some(3),
                     media: a_path(THIRD),
                     watched: STEP * HALF_AT,
@@ -1760,7 +1783,7 @@ mod tests {
                 .expect("the total is kept");
             store
                 .record(&Viewing {
-                    title: SERIES.to_owned(),
+                    show: show_of(SERIES),
                     episode: Some(3),
                     media: a_path(THIRD),
                     at: the_time(),
@@ -2055,7 +2078,12 @@ mod tests {
 
         rounds(&mut detection, HALF_AT + 1).await;
 
-        for table in ["shows", "watching", "episodes_seen", "sync_queue"] {
+        assert_eq!(
+            database.count_of("shows"),
+            [3],
+            "the shows of the list alone"
+        );
+        for table in ["watching", "episodes_seen", "sync_queue"] {
             assert_eq!(database.count_of(table), [0], "{table}");
         }
     }
@@ -2103,7 +2131,7 @@ mod tests {
             .lock()
             .expect("the store")
             .keep(&Total {
-                title: SERIES.to_owned(),
+                show: show_of(SERIES),
                 episode: Some(3),
                 media: a_path(THIRD),
                 watched: STEP,

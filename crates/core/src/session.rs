@@ -67,12 +67,12 @@ use crate::path::RawPath;
 use crate::recognise::Recognition;
 use crate::recognise::parse::Episode;
 use crate::timeline::{Progress, Timeline, WatchedPolicy};
-use crate::{Known, MediaRef, PlayerId, PlayerSnapshot};
+use crate::{Known, MediaRef, PlayerId, PlayerSnapshot, ShowId};
 
 /// What a store is to do, in answer to a reading or to the end of a round.
 ///
-/// A title is the title as the corpus spells it. An episode is in the
-/// release's numbering, and a film has none.
+/// A show is the one recognition named, as the store files it. An episode is
+/// in the release's numbering, and a film has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Ask what was kept of an episode, and bring the answer to
@@ -80,16 +80,16 @@ pub enum Effect {
     Resume {
         /// What the answer is handed back with.
         question: Question,
-        /// The title of what was opened.
-        title: String,
+        /// The show that was opened.
+        show: ShowId,
         /// The episode that was opened.
         episode: Option<u32>,
     },
     /// Keep the total watched of an episode, in place of the one kept
     /// before.
     Keep {
-        /// The title of what is open.
-        title: String,
+        /// The show that is open.
+        show: ShowId,
         /// The episode that is open.
         episode: Option<u32>,
         /// The file the reading that added to the total is of.
@@ -104,8 +104,8 @@ pub enum Effect {
     /// same answer, so a store that marks the total it holds for the episode
     /// holds one by then.
     Record {
-        /// The title of what was seen.
-        title: String,
+        /// The show that was seen.
+        show: ShowId,
         /// The episode that was seen.
         episode: Option<u32>,
         /// The file the reading that reached the policy is of.
@@ -113,8 +113,8 @@ pub enum Effect {
     },
     /// Close the sitting of an episode.
     Close {
-        /// The title of what was open.
-        title: String,
+        /// The show that was open.
+        show: ShowId,
         /// The episode that was open.
         episode: Option<u32>,
     },
@@ -156,8 +156,8 @@ pub struct Resumed {
 struct Named<'reading> {
     /// The file that is open.
     media: &'reading RawPath,
-    /// The title as the corpus spells it.
-    title: &'reading str,
+    /// The show recognition named.
+    show: ShowId,
     /// The episode, and none for a film.
     episode: Option<u32>,
 }
@@ -188,7 +188,7 @@ impl<'reading> Named<'reading> {
 
         Some(Self {
             media,
-            title: &found.title,
+            show: found.show,
             episode,
         })
     }
@@ -269,8 +269,8 @@ enum Count {
 /// reading its last player left at until the round is over.
 #[derive(Debug)]
 struct Sitting {
-    /// The title as the corpus spells it.
-    title: String,
+    /// The show recognition named.
+    show: ShowId,
     /// The episode, and none for a film.
     episode: Option<u32>,
     /// How far the total has got, and who counts into it.
@@ -281,7 +281,7 @@ impl Sitting {
     /// A sitting that begins at this reading and asks the store.
     fn asking(question: Question, named: Named<'_>, reading: &PlayerSnapshot) -> Self {
         Self {
-            title: named.title.to_owned(),
+            show: named.show,
             episode: named.episode,
             count: Count::Asked {
                 question,
@@ -295,7 +295,7 @@ impl Sitting {
 
     /// Whether a reading that names this is a reading of this episode.
     fn is_of(&self, named: Named<'_>) -> bool {
-        self.title == named.title && self.episode == named.episode
+        self.show == named.show && self.episode == named.episode
     }
 
     /// Whether this player has the episode open.
@@ -426,7 +426,7 @@ impl Sitting {
         *watched += added;
 
         let mut effects = vec![Effect::Keep {
-            title: self.title.clone(),
+            show: self.show,
             episode: self.episode,
             media: player.media.clone(),
             watched: *watched,
@@ -439,7 +439,7 @@ impl Sitting {
         if !*registered && policy.counts_as_watched(&reached) {
             *registered = true;
             effects.push(Effect::Record {
-                title: self.title.clone(),
+                show: self.show,
                 episode: self.episode,
                 media: player.media.clone(),
             });
@@ -451,7 +451,7 @@ impl Sitting {
     /// What the sitting ends with.
     fn close(self) -> Effect {
         Effect::Close {
-            title: self.title,
+            show: self.show,
             episode: self.episode,
         }
     }
@@ -587,7 +587,7 @@ impl Session {
 
         Some(Effect::Resume {
             question,
-            title: named.title.to_owned(),
+            show: named.show,
             episode: named.episode,
         })
     }
@@ -602,9 +602,9 @@ mod tests {
     use crate::recognise::corpus::Corpus;
     use crate::recognise::index::Index;
     use crate::recognise::parse::{Episode, parse};
-    use crate::recognise::{Ambiguity, Match, Recognition, Refusal, Stage, decide};
+    use crate::recognise::{Ambiguity, Candidate, Match, Recognition, Refusal, Stage, decide};
     use crate::timeline::{WATCHED_FALLBACK, WatchedPolicy};
-    use crate::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
+    use crate::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
     use std::cell::Cell;
     use std::time::Duration;
 
@@ -622,14 +622,14 @@ mod tests {
     /// second is watched at the reading of this index.
     const ASKED_AT: usize = 100;
 
-    /// The title the list holds for the series.
-    const SERIES: &str = "Show Title";
+    /// The series of the list.
+    const SERIES: ShowId = ShowId(1);
 
-    /// The title the list holds for the film.
-    const FILM: &str = "A Film";
+    /// A second series of the list.
+    const SECOND_SERIES: ShowId = ShowId(2);
 
-    /// The title the list holds for a second series.
-    const SECOND_SERIES: &str = "Second Series";
+    /// The film of the list.
+    const FILM: ShowId = ShowId(3);
 
     const THIRD: &str = "/anime/[Group] Show Title - 03 [1080p].mkv";
     const THIRD_BY_OTHERS: &str = "/anime/[Others] Show Title - 03 [720p].mkv";
@@ -773,7 +773,10 @@ mod tests {
         let MediaRef::LocalFile(path) = &reading.media else {
             return None;
         };
-        let list: Corpus = [SERIES, SECOND_SERIES, FILM].into_iter().collect();
+        let mut list = Corpus::new();
+        for show in [SERIES, SECOND_SERIES, FILM] {
+            list.file(show, title_of(show), Vec::<&str>::new());
+        }
         let name = RawPath::from_bytes(path.file_name().to_vec());
 
         Some(decide(
@@ -784,10 +787,21 @@ mod tests {
         ))
     }
 
+    /// The title of a show of the list, and that of the series for any other
+    /// show.
+    fn title_of(show: ShowId) -> &'static str {
+        match show {
+            SECOND_SERIES => "Second Series",
+            FILM => "A Film",
+            _ => "Show Title",
+        }
+    }
+
     /// A decision written out by hand, for a test that is about the decision.
-    fn recognised(title: &str, episode: Episode) -> Recognition {
+    fn recognised(show: ShowId, episode: Episode) -> Recognition {
         Recognition::Recognised(Match {
-            title: title.to_owned(),
+            show,
+            title: title_of(show).to_owned(),
             episode,
             stage: Stage::Key,
         })
@@ -862,40 +876,37 @@ mod tests {
     }
 
     /// The question of this number, a session's first being the first.
-    fn resume(number: u64, title: &str, episode: Option<u32>) -> Effect {
+    fn resume(number: u64, show: ShowId, episode: Option<u32>) -> Effect {
         Effect::Resume {
             question: Question(number),
-            title: title.to_owned(),
+            show,
             episode,
         }
     }
 
-    fn keep(title: &str, episode: Option<u32>, name: &str, seconds: u64) -> Effect {
-        keep_ms(title, episode, name, seconds * 1000)
+    fn keep(show: ShowId, episode: Option<u32>, name: &str, seconds: u64) -> Effect {
+        keep_ms(show, episode, name, seconds * 1000)
     }
 
-    fn keep_ms(title: &str, episode: Option<u32>, name: &str, millis: u64) -> Effect {
+    fn keep_ms(show: ShowId, episode: Option<u32>, name: &str, millis: u64) -> Effect {
         Effect::Keep {
-            title: title.to_owned(),
+            show,
             episode,
             media: a_path(name),
             watched: Duration::from_millis(millis),
         }
     }
 
-    fn record(title: &str, episode: Option<u32>, name: &str) -> Effect {
+    fn record(show: ShowId, episode: Option<u32>, name: &str) -> Effect {
         Effect::Record {
-            title: title.to_owned(),
+            show,
             episode,
             media: a_path(name),
         }
     }
 
-    fn close(title: &str, episode: Option<u32>) -> Effect {
-        Effect::Close {
-            title: title.to_owned(),
-            episode,
-        }
+    fn close(show: ShowId, episode: Option<u32>) -> Effect {
+        Effect::Close { show, episode }
     }
 
     #[test]
@@ -1017,7 +1028,7 @@ mod tests {
 
     #[test]
     fn an_answer_to_a_question_asked_before_a_close_is_dropped() {
-        // The same episode, closed and opened again, so that title and
+        // The same episode, closed and opened again, so that show and
         // episode tell the two questions apart no longer. A store drops a
         // total at a close where the episode registered, so the answer to
         // the first question says what the store no longer holds: taken, it
@@ -2081,7 +2092,7 @@ mod tests {
 
     #[test]
     fn a_file_of_several_episodes_is_not_recorded() {
-        // The title is recognised, which the first assertion holds, so what
+        // The show is recognised, which the first assertion holds, so what
         // is refused is the episode: a file of twelve is neither the first
         // nor the twelfth, and with no episode it would arrive as a film.
         let mut session = Session::new(half());
@@ -2130,8 +2141,17 @@ mod tests {
         let mut session = Session::new(half());
         let player = Player::named("mpv");
         let either = Recognition::Ambiguous(Ambiguity {
-            parsed: SERIES.to_owned(),
-            candidates: vec![SERIES.to_owned(), "Show Title (2019)".to_owned()],
+            parsed: "Show Title".to_owned(),
+            candidates: vec![
+                Candidate {
+                    show: SERIES,
+                    title: "Show Title".to_owned(),
+                },
+                Candidate {
+                    show: ShowId(4),
+                    title: "Show Title (2019)".to_owned(),
+                },
+            ],
         });
 
         let effects: Vec<Effect> = (0..150)
@@ -2183,7 +2203,7 @@ mod tests {
     fn a_file_decided_otherwise_closes_one_sitting_and_begins_another() {
         // The file stays open and what it is changes under it, a decision
         // being given with every reading. The episode alone changes first,
-        // then the title alone, then the file is nothing the list holds,
+        // then the show alone, then the file is nothing the list holds,
         // and then it is what it was at the start.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
@@ -2191,7 +2211,7 @@ mod tests {
         let the_fourth = recognised(SERIES, Episode::Only(4));
         let of_the_second = recognised(SECOND_SERIES, Episode::Only(4));
         let nothing = Recognition::Unrecognised(Refusal {
-            parsed: SERIES.to_owned(),
+            parsed: "Show Title".to_owned(),
             best: None,
         });
 
@@ -2258,5 +2278,25 @@ mod tests {
                 vec![close(SERIES, Some(3))]
             ]
         );
+    }
+
+    #[test]
+    fn two_shows_of_one_title_are_two_sittings() {
+        // A title does not name an entry. Told apart by their title, the two
+        // would be one sitting, and the time of one would count into the
+        // total of the other.
+        let mut session = Session::new(half());
+        let stamps = Stamps::new();
+        let of_one = recognised(ShowId(7), Episode::Only(3));
+        let of_the_other = recognised(ShowId(9), Episode::Only(3));
+
+        let one = session.advance(&stamps.playing("mpv", THIRD, 1000), Some(&of_one));
+        let the_other = session.advance(
+            &stamps.playing("vlc", THIRD_BY_OTHERS, 1200),
+            Some(&of_the_other),
+        );
+
+        assert_eq!(one, [resume(1, ShowId(7), Some(3))]);
+        assert_eq!(the_other, [resume(2, ShowId(9), Some(3))]);
     }
 }

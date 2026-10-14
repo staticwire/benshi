@@ -26,7 +26,10 @@ use benshi_core::clock::{Clock, TestClock, Timestamp};
 use benshi_core::path::RawPath;
 use benshi_core::policy::Policy;
 use benshi_core::recognise::altname::Altnames;
-use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
+use benshi_core::recognise::corpus::Corpus;
+use benshi_core::{
+    AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
+};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::ipc::bind;
 use benshi_daemon::protocol::{Request, Response, SourceListing};
@@ -235,11 +238,16 @@ fn a_socket() -> (TempDir, PathBuf) {
     (home, socket)
 }
 
-/// A database in that directory, opened the way the binary opens one.
+/// The show the list holds, as a fresh store files it first.
+const THE_SHOW: ShowId = ShowId(1);
+
+/// A database in that directory, opened the way the binary opens one, with
+/// the show of the list filed.
 fn a_store(home: &TempDir) -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(
-        Store::open(&the_database(home)).expect("the database opens"),
-    ))
+    let store = Store::open(&the_database(home)).expect("the database opens");
+    assert_eq!(store.new_show("Show").expect("the show is filed"), THE_SHOW);
+
+    Arc::new(Mutex::new(store))
 }
 
 /// Where the database of [`a_store`] is.
@@ -317,11 +325,13 @@ fn a_daemon_that_tells(
     told: &Told,
 ) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
+    let mut list = Corpus::new();
+    list.file(THE_SHOW, "Show", Vec::<&str>::new());
 
     tokio::spawn(benshi_daemon::run(
         platform.factory(),
         listener,
-        Recogniser::of(["Show"].into_iter().collect(), Altnames::new()),
+        Recogniser::of(list, Altnames::new()),
         Arc::clone(store),
         the_time,
         PERIOD,
@@ -334,7 +344,7 @@ fn watched(store: &Arc<Mutex<Store>>) -> Option<Duration> {
     store
         .lock()
         .expect("the store")
-        .resume("Show", Some(3))
+        .resume(THE_SHOW, Some(3))
         .expect("the total reads")
         .map(|kept| kept.watched)
 }
@@ -442,6 +452,7 @@ async fn a_running_daemon_records_what_its_detection_watched() {
         queued,
         [Operation {
             id: 1,
+            show: THE_SHOW,
             title: "Show".to_owned(),
             kind: Kind::Progress { episode: Some(3) },
         }]
@@ -648,6 +659,7 @@ async fn a_daemon_whose_database_was_in_use_records_once_it_is_free() {
         queued,
         [Operation {
             id: 1,
+            show: THE_SHOW,
             title: "Show".to_owned(),
             kind: Kind::Progress { episode: Some(3) },
         }]

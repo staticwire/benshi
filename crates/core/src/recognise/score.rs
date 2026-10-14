@@ -53,6 +53,7 @@
 
 use std::collections::HashSet;
 
+use crate::ShowId;
 use crate::recognise::corpus::Corpus;
 use crate::recognise::normalise::wording_of;
 use crate::recognise::parse::Parsed;
@@ -117,7 +118,7 @@ pub fn alike(name: &[String], spelling: &[String]) -> Score {
 /// season no candidate spells is refused with nothing scored, and so is a
 /// name that spells two seasons or two parts.
 #[must_use]
-pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Recognition {
+pub fn by_score(parsed: &Parsed, candidates: &[ShowId], corpus: &Corpus) -> Recognition {
     let name = wording_of(&parsed.text);
     let refused = |best| {
         Recognition::Unrecognised(Refusal {
@@ -131,23 +132,23 @@ pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Recogn
     ) else {
         return refused(None);
     };
-    let mut judged: Vec<(Score, usize, &str)> = candidates
+    let mut judged: Vec<(Score, usize, ShowId)> = candidates
         .iter()
-        .filter_map(|title| {
+        .filter_map(|&show| {
             let (score, words) = corpus
-                .spellings_of(title)
+                .spellings_of(show)
                 .into_iter()
                 .map(wording_of)
                 .filter(|spelling| spelling.season == season && spelling.part == part)
                 .map(|spelling| (alike(&name.words, &spelling.words), spelling.words.len()))
                 .max_by(|one, other| one.0.value().total_cmp(&other.0.value()))?;
-            Some((score, words, *title))
+            Some((score, words, show))
         })
         .collect();
     // Stable, so candidates that score alike keep the order they arrived in.
     judged.sort_by(|one, other| other.0.value().total_cmp(&one.0.value()));
 
-    let Some(&(best, words, title)) = judged.first() else {
+    let Some(&(best, words, show)) = judged.first() else {
         return refused(None);
     };
     let runner_up = judged.get(1).map_or(0.0, |&(score, ..)| score.value());
@@ -160,7 +161,8 @@ pub fn by_score(parsed: &Parsed, candidates: &[&str], corpus: &Corpus) -> Recogn
         return refused(Some(best));
     }
     Recognition::Recognised(Match {
-        title: title.to_owned(),
+        show,
+        title: corpus.title_of(show).unwrap_or_default().to_owned(),
         episode: parsed.episode,
         stage: Stage::Scored(best),
     })
@@ -185,10 +187,11 @@ struct Two;
 #[cfg(test)]
 mod tests {
     use super::{NEAR_ENOUGH, alike, by_score};
+    use crate::ShowId;
     use crate::encoding::Confidence;
     use crate::path::RawPath;
     use crate::recognise::corpus::Corpus;
-    use crate::recognise::normalise::words_in;
+    use crate::recognise::normalise::{Key, words_in};
     use crate::recognise::parse::{Episode, Parsed, parse};
     use crate::recognise::{Match, Recognition, Refusal, Score, Stage};
 
@@ -200,6 +203,22 @@ mod tests {
     /// A score the tests use where the exact value is not the point.
     fn a_score(value: f64) -> Score {
         Score::new(value).expect("the value is between nought and one")
+    }
+
+    /// The shows these titles are filed as, for a test that names its
+    /// candidates by their titles.
+    fn shows(corpus: &Corpus, titles: &[&str]) -> Vec<ShowId> {
+        titles
+            .iter()
+            .map(|&title| {
+                let key = Key::from_title(title).expect("a title with letters in it has a key");
+                corpus
+                    .candidates(&key)
+                    .into_iter()
+                    .find(|&show| corpus.title_of(show) == Some(title))
+                    .expect("the title is filed")
+            })
+            .collect()
     }
 
     /// The match an answer carries, where the test says it has to be one.
@@ -224,12 +243,15 @@ mod tests {
 
         let by_the_short = by_score(
             &named("Alpha Beta Gamma - 03.mkv"),
-            &["Alpha Beta", "Alpha Beta Delta"],
+            &shows(&short, &["Alpha Beta", "Alpha Beta Delta"]),
             &short,
         );
         let by_the_long = by_score(
             &named("Alpha Beta Gamma Delta - 03.mkv"),
-            &["Alpha Beta Gamma Delta", "Alpha Beta Gamma Delta Epsilon"],
+            &shows(
+                &long,
+                &["Alpha Beta Gamma Delta", "Alpha Beta Gamma Delta Epsilon"],
+            ),
             &long,
         );
 
@@ -244,13 +266,40 @@ mod tests {
     }
 
     #[test]
+    fn a_scored_answer_names_the_show_it_scored() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", Vec::<&str>::new());
+        corpus.file(
+            ShowId(9),
+            "Show Title Cour 2 The Subtitle",
+            Vec::<&str>::new(),
+        );
+
+        let found = answered(
+            by_score(
+                &named("Show Title Cour 2 - The Subtitle - 03.mkv"),
+                &[ShowId(7), ShowId(9)],
+                &corpus,
+            ),
+            "the subtitle tells the two apart",
+        );
+
+        assert_eq!(found.show, ShowId(9));
+        assert_eq!(found.title, "Show Title Cour 2 The Subtitle");
+    }
+
+    #[test]
     fn a_candidate_with_nothing_to_beat_still_has_to_be_near_enough() {
         // A name reaching one entry has no runner-up, so a margin measured
         // against nothing would answer every name sharing a word with a single
         // entry. `Some Other Show` shares `show` and nothing else.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
-        let alone = by_score(&named("Some Other Show - 03.mkv"), &["Show Title"], &corpus);
+        let alone = by_score(
+            &named("Some Other Show - 03.mkv"),
+            &shows(&corpus, &["Show Title"]),
+            &corpus,
+        );
 
         assert!(matches!(alone, Recognition::Unrecognised(_)));
         assert!(alike(&words_in("Some Other Show"), &words_in("Show Title")).value() < NEAR_ENOUGH);
@@ -267,7 +316,7 @@ mod tests {
         assert!(matches!(
             by_score(
                 &named("Show Title - 03.mkv"),
-                &["Show Title Alpha", "Show Title Beta"],
+                &shows(&corpus, &["Show Title Alpha", "Show Title Beta"]),
                 &corpus
             ),
             Recognition::Unrecognised(_)
@@ -289,7 +338,7 @@ mod tests {
         assert_eq!(
             by_score(
                 &named("Show Title - 03.mkv"),
-                &["Show Title Alpha", "Show Title Beta Gamma"],
+                &shows(&corpus, &["Show Title Alpha", "Show Title Beta Gamma"]),
                 &corpus
             ),
             Recognition::Unrecognised(Refusal {
@@ -323,7 +372,7 @@ mod tests {
         let found = answered(
             by_score(
                 &named("[Group] Shingeki no Kyojin - 03 [1080p].mkv"),
-                &["Shingeki no Kyojin", "Kimi no Na wa"],
+                &shows(&corpus, &["Shingeki no Kyojin", "Kimi no Na wa"]),
                 &corpus,
             ),
             "one candidate stands out",
@@ -349,7 +398,7 @@ mod tests {
         let found = answered(
             by_score(
                 &file,
-                &["Show Title", "Show Title Cour 2 The Subtitle"],
+                &shows(&corpus, &["Show Title", "Show Title Cour 2 The Subtitle"]),
                 &corpus,
             ),
             "the subtitle is in the name even where the title lost it",
@@ -369,7 +418,7 @@ mod tests {
         let found = answered(
             by_score(
                 &named("[SubsPlease] Show Title - 03 (1080p) [A1B2C3D4].mkv"),
-                &["Show Title", "Another Show"],
+                &shows(&corpus, &["Show Title", "Another Show"]),
                 &corpus,
             ),
             "the release's own words are not the name",
@@ -384,12 +433,12 @@ mod tests {
         // English: the entry meets the name on whichever spelling is closest,
         // not on the one its title is written in.
         let mut corpus: Corpus = ["Kimi no Na wa"].into_iter().collect();
-        corpus.file("Shingeki no Kyojin", ["Attack on Titan"]);
+        corpus.file(ShowId(2), "Shingeki no Kyojin", ["Attack on Titan"]);
 
         let found = answered(
             by_score(
                 &named("Attack on Titan - 03.mkv"),
-                &["Shingeki no Kyojin", "Kimi no Na wa"],
+                &shows(&corpus, &["Shingeki no Kyojin", "Kimi no Na wa"]),
                 &corpus,
             ),
             "the English spelling is what matched",
@@ -403,7 +452,7 @@ mod tests {
     fn scored(name: &str, entries: &[&str]) -> Recognition {
         let corpus: Corpus = entries.iter().copied().collect();
 
-        by_score(&named(name), entries, &corpus)
+        by_score(&named(name), &shows(&corpus, entries), &corpus)
     }
 
     /// Whether an answer is a refusal with nothing scored, which is what a
@@ -473,7 +522,11 @@ mod tests {
         let corpus: Corpus = seasons.into_iter().collect();
 
         let found = answered(
-            by_score(&reported("Show Title II", Some(1)), &seasons, &corpus),
+            by_score(
+                &reported("Show Title II", Some(1)),
+                &shows(&corpus, &seasons),
+                &corpus,
+            ),
             "the numeral is the season",
         );
 
@@ -487,7 +540,11 @@ mod tests {
         let seasons = ["Show Title", "Show Title II", "Show Title III"];
         let corpus: Corpus = seasons.into_iter().collect();
 
-        let answer = by_score(&reported("Show Title II", Some(3)), &seasons, &corpus);
+        let answer = by_score(
+            &reported("Show Title II", Some(3)),
+            &shows(&corpus, &seasons),
+            &corpus,
+        );
 
         assert!(nothing_was_scored(&answer), "got {answer:?}");
     }
@@ -548,8 +605,12 @@ mod tests {
         // is scored against the spelling that holds what it spells, and the
         // other spelling is no way in.
         let mut corpus = Corpus::new();
-        corpus.file("Alpha Beta 2nd Season", ["Delta Epsilon Zeta Part 2"]);
-        let entry = ["Alpha Beta 2nd Season"];
+        corpus.file(
+            ShowId(1),
+            "Alpha Beta 2nd Season",
+            ["Delta Epsilon Zeta Part 2"],
+        );
+        let entry = [ShowId(1)];
 
         let by_its_part = by_score(&named("Delta Epsilon Part 2 - 03.mkv"), &entry, &corpus);
         let by_another_season = by_score(&named("Delta Epsilon Zeta II - 03.mkv"), &entry, &corpus);

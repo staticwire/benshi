@@ -17,16 +17,19 @@
 //! **An entry filed under several spellings is one candidate.** Two spellings
 //! of one entry reach one key when the title is repeated among them, or when
 //! they differ only in the marks a lookup widens over. One entry reached twice
-//! is not two entries.
+//! is not two entries. **Two entries that share a title are two candidates**,
+//! because an entry is the show it is filed as, and its title is what a person
+//! is shown.
 
 use std::collections::HashMap;
 
+use crate::ShowId;
 use crate::recognise::normalise::Key;
 
-/// The titles recognition matches against.
+/// The shows recognition matches against.
 ///
 /// Every spelling of an entry is filed under its own key, and every key answers
-/// with the entry's title rather than with the spelling that was reached.
+/// with the entry's show rather than with the spelling that was reached.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
     /// Filed under the key with its marks taken off, so that a name which lost
@@ -34,6 +37,8 @@ pub struct Corpus {
     /// holds is then told apart by the marks alone: everything else about the
     /// key is what put it there.
     filed: HashMap<Key, Vec<Filed>>,
+    /// The title of every show filed, which is what an answer shows a person.
+    titles: HashMap<ShowId, String>,
 }
 
 /// One spelling of one entry.
@@ -46,8 +51,8 @@ struct Filed {
     /// erases the breaks between words, and a stage that compares words needs
     /// them.
     spelled: String,
-    /// The entry's title, which is what an answer names.
-    title: String,
+    /// The show the entry is, which is what an answer names.
+    show: ShowId,
 }
 
 impl Corpus {
@@ -57,19 +62,26 @@ impl Corpus {
         Self::default()
     }
 
-    /// File an entry under its title and under every other spelling it carries.
+    /// File an entry as a show, under its title and under every other spelling
+    /// it carries.
     ///
     /// A spelling with no letters in it is filed nowhere: nothing could look it
     /// up, because a name spelling no letters has no key either.
-    pub fn file(&mut self, title: &str, also_spelled: impl IntoIterator<Item = impl AsRef<str>>) {
-        self.put(title, title);
+    pub fn file(
+        &mut self,
+        show: ShowId,
+        title: &str,
+        also_spelled: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        self.titles.insert(show, title.to_owned());
+        self.put(title, show);
         for spelling in also_spelled {
-            self.put(spelling.as_ref(), title);
+            self.put(spelling.as_ref(), show);
         }
     }
 
     /// File one spelling of one entry.
-    fn put(&mut self, spelling: &str, title: &str) {
+    fn put(&mut self, spelling: &str, show: ShowId) {
         let Some(key) = Key::from_title(spelling) else {
             return;
         };
@@ -79,8 +91,14 @@ impl Corpus {
             .push(Filed {
                 marks: key.marks().to_owned(),
                 spelled: spelling.to_owned(),
-                title: title.to_owned(),
+                show,
             });
+    }
+
+    /// The title a show was filed with, and nothing where it was not filed.
+    #[must_use]
+    pub fn title_of(&self, show: ShowId) -> Option<&str> {
+        self.titles.get(&show).map(String::as_str)
     }
 
     /// Every spelling one entry is filed under.
@@ -89,10 +107,10 @@ impl Corpus {
     /// entry filed under romaji, English and native spellings meets the name on
     /// the closest of those that stage compares, and the title it answers with
     /// is not necessarily the one that matched.
-    pub(super) fn spellings_of(&self, title: &str) -> Vec<&str> {
+    pub(super) fn spellings_of(&self, show: ShowId) -> Vec<&str> {
         let mut found: Vec<&str> = self
             .spellings()
-            .filter(|(_, filed)| *filed == title)
+            .filter(|&(_, filed)| filed == show)
             .map(|(spelled, _)| spelled)
             .collect();
         // Sorted for the same reason the index sorts: these come out of a hash
@@ -106,11 +124,11 @@ impl Corpus {
     ///
     /// For the stage that compares words rather than keys, so that one corpus
     /// answers both and the two cannot be filed differently.
-    pub(super) fn spellings(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub(super) fn spellings(&self) -> impl Iterator<Item = (&str, ShowId)> {
         self.filed
             .values()
             .flatten()
-            .map(|filed| (filed.spelled.as_str(), filed.title.as_str()))
+            .map(|filed| (filed.spelled.as_str(), filed.show))
     }
 
     /// The entries a key reaches, in the order they were filed.
@@ -119,15 +137,15 @@ impl Corpus {
     /// key either hits or misses, and the stages below are what answer a name
     /// that misses.
     #[must_use]
-    pub fn candidates(&self, key: &Key) -> Vec<&str> {
-        let mut found: Vec<&str> = Vec::new();
+    pub fn candidates(&self, key: &Key) -> Vec<ShowId> {
+        let mut found: Vec<ShowId> = Vec::new();
         let Some(bucket) = self.filed.get(&key.without_marks()) else {
             return found;
         };
         for filed in bucket {
             let reached = key.marks().is_empty() || filed.marks == key.marks();
-            if reached && !found.contains(&filed.title.as_str()) {
-                found.push(&filed.title);
+            if reached && !found.contains(&filed.show) {
+                found.push(filed.show);
             }
         }
         found
@@ -135,11 +153,12 @@ impl Corpus {
 }
 
 impl<S: AsRef<str>> FromIterator<S> for Corpus {
-    /// A corpus of entries spelled one way each.
+    /// A corpus of entries spelled one way each, filed as shows numbered from
+    /// one in the order they are given.
     fn from_iter<I: IntoIterator<Item = S>>(titles: I) -> Self {
         let mut corpus = Self::new();
-        for title in titles {
-            corpus.file(title.as_ref(), Vec::<&str>::new());
+        for (show, title) in (1..).zip(titles) {
+            corpus.file(ShowId(show), title.as_ref(), Vec::<&str>::new());
         }
         corpus
     }
@@ -148,6 +167,7 @@ impl<S: AsRef<str>> FromIterator<S> for Corpus {
 #[cfg(test)]
 mod tests {
     use super::Corpus;
+    use crate::ShowId;
     use crate::recognise::normalise::Key;
 
     /// The key a list entry spelled this way is filed under.
@@ -155,11 +175,21 @@ mod tests {
         Key::from_title(title).expect("a title with letters in it has a key")
     }
 
+    /// The titles of the entries this spelling's key reaches, in the order
+    /// the corpus answers them.
+    fn reached<'c>(corpus: &'c Corpus, spelled: &str) -> Vec<&'c str> {
+        corpus
+            .candidates(&listed(spelled))
+            .into_iter()
+            .map(|show| corpus.title_of(show).expect("a candidate is a show filed"))
+            .collect()
+    }
+
     #[test]
     fn an_entry_answers_the_key_of_its_own_spelling() {
         let corpus: Corpus = ["Show Title", "Another Show"].into_iter().collect();
 
-        assert_eq!(corpus.candidates(&listed("Show Title")), ["Show Title"]);
+        assert_eq!(reached(&corpus, "Show Title"), ["Show Title"]);
     }
 
     #[test]
@@ -179,10 +209,30 @@ mod tests {
         // the title files that entry twice. Answered as they are filed, the two
         // would be an ambiguity between one entry and itself.
         let mut corpus = Corpus::new();
-        corpus.file("Show Title", ["Show Title", "Shoo Taitoru"]);
+        corpus.file(ShowId(1), "Show Title", ["Show Title", "Shoo Taitoru"]);
 
-        assert_eq!(corpus.candidates(&listed("Show Title")), ["Show Title"]);
-        assert_eq!(corpus.candidates(&listed("Shoo Taitoru")), ["Show Title"]);
+        assert_eq!(corpus.candidates(&listed("Show Title")), [ShowId(1)]);
+        assert_eq!(corpus.candidates(&listed("Shoo Taitoru")), [ShowId(1)]);
+    }
+
+    #[test]
+    fn two_entries_of_one_title_are_two_candidates() {
+        // A title does not name an entry: AniList holds entries that share a
+        // romaji title. Told apart by the show each is, the two stay two.
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(7), "Show Title", ["Shoo Taitoru"]);
+        corpus.file(ShowId(9), "Show Title", Vec::<&str>::new());
+
+        assert_eq!(
+            corpus.candidates(&listed("Show Title")),
+            [ShowId(7), ShowId(9)]
+        );
+        assert_eq!(corpus.title_of(ShowId(9)), Some("Show Title"));
+        assert_eq!(
+            corpus.spellings_of(ShowId(7)),
+            ["Shoo Taitoru", "Show Title"]
+        );
+        assert_eq!(corpus.spellings_of(ShowId(9)), ["Show Title"]);
     }
 
     #[test]
@@ -192,10 +242,7 @@ mod tests {
         // to the text.
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
 
-        assert_eq!(
-            corpus.candidates(&listed("Nisekoi")),
-            ["Nisekoi", "Nisekoi:"]
-        );
+        assert_eq!(reached(&corpus, "Nisekoi"), ["Nisekoi", "Nisekoi:"]);
     }
 
     #[test]
@@ -204,7 +251,7 @@ mod tests {
         // name that did keep its colon names one season exactly.
         let corpus: Corpus = ["Nisekoi", "Nisekoi:"].into_iter().collect();
 
-        assert_eq!(corpus.candidates(&listed("Nisekoi:")), ["Nisekoi:"]);
+        assert_eq!(reached(&corpus, "Nisekoi:"), ["Nisekoi:"]);
     }
 
     #[test]
@@ -233,15 +280,12 @@ mod tests {
         .collect();
 
         assert_eq!(
-            corpus.candidates(&listed("Show Title Season 2")),
+            reached(&corpus, "Show Title Season 2"),
             ["Show Title Season 2"]
         );
+        assert_eq!(reached(&corpus, "Show Title Part 2"), ["Show Title Part 2"]);
         assert_eq!(
-            corpus.candidates(&listed("Show Title Part 2")),
-            ["Show Title Part 2"]
-        );
-        assert_eq!(
-            corpus.candidates(&listed("Show Title")),
+            reached(&corpus, "Show Title"),
             ["Show Title", "Show Title!"]
         );
     }
@@ -252,10 +296,10 @@ mod tests {
         // arrives in no particular order. A stage picking between spellings
         // that score alike would pick differently between two runs.
         let mut corpus = Corpus::new();
-        corpus.file("Show Title", ["Zeta Spelling", "Alpha Spelling"]);
+        corpus.file(ShowId(1), "Show Title", ["Zeta Spelling", "Alpha Spelling"]);
 
         assert_eq!(
-            corpus.spellings_of("Show Title"),
+            corpus.spellings_of(ShowId(1)),
             ["Alpha Spelling", "Show Title", "Zeta Spelling"]
         );
     }
@@ -266,9 +310,9 @@ mod tests {
         // and nothing can look it up. The entry's other spellings are filed as
         // usual.
         let mut corpus = Corpus::new();
-        corpus.file("Show Title", ["Season 2"]);
+        corpus.file(ShowId(1), "Show Title", ["Season 2"]);
 
-        assert_eq!(corpus.candidates(&listed("Show Title")), ["Show Title"]);
+        assert_eq!(reached(&corpus, "Show Title"), ["Show Title"]);
         assert!(Key::from_title("Season 2").is_none());
     }
 }

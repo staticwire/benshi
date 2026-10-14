@@ -15,6 +15,7 @@
 //! it is written, which is what allows a delivery to be repeated when nobody
 //! can tell whether the first one arrived.
 
+use benshi_core::ShowId;
 use rusqlite::{Connection, params};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -133,7 +134,9 @@ impl<'de> Deserialize<'de> for Rating {
 pub struct Operation {
     /// The row's `id` in `sync_queue`.
     pub id: i64,
-    /// The show it is about, by the title the corpus spells.
+    /// The show it is about.
+    pub show: ShowId,
+    /// That show's title, as the store files it. Two shows can share one.
     pub title: String,
     /// What a list is to be told.
     pub kind: Kind,
@@ -154,25 +157,32 @@ impl Store {
     /// than answering without it.
     pub fn queued(&self) -> Result<Vec<Operation>, Error> {
         let mut statement = self.connection.prepare(
-            "SELECT sync_queue.id, shows.title, sync_queue.kind, sync_queue.payload \
+            "SELECT sync_queue.id, sync_queue.show, shows.title, sync_queue.kind, \
+             sync_queue.payload \
              FROM sync_queue LEFT JOIN shows ON shows.id = sync_queue.show \
              ORDER BY sync_queue.id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
 
         rows.map(|row| {
-            let (id, title, kind, payload) = row?;
+            let (id, show, title, kind, payload) = row?;
             let title = title.ok_or(Error::Orphan { id })?;
             let kind = Kind::from_columns(&kind, &payload)
                 .map_err(|cause| Error::Operation { id, cause })?;
-            Ok(Operation { id, title, kind })
+            Ok(Operation {
+                id,
+                show: ShowId(show),
+                title,
+                kind,
+            })
         })
         .collect()
     }
@@ -243,22 +253,32 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use benshi_core::ShowId;
     use benshi_core::path::RawPath;
+    use rusqlite::OptionalExtension;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{Kind, Operation, Rating, Status, enqueue};
     use crate::{Error, Store, Viewing};
 
+    /// The show a fresh store here files first, titled `Show Title`.
+    const SHOW: ShowId = ShowId(1);
+
+    /// A store with the show filed.
     fn a_store() -> (TempDir, Store) {
         let home = tempfile::tempdir().expect("a directory of our own");
         let store = Store::open(&home.path().join("benshi.db")).expect("a fresh database opens");
+        assert_eq!(
+            store.new_show("Show Title").expect("the show is filed"),
+            SHOW
+        );
         (home, store)
     }
 
     fn a_viewing() -> Viewing {
         Viewing {
-            title: "Show Title".to_owned(),
+            show: SHOW,
             episode: Some(3),
             media: RawPath::from_bytes(b"Show Title - 03.mkv".to_vec()),
             at: UNIX_EPOCH + Duration::from_secs(1_790_000_000),
@@ -292,18 +312,20 @@ mod tests {
         every
     }
 
-    /// File the show if it is new and queue one operation for it.
+    /// Queue one operation for the show of this title, filed where no show
+    /// has it.
     fn queue(store: &Store, title: &str, kind: &Kind) {
-        store
-            .connection
-            .execute("INSERT OR IGNORE INTO shows (title) VALUES (?1)", [title])
-            .expect("the show is filed");
-        let show: i64 = store
+        let filed: Option<i64> = store
             .connection
             .query_row("SELECT id FROM shows WHERE title = ?1", [title], |row| {
                 row.get(0)
             })
-            .expect("the show is there");
+            .optional()
+            .expect("the table is there");
+        let show = match filed {
+            Some(show) => show,
+            None => store.new_show(title).expect("the show is filed").0,
+        };
         enqueue(&store.connection, show, kind, "2026-09-27T00:00:00Z")
             .expect("the operation is queued");
     }
@@ -311,13 +333,6 @@ mod tests {
     /// A row put into the queue by hand, which is how a row this build did
     /// not write gets there.
     fn a_row(store: &Store, kind: &str, payload: &str) {
-        store
-            .connection
-            .execute(
-                "INSERT OR IGNORE INTO shows (title) VALUES ('Show Title')",
-                [],
-            )
-            .expect("the show is filed");
         store
             .connection
             .execute(
@@ -345,11 +360,11 @@ mod tests {
     /// work that out. That is the meaning the documentation of each kind
     /// gives it, written as code.
     #[derive(Debug, Default)]
-    struct Ledger(BTreeMap<String, Listed>);
+    struct Ledger(BTreeMap<ShowId, Listed>);
 
     impl Ledger {
         fn apply(&mut self, operation: &Operation) {
-            let listed = self.0.entry(operation.title.clone()).or_default();
+            let listed = self.0.entry(operation.show).or_default();
             match operation.kind {
                 Kind::Progress {
                     episode: Some(episode),
@@ -381,6 +396,7 @@ mod tests {
             store.queued().expect("the queue is readable"),
             [Operation {
                 id: 1,
+                show: SHOW,
                 title: "Show Title".to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
             }]
@@ -765,14 +781,14 @@ mod tests {
 
             ledger.apply(operation);
             assert_eq!(
-                ledger.0.get("Show Title"),
+                ledger.0.get(&operation.show),
                 Some(&left),
                 "{kind:?} applied once"
             );
 
             ledger.apply(operation);
             assert_eq!(
-                ledger.0.get("Show Title"),
+                ledger.0.get(&operation.show),
                 Some(&left),
                 "{kind:?} applied twice"
             );

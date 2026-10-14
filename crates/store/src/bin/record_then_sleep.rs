@@ -1,5 +1,5 @@
-//! Record one episode into the database at the path given, say so, and sleep
-//! until killed.
+//! File a show in the database at the path given, record one episode of it,
+//! say so, and sleep until killed.
 //!
 //! Exists for one test, which kills this process with `SIGKILL` after the line
 //! is printed and then reads what the file holds. It is not a command anybody
@@ -22,10 +22,11 @@ fn main() {
         .map(PathBuf::from)
         .expect("the database path is the one argument");
     let mut store = Store::open(&path).expect("the database opens");
+    let show = store.new_show("Show Title").expect("the show is filed");
 
     store
         .record(&Viewing {
-            title: "Show Title".to_owned(),
+            show,
             episode: Some(3),
             media: RawPath::from_bytes(b"/anime/[Group] Show Title - 03.mkv".to_vec()),
             at: SystemTime::now(),

@@ -22,6 +22,7 @@
 //! to the arithmetic while holding no rule of its own; whether the best
 //! candidate was scored at all is the fact a refusal is checked for.
 
+use benshi_core::ShowId;
 use benshi_core::path::RawPath;
 use benshi_core::recognise::altname::Altnames;
 use benshi_core::recognise::corpus::Corpus;
@@ -158,7 +159,13 @@ impl Shape {
                     Stage::Scored(_) => StageName::Score,
                 },
             },
-            Recognition::Ambiguous(ambiguity) => Self::Ambiguous(ambiguity.candidates.clone()),
+            Recognition::Ambiguous(ambiguity) => Self::Ambiguous(
+                ambiguity
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.title.clone())
+                    .collect(),
+            ),
             Recognition::Unrecognised(refusal) => Self::Unrecognised(if refusal.best.is_some() {
                 Refused::Scored
             } else {
@@ -188,25 +195,37 @@ fn parsed(name: &RawPath) -> Parsed {
     parse(&RawPath::from_bytes(name.file_name().to_vec()))
 }
 
+/// The list as a corpus, each entry filed as a show numbered by its place.
 fn corpus_of(list: &[Entry]) -> Corpus {
     let mut corpus = Corpus::new();
-    for entry in list {
-        corpus.file(&entry.title, &entry.spellings);
+    for (show, entry) in (1..).zip(list) {
+        corpus.file(ShowId(show), &entry.title, &entry.spellings);
     }
 
     corpus
 }
 
+/// The show of the entry with this title, as [`corpus_of`] files it.
+fn show_titled(list: &[Entry], title: &str, rule: &str) -> ShowId {
+    let Some((show, _)) = (1..).zip(list).find(|(_, entry)| entry.title == title) else {
+        panic!("{rule}: no entry is titled {title:?}");
+    };
+
+    ShowId(show)
+}
+
 /// The assignments a fixture makes, each checked against the corpus as a
 /// user's would be, so a fixture cannot assign what the program refuses.
-fn altnames_of(named: &[Named], corpus: &Corpus, rule: &str) -> Altnames {
+fn altnames_of(named: &[Named], list: &[Entry], corpus: &Corpus, rule: &str) -> Altnames {
     let mut altnames = Altnames::new();
     for assignment in named {
         let made = match assignment {
-            Named::Typed { spelled, title } => altnames.name(spelled, title, corpus),
+            Named::Typed { spelled, title } => {
+                altnames.name(spelled, show_titled(list, title, rule), corpus)
+            }
             Named::FromFile { file, title } => {
                 let file = RawPath::from_bytes(file.as_bytes().to_vec());
-                altnames.name_as_parsed(&parsed(&file), title, corpus)
+                altnames.name_as_parsed(&parsed(&file), show_titled(list, title, rule), corpus)
             }
         };
         made.unwrap_or_else(|refused| panic!("{rule}: the assignment was refused: {refused}"));
@@ -224,7 +243,7 @@ fn every_fixture_resolves_to_the_answer_it_expects() {
     for fixture in fixtures() {
         let corpus = corpus_of(&fixture.list);
         let index = Index::of(&corpus);
-        let altnames = altnames_of(&fixture.altnames, &corpus, &fixture.rule);
+        let altnames = altnames_of(&fixture.altnames, &fixture.list, &corpus, &fixture.rule);
 
         let answer = decide(&parsed(&fixture.name), &altnames, &corpus, &index);
 

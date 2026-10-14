@@ -125,13 +125,14 @@ mod tests {
     use benshi_core::recognise::corpus::Corpus;
     use benshi_core::recognise::parse::Episode;
     use benshi_core::recognise::{Match, Recognition, Refusal, Stage};
-    use benshi_core::{MediaRef, PlayerId};
+    use benshi_core::{MediaRef, PlayerId, ShowId};
 
     fn a_path(name: &str) -> RawPath {
         RawPath::from_bytes(name.as_bytes().to_vec())
     }
 
-    /// A list of these titles, each spelled one way.
+    /// A list of these titles, each spelled one way, filed as shows numbered
+    /// from one in the order given.
     fn a_list_of(titles: &[&str]) -> Corpus {
         titles.iter().collect()
     }
@@ -187,6 +188,7 @@ mod tests {
         assert_eq!(
             answer,
             Recognition::Recognised(Match {
+                show: ShowId(1),
                 title: "Show Title".to_owned(),
                 episode: Episode::Only(3),
                 stage: Stage::Key,
@@ -199,7 +201,7 @@ mod tests {
         let list = a_list_of(&["Show Title", "Another Show"]);
         let mut named = Altnames::new();
         named
-            .name("ShoTi", "Show Title", &list)
+            .name("ShoTi", ShowId(1), &list)
             .expect("text that reaches no entry can be named");
         let recogniser = Recogniser::of(list, named);
 
@@ -209,6 +211,7 @@ mod tests {
             matches!(
                 &answer,
                 Recognition::Recognised(Match {
+                    show: ShowId(1),
                     title,
                     episode: Episode::Only(3),
                     stage: Stage::Altname(_),
@@ -234,6 +237,7 @@ mod tests {
             matches!(
                 &answer,
                 Recognition::Recognised(Match {
+                    show: ShowId(2),
                     title,
                     episode: Episode::Only(3),
                     stage: Stage::Scored(_),
