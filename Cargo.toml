@@ -33,3 +33,14 @@ let_underscore_must_use = "deny"
 dbg_macro = "deny"
 print_stderr = "deny"
 print_stdout = "deny"
+
+# Debug information is trimmed to keep `target` small. Line tables keep the
+# file and the line in a backtrace for code compiled in a workspace crate,
+# and that includes a dependency's generic code instantiated there. Code
+# compiled in a dependency carries none, so its frames show a name and no
+# line. A debugger shows no local variables.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
