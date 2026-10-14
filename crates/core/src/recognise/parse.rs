@@ -285,8 +285,8 @@ fn part_lost_after_season(text: &str, elements: &[Element]) -> Option<u32> {
 /// counting them would tell against every candidate alike. That takes in
 /// `ElementKind::Other`: a word from the parser's keyword list, such as
 /// `Uncensored`, or a broadcast marker, such as `7月新番`. A list entry can
-/// spell such a word, as `Kite Remastered` does, and a file named after it is
-/// compared without the word.
+/// spell such a keyword, as `Kite Remastered` does, and its key and its words
+/// are read without it too.
 ///
 /// **A number goes with what marks it.** The parser reports a season, an
 /// episode, a volume and a part as the number alone: `S01E03` comes back as
