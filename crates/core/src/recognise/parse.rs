@@ -17,6 +17,8 @@
 //! the part belongs to no element at all. [`parse`] reads it back from that
 //! one place and no other.
 
+use std::ops::Range;
+
 use anitomy_ng::{Element, ElementKind, Options};
 use serde::{Deserialize, Serialize};
 
@@ -109,9 +111,10 @@ pub struct Parsed {
     /// a title of `Show Title` and the subtitle belongs to no element at all.
     /// A stage reading the title alone cannot tell such a file from the series
     /// it extends. What is struck out is the release group, the episode, the
-    /// season, the part, the year, the resolution, the source, the extension
-    /// and the rest of the release's own vocabulary - everything a list never
-    /// spells, and nothing a name might be.
+    /// season, the part and the volume with the words that mark them, the
+    /// year, the resolution, the source, the extension and the rest of the
+    /// release's own vocabulary - everything a list never spells, and nothing a
+    /// name might be.
     ///
     /// A space is left wherever something was struck out, so that the words on
     /// either side of it stay two words.
@@ -274,33 +277,144 @@ fn part_lost_after_season(text: &str, elements: &[Element]) -> Option<u32> {
     part_in(&between)
 }
 
-/// The name with everything the release itself spells struck out.
+/// The name with what the release itself spells struck out.
 ///
 /// Kept: the title, an episode title, and anything the parser could not place,
 /// which is where a subtitle beyond the end of the title ends up. Struck out:
-/// every other kind, because a list entry never spells a resolution, a group or
-/// an episode number, and counting them would tell against every candidate
-/// alike.
+/// what an element of any other kind spells and every word it touches, because
+/// a list entry never spells a resolution, a group or an episode number, and
+/// counting them would tell against every candidate alike.
+///
+/// **A number goes with what marks it.** The parser reports a season, an
+/// episode, a volume and a part as the number alone: `S01E03` comes back as
+/// `01` and `03`, and `Season II` as `2`, one character long. Each of its
+/// patterns matches a word whole, so striking whole words takes the `S` and
+/// the `E`, the `x` of `1x03`, the `nd` of `2nd` and both letters of `II`. A
+/// word the parser lists as marking a number goes too, where it stands before
+/// a number of its own kind with nothing but delimiters between, as in
+/// `Episode 03` and `Vol.2`. A season's word and a part's also go after one,
+/// as in `2nd Season` and `2nd Cour`. Such a word standing apart in the title
+/// stays: in `New Season S01E03` the season is reported, but not through the
+/// `Season` before it.
 ///
 /// What goes is replaced by a space rather than removed, so that two words
 /// which were apart stay apart. Positions come from the parser and are counted
 /// in `char`s.
 fn without_the_release(text: &str, elements: &[Element]) -> String {
-    let mut kept: Vec<char> = text.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
+    let words = words_of(&chars);
+    let mut struck = vec![false; chars.len()];
+    let mut carries: Vec<Vec<ElementKind>> = vec![Vec::new(); words.len()];
+    let mut named = vec![false; words.len()];
     for element in elements {
-        if matches!(
-            element.kind,
-            ElementKind::Title | ElementKind::EpisodeTitle | ElementKind::Other
-        ) {
-            continue;
-        }
-        let from = element.position.min(kept.len());
-        let upto = (from + element.value.chars().count()).min(kept.len());
-        for slot in &mut kept[from..upto] {
-            *slot = ' ';
+        let from = element.position.min(chars.len());
+        let upto = (from + element.value.chars().count()).min(chars.len());
+        let touched = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word.start < upto && from < word.end);
+        match element.kind {
+            ElementKind::Title | ElementKind::EpisodeTitle | ElementKind::Other => {
+                for (at, _) in touched {
+                    named[at] = true;
+                }
+            }
+            kind => {
+                struck[from..upto].fill(true);
+                for (at, word) in touched {
+                    struck[word.clone()].fill(true);
+                    carries[at].push(kind);
+                }
+            }
         }
     }
-    kept.into_iter().collect()
+
+    let only_delimiters = |one: &Range<usize>, other: &Range<usize>| {
+        chars[one.end..other.start].iter().all(|&c| is_delimiter(c))
+    };
+    for (at, word) in words.iter().enumerate() {
+        let Some(kind) = number_marked_by(&chars[word.clone()]) else {
+            continue;
+        };
+        let before_one = words
+            .get(at + 1)
+            .is_some_and(|next| carries[at + 1].contains(&kind) && only_delimiters(word, next));
+        let after_one = matches!(kind, ElementKind::Season | ElementKind::Part)
+            && at.checked_sub(1).is_some_and(|before| {
+                carries[before].contains(&kind) && only_delimiters(&words[before], word)
+            });
+        if !named[at] && (before_one || after_one) {
+            struck[word.clone()].fill(true);
+        }
+    }
+
+    chars
+        .iter()
+        .zip(&struck)
+        .map(|(&c, &gone)| if gone { ' ' } else { c })
+        .collect()
+}
+
+/// Where each run of letters and digits in the name lies, counted in `char`s.
+fn words_of(chars: &[char]) -> Vec<Range<usize>> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (at, c) in chars.iter().enumerate() {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                words.push(from..at);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        words.push(from..chars.len());
+    }
+    words
+}
+
+/// The kind of number the parser reads this word as marking, where it reads
+/// it as marking one.
+///
+/// The words `anitomy-ng` lists for an episode, a season, a volume and a part,
+/// matched ignoring ASCII case as it matches them.
+fn number_marked_by(word: &[char]) -> Option<ElementKind> {
+    const MARKERS: [(&str, ElementKind); 16] = [
+        ("Ep", ElementKind::Episode),
+        ("Eps", ElementKind::Episode),
+        ("Episode", ElementKind::Episode),
+        ("Episodes", ElementKind::Episode),
+        ("Episodio", ElementKind::Episode),
+        ("Episódio", ElementKind::Episode),
+        ("Capitulo", ElementKind::Episode),
+        ("Folge", ElementKind::Episode),
+        ("Season", ElementKind::Season),
+        ("Saison", ElementKind::Season),
+        ("Vol", ElementKind::Volume),
+        ("Volume", ElementKind::Volume),
+        ("Cour", ElementKind::Part),
+        ("Part", ElementKind::Part),
+        ("Parte", ElementKind::Part),
+        ("Pt", ElementKind::Part),
+    ];
+
+    let word: String = word.iter().collect();
+    MARKERS
+        .iter()
+        .find(|(marker, _)| marker.eq_ignore_ascii_case(&word))
+        .map(|&(_, kind)| kind)
+}
+
+/// What may stand between a word that marks a number and the number: any
+/// whitespace, an underscore, and the separators the parser trims off the end
+/// of a title.
+///
+/// The parser's own delimiters are these with `~` added, and with five spaces
+/// in place of any whitespace.
+fn is_delimiter(c: char) -> bool {
+    is_trimmed_separator(c) || c == '_' || c.is_whitespace()
 }
 
 #[cfg(test)]
@@ -312,6 +426,17 @@ mod tests {
     /// Parse a name given as text, which is what every fixture here is.
     fn spelled(name: &str) -> Parsed {
         parse(&RawPath::from_bytes(name.as_bytes().to_vec()))
+    }
+
+    /// The words a stage comparing text finds in what the parse left of a
+    /// name.
+    fn words_left(name: &str) -> Vec<String> {
+        spelled(name)
+            .text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
@@ -335,6 +460,184 @@ mod tests {
                 "{noise} is still in {:?}",
                 parsed.text
             );
+        }
+    }
+
+    #[test]
+    fn the_letters_beside_a_season_and_an_episode_go_with_their_numbers() {
+        // A letter left behind is a word the entry does not spell, and it
+        // counts against every candidate alike.
+        for name in [
+            "Alpha Beta S01E03.mkv",
+            "Alpha.Beta.S01E03.1080p.WEB.mkv",
+            "Alpha Beta 1x03.mkv",
+            "Alpha Beta S01E03",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_letters_beside_an_episode_go_with_its_number() {
+        for name in [
+            "Alpha Beta E03.mkv",
+            "Alpha Beta EP03.mkv",
+            "Alpha Beta - 03v2.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_word_before_an_episode_goes_with_its_number() {
+        for name in [
+            "Alpha Beta Episode 03.mkv",
+            "Alpha Beta Ep 03.mkv",
+            "Alpha_Beta_Episode_03.mkv",
+            "Alpha Beta Episode - 03.mkv",
+            "Alpha Beta EPISODE 03.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_word_beside_a_season_goes_with_its_number() {
+        for name in [
+            "Alpha Beta Season 2 - 03.mkv",
+            "Alpha Beta 2nd Season - 03.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_season_read_from_a_word_goes_whole() {
+        // The parser reports the number it read, so `II` and `Second` come
+        // back as `2`, one character long.
+        for name in [
+            "Alpha Beta Season II - 03.mkv",
+            "Alpha Beta Second Season - 03.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_season_counted_in_japanese_goes_whole() {
+        assert_eq!(words_left("Alpha Beta 第2期 - 03.mkv"), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn the_word_before_a_volume_goes_with_its_number() {
+        for name in [
+            "Alpha Beta Vol.2 - 03.mkv",
+            "Alpha Beta Volume 2 - 03.mkv",
+            "Alpha Beta Vol - 03.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_word_beside_a_part_goes_with_its_number() {
+        for name in ["Alpha Beta Cour 2 - 03.mkv", "Alpha Beta 2nd Cour - 03.mkv"] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_marker_after_an_episode_stays() {
+        // The parser reads a marker of an episode before its number, and a
+        // season's or a part's after one too, as in `2nd Season` and
+        // `2nd Cour`.
+        assert_eq!(
+            words_left("Alpha Beta - 03 - Episode of the Sea.mkv"),
+            ["Alpha", "Beta", "Episode", "of", "the", "Sea"]
+        );
+    }
+
+    #[test]
+    fn a_marker_before_a_number_of_another_kind_stays() {
+        assert_eq!(
+            words_left("Alpha Beta Episode 2nd Season - 03.mkv"),
+            ["Alpha", "Beta", "Episode"]
+        );
+    }
+
+    #[test]
+    fn a_marker_set_apart_from_its_number_by_a_bracket_stays() {
+        assert_eq!(
+            words_left("Alpha Beta (Episode) 03.mkv"),
+            ["Alpha", "Beta", "Episode"]
+        );
+        assert_eq!(
+            words_left("Alpha Beta S02E03 (Season).mkv"),
+            ["Alpha", "Beta", "Season"]
+        );
+    }
+
+    #[test]
+    fn a_marker_the_parser_reads_as_part_of_the_title_stays() {
+        // `S01E03` reports a season, but not through the `Season` before it,
+        // so the parser keeps that word in the title and the key holds it.
+        let parsed = spelled("Alpha Beta New Season S01E03.mkv");
+
+        assert_eq!(parsed.title.as_deref(), Some("Alpha Beta New Season"));
+        assert_eq!(
+            words_left("Alpha Beta New Season S01E03.mkv"),
+            ["Alpha", "Beta", "New", "Season"]
+        );
+    }
+
+    #[test]
+    fn what_the_release_spells_goes_even_where_it_is_no_letter() {
+        // A mark that is no letter here can become one once the text is
+        // brought to NFKC, as `™` becomes `TM`.
+        let parsed = spelled("[Group™] Alpha Beta - 03.mkv");
+
+        assert_eq!(parsed.release_group.as_deref(), Some("Group™"));
+        assert!(!parsed.text.contains('™'), "{:?}", parsed.text);
+    }
+
+    #[test]
+    fn a_marker_apart_from_a_number_stays() {
+        assert_eq!(
+            words_left("Alpha Beta - 03 - The Episode Name.mkv"),
+            ["Alpha", "Beta", "The", "Episode", "Name"]
+        );
+    }
+
+    #[test]
+    fn every_word_the_parser_lists_as_a_marker_goes_with_its_number() {
+        let episode = [
+            "Ep",
+            "Eps",
+            "Episode",
+            "Episodes",
+            "Episodio",
+            "Episódio",
+            "Capitulo",
+            "Folge",
+        ];
+        let season_or_volume = ["Season", "Saison", "Vol", "Volume"];
+        // `Part` and `Pt` count for the parser only inside brackets.
+        let part = ["Cour", "Part", "Parte", "Pt"];
+        let names = episode
+            .iter()
+            .map(|marker| format!("Alpha Beta {marker} 03.mkv"))
+            .chain(
+                season_or_volume
+                    .iter()
+                    .map(|marker| format!("Alpha Beta {marker} 2 - 03.mkv")),
+            )
+            .chain(
+                part.iter()
+                    .map(|marker| format!("Alpha Beta ({marker} 2) - 03.mkv")),
+            );
+
+        for name in names {
+            assert_eq!(words_left(&name), ["Alpha", "Beta"], "{name}");
         }
     }
 
