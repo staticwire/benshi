@@ -113,8 +113,7 @@ pub struct Parsed {
     /// it extends. What is struck out is the release group, the episode, the
     /// season, the part and the volume with the words that mark them, the
     /// year, the resolution, the source, the extension and the rest of the
-    /// release's own vocabulary - everything a list never spells, and nothing a
-    /// name might be.
+    /// release's own vocabulary.
     ///
     /// A space is left wherever something was struck out, so that the words on
     /// either side of it stay two words.
@@ -283,7 +282,11 @@ fn part_lost_after_season(text: &str, elements: &[Element]) -> Option<u32> {
 /// which is where a subtitle beyond the end of the title ends up. Struck out:
 /// what an element of any other kind spells and every word it touches, because
 /// a list entry never spells a resolution, a group or an episode number, and
-/// counting them would tell against every candidate alike.
+/// counting them would tell against every candidate alike. That takes in
+/// `ElementKind::Other`: a word from the parser's keyword list, such as
+/// `Uncensored`, or a broadcast marker, such as `7月新番`. A list entry can
+/// spell such a word, as `Kite Remastered` does, and a file named after it is
+/// compared without the word.
 ///
 /// **A number goes with what marks it.** The parser reports a season, an
 /// episode, a volume and a part as the number alone: `S01E03` comes back as
@@ -314,7 +317,7 @@ fn without_the_release(text: &str, elements: &[Element]) -> String {
             .enumerate()
             .filter(|(_, word)| word.start < upto && from < word.end);
         match element.kind {
-            ElementKind::Title | ElementKind::EpisodeTitle | ElementKind::Other => {
+            ElementKind::Title | ElementKind::EpisodeTitle => {
                 for (at, _) in touched {
                     named[at] = true;
                 }
@@ -588,6 +591,20 @@ mod tests {
             words_left("Alpha Beta New Season S01E03.mkv"),
             ["Alpha", "Beta", "New", "Season"]
         );
+    }
+
+    #[test]
+    fn what_the_parser_reports_as_other_goes() {
+        // The parser's own words for an edit of the release, and the mark of
+        // a broadcast season that some groups put where a title stands.
+        for name in [
+            "Alpha Beta - 03 [Uncensored].mkv",
+            "Alpha Beta Uncut - 03.mkv",
+            "Alpha Beta - 03 (Remastered).mkv",
+            "[7月新番] Alpha Beta - 03.mkv",
+        ] {
+            assert_eq!(words_left(name), ["Alpha", "Beta"], "{name}");
+        }
     }
 
     #[test]
