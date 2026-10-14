@@ -52,14 +52,16 @@ pub enum Episode {
     /// record as watched; a half episode is not. A consumer reading the two
     /// alike would mark a whole series watched because somebody played a recap.
     NotWhole,
-    /// None spelled at all: a film, or a name that does not say.
+    /// None spelled at all: a film, or a name that does not say. A name
+    /// spelling nought for the season and for the episode at once is read as
+    /// spelling none.
     Absent,
 }
 
 /// What a filename spells.
 ///
-/// The parser's answer, narrowed to what the stages below read, and nothing is
-/// matched or judged yet. Every field is what the **name** said, never what a
+/// What [`parse`] reads from a name for the stages below, and nothing is
+/// matched yet. Every field is read from the **name**, never from what a
 /// corpus holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parsed {
@@ -72,7 +74,8 @@ pub struct Parsed {
     /// `Season 2`, `2nd Season` and `Season II` all arrive here as two. A
     /// numeral ending the title does not: `Show Title II` comes back with the
     /// numeral still in the title and no season at all, which is why the
-    /// normaliser carries a rule of its own for it.
+    /// normaliser carries a rule of its own for it. A season of nought
+    /// beside an episode of nought is not kept.
     pub season: Option<u32>,
     /// The part of a season, where the parser reported one or [`parse`] read
     /// one back from after the season marker.
@@ -187,6 +190,14 @@ pub fn parse(name: &RawPath) -> Parsed {
         [] => Episode::Absent,
         _ => Episode::Several,
     };
+    // Nought for the season and for the episode at once counts nothing, as
+    // in a film named with `s00e00`, and the name is read as spelling
+    // neither. Either nought alone is kept: an episode of nought can
+    // number a prologue, and an episode in a season of nought a special.
+    if parsed.season == Some(0) && parsed.episode == Episode::Only(0) {
+        parsed.season = None;
+        parsed.episode = Episode::Absent;
+    }
     parsed.part = parsed.part.or(lost_part);
     if let Some(title) = &mut parsed.title {
         title.push_str(&cut_marks);
@@ -366,6 +377,60 @@ mod tests {
         // And absent is not the answer a fraction gets, which is the whole
         // reason there are four cases and not three.
         assert_ne!(parsed.episode, Episode::NotWhole);
+    }
+
+    #[test]
+    fn a_season_and_an_episode_of_nought_together_spell_neither() {
+        // A film named with `s00e00`. Left as spelled, the season of nought
+        // goes into the key, and the film's entry is filed with no season.
+        let parsed = spelled("Show.Title.The.Movie.s00e00.HD1080p.WEBRip.mp4");
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title The Movie"));
+        assert_eq!(parsed.season, None);
+        assert_eq!(parsed.episode, Episode::Absent);
+    }
+
+    #[test]
+    fn an_episode_in_a_season_of_nought_keeps_its_season() {
+        // `S00E03` numbers a special. With the season taken off, the name
+        // would reach the series and name its third episode.
+        for (name, episode) in [
+            ("Show.Title.S00E03.1080p.WEB.mkv", 3),
+            ("[Group] Show Title - S00E01 - A Special [1080p].mkv", 1),
+            ("Show Title Season 0 - 01.mkv", 1),
+        ] {
+            let parsed = spelled(name);
+
+            assert_eq!(parsed.season, Some(0), "{name}");
+            assert_eq!(parsed.episode, Episode::Only(episode), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_season_of_nought_beside_no_whole_episode_keeps_its_season() {
+        // A whole episode of nought is all that takes the season with it.
+        // Read as spelling no season, a name with no episode beside it would
+        // reach the series and name the whole of it.
+        for (name, episode) in [
+            ("Show Title Season 0 [1080p].mkv", Episode::Absent),
+            ("Show Title Season 0 - 01-12.mkv", Episode::Several),
+            ("Show Title Season 0 - 05.5.mkv", Episode::NotWhole),
+        ] {
+            let parsed = spelled(name);
+
+            assert_eq!(parsed.season, Some(0), "{name}");
+            assert_eq!(parsed.episode, episode, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_episode_of_nought_outside_a_season_of_nought_is_an_episode() {
+        // A series can number a prologue nought.
+        for name in ["Show Title - 00.mkv", "Show.Title.S01E00.1080p.WEB.mkv"] {
+            let parsed = spelled(name);
+
+            assert_eq!(parsed.episode, Episode::Only(0), "{name}");
+        }
     }
 
     #[test]

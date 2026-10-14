@@ -168,7 +168,7 @@ pub enum Outcome {
     Recognised {
         /// The title as the corpus spells it.
         title: String,
-        /// The episode in the release's numbering, as the name spelled it.
+        /// The episode in the release's numbering, as it was read from the name.
         episode: Episode,
         /// Which stage decided, and what it decided by.
         stage: DecidedBy,

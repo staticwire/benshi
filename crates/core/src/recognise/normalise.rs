@@ -79,7 +79,7 @@ impl Key {
 
     /// The key a filename is looked up by.
     ///
-    /// Where the parser reported a season, the title left behind is not read
+    /// Where the parse holds a season, the title left behind is not read
     /// for another: a numeral ending it is part of the name, as it is in the
     /// list entry that spells the season out. The same holds for a part.
     #[must_use]
@@ -136,7 +136,7 @@ impl Key {
     }
 }
 
-/// Which of the season and the part the parser has already read.
+/// Which of the season and the part the parse already holds.
 #[derive(Clone, Copy, Default)]
 struct Reported {
     season: bool,

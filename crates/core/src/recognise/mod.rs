@@ -171,9 +171,9 @@ pub enum Stage {
 pub struct Match {
     /// The title as the corpus spells it.
     pub title: String,
-    /// The episode in the release's numbering, exactly as the name spelled it.
+    /// The episode in the release's numbering, as it was read from the name.
     ///
-    /// The parser's four answers travel here whole, because this is what a
+    /// The four cases of [`Episode`] travel here whole, because this is what a
     /// consumer reads and the four lead different places. A film spells none
     /// and can be marked watched; a file holding twelve episodes spells several
     /// and is neither the first nor the twelfth. Reduced to a number and an
