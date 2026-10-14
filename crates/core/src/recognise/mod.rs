@@ -203,14 +203,16 @@ pub struct Refusal {
     /// How close the best candidate came, where there was one to compare.
     ///
     /// Absent and low are different answers and lead different places. Absent
-    /// says nothing was scored, because the name spelled no title or because
-    /// the index left the scorer no candidate, which points at the list; a low
-    /// score says the corpus was searched and nothing in it was close, which
-    /// points at the name or at a missing entry. It says how close and never
-    /// why that was not enough: a candidate is refused below the scorer's
-    /// floor, and above it where the next candidate ran level. Reserved rather
-    /// than enforced, as the field is public and nothing here stops a caller
-    /// writing `None` after scoring.
+    /// says nothing was scored: the name spelled no title or two seasons, or
+    /// the list left nothing to compare it with, because the index found no
+    /// candidate or because none it found spells the season and the part the
+    /// name does. A low score says the corpus was searched and nothing in it
+    /// that spells the name's season and part was close, which points at the
+    /// name or at a missing entry. It says how close and never why that was
+    /// not enough: a candidate is refused below the scorer's floor, and above
+    /// it where the next candidate ran level. Reserved rather than enforced,
+    /// as the field is public and nothing here stops a caller writing `None`
+    /// after scoring.
     pub best: Option<Score>,
 }
 

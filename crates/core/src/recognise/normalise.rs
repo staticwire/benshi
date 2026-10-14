@@ -203,23 +203,51 @@ impl Spelled {
     }
 }
 
-/// The words a title spells, in the form the key would have compared them in.
+/// A title as a stage that compares words reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wording {
+    /// The words, in the form the key would have compared them in.
+    pub words: Vec<String>,
+    /// The season taken out of the words, where the text spelled one past
+    /// the first.
+    pub season: Option<u32>,
+    /// The part taken out of the words, where the text spelled one past the
+    /// first.
+    pub part: Option<u32>,
+}
+
+/// The words a title spells, and the season and the part it spelled among
+/// them.
 ///
-/// Case, width, a year, a bracketed type, and the way a season or a part is
-/// spelled are all gone, because each of them is a thing one side writes and
-/// the other does not. What is left is cut on anything that is not a letter or
-/// a digit, so `Fate/Zero` spells `fate` and `zero`.
+/// Case, width, a year and a bracketed type are gone from the words, because
+/// each of them is a thing one side writes and the other does not. A season
+/// and a part are gone from them whole, number and all, and are handed back
+/// beside them, as [`Key::from_title`] holds them. What is left is cut on
+/// anything that is not a letter or a digit, so `Fate/Zero` spells `fate` and
+/// `zero`.
 ///
-/// Empty where the title spells no letters at all, which is the same answer
-/// [`Key::from_title`] gives such a title.
+/// No words where the title spells no letters at all, which is the same
+/// answer [`Key::from_title`] gives such a title.
+#[must_use]
+pub fn wording_of(title: &str) -> Wording {
+    let (text, season, part) = Spelled::strip(title, Reported::default());
+    let not_the_first = |number: &u32| *number != 1;
+    Wording {
+        words: text
+            .to_lowercase()
+            .split(|c| !is_letter(c))
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        season: season.filter(not_the_first),
+        part: part.filter(not_the_first),
+    }
+}
+
+/// The words a title spells, as [`wording_of`] reads them.
 #[must_use]
 pub fn words_in(title: &str) -> Vec<String> {
-    let (text, _, _) = Spelled::strip(title, Reported::default());
-    text.to_lowercase()
-        .split(|c| !is_letter(c))
-        .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect()
+    wording_of(title).words
 }
 
 /// The part a stretch of text spells, in any form a title's part is read in.

@@ -87,8 +87,8 @@ impl Corpus {
     ///
     /// For the stage that compares an entry against a name word by word: an
     /// entry filed under romaji, English and native spellings meets the name on
-    /// whichever of them is closest, and the title it answers with is not
-    /// necessarily the one that matched.
+    /// the closest of those that stage compares, and the title it answers with
+    /// is not necessarily the one that matched.
     pub(super) fn spellings_of(&self, title: &str) -> Vec<&str> {
         let mut found: Vec<&str> = self
             .spellings()
