@@ -8,7 +8,8 @@
 //! read is the one the program acts on rather than a second one written for the
 //! occasion. `benshi why` prints the most recent recognition decision: what the
 //! name spelled, what was answered, and for a match which stage decided it and
-//! by what.
+//! by what. `benshi login` has the daemon ask AniList whose a token is and keep
+//! it in the secret store, and `benshi logout` has it removed.
 //!
 //! The client renders; it never decides. Anything it shows came from the daemon
 //! in that answer, so two runs of `benshi sources` a second apart can differ and
@@ -18,10 +19,13 @@ pub mod client;
 
 pub mod commands;
 
+pub mod prompt;
+
 pub mod render;
 
 use std::fmt;
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -95,6 +99,7 @@ pub fn main(arguments: Cli) -> ExitCode {
     runtime.block_on(commands::run(
         arguments.command,
         &socket,
+        || prompt::hidden(io::stdin().as_fd()),
         &mut io::stdout(),
         &mut io::stderr(),
     ))
@@ -156,6 +161,19 @@ mod tests {
 
         assert_eq!(asked.command, Command::Why);
         assert!(Cli::try_parse_from(["benshi", "why", "some.mkv"]).is_err());
+    }
+
+    #[test]
+    fn login_and_logout_take_no_argument() {
+        // A token is pasted at a prompt. One typed on the command line would
+        // stay in the shell's history.
+        let login = Cli::try_parse_from(["benshi", "login"]).expect("parses");
+        let logout = Cli::try_parse_from(["benshi", "logout"]).expect("parses");
+
+        assert_eq!(login.command, Command::Login);
+        assert_eq!(logout.command, Command::Logout);
+        assert!(Cli::try_parse_from(["benshi", "login", "a.pasted.token"]).is_err());
+        assert!(Cli::try_parse_from(["benshi", "logout", "anilist"]).is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! test account's token in the environment:
 //!
 //! ```text
-//! BENSHI_ANILIST_TOKEN=... cargo test -p benshi-sync --test anilist_record -- --ignored
+//! BENSHI_TOKEN_ANILIST=... cargo test -p benshi-sync --test anilist_record -- --ignored
 //! ```
 //!
 //! It files three works on the account's list, records the backend reading
@@ -70,10 +70,10 @@ async fn send(http: &Http, request: &Request) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "speaks to AniList with the test account's token, from BENSHI_ANILIST_TOKEN"]
+#[ignore = "speaks to AniList with the test account's token, from BENSHI_TOKEN_ANILIST"]
 async fn record_the_list_of_the_test_account() {
-    let token = std::env::var("BENSHI_ANILIST_TOKEN")
-        .expect("BENSHI_ANILIST_TOKEN holds the test account's token");
+    let token = std::env::var("BENSHI_TOKEN_ANILIST")
+        .expect("BENSHI_TOKEN_ANILIST holds the test account's token");
     let http = Http::new(ANILIST, token.trim()).expect("a client");
 
     let mut filed = Vec::new();

@@ -13,6 +13,7 @@ pub mod policy;
 pub mod recognise;
 pub mod session;
 pub mod timeline;
+pub mod token;
 pub mod trace;
 
 use std::fmt;

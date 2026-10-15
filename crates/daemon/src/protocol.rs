@@ -14,6 +14,7 @@ use benshi_core::policy::Policy;
 use benshi_core::recognise::altname::Assignment;
 use benshi_core::recognise::parse::{Episode, Parsed};
 use benshi_core::recognise::{Recognition, Score, Stage};
+use benshi_core::token::Token;
 use benshi_core::{AppName, Capabilities, MediaRef, PlayState, PlayerId};
 use benshi_detect::SourceInfo;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,24 @@ pub enum Request {
 
     /// The most recent recognition decision, and what it was decided by.
     Why,
+
+    /// Check a token with AniList and keep it in the secret store.
+    ///
+    /// Answered twice: with [`Response::Ok`] once it is read, and with
+    /// [`Response::LoggedIn`] or [`Response::Error`] once it is done. The
+    /// store may ask a person to unlock it and the second answer waits for
+    /// them, so the first is what tells a daemon at work from one that will
+    /// never answer.
+    Login {
+        /// The token, as AniList's page gives it.
+        token: Token,
+    },
+
+    /// Remove the token kept in the secret store.
+    ///
+    /// Answered twice, as [`Request::Login`] is: with [`Response::Ok`], and
+    /// with [`Response::LoggedOut`] or [`Response::Error`].
+    Logout,
 }
 
 /// One source as a listing shows it.
@@ -111,7 +130,9 @@ pub enum Response {
     },
 
     /// The request was carried out and has nothing to return. In answer to
-    /// [`Request::Watch`], that the stream is on and what follows is it.
+    /// [`Request::Watch`], that the stream is on and what follows is it; to
+    /// [`Request::Login`] and [`Request::Logout`], that the request is read
+    /// and what it comes to follows.
     Ok,
 
     /// The request could not be carried out.
@@ -123,6 +144,18 @@ pub enum Response {
     /// The most recent decision, in answer to [`Request::Why`], and nothing
     /// where no reading has been decided yet.
     Why(Option<Explanation>),
+
+    /// Whose the token is, in answer to [`Request::Login`], once it is kept.
+    LoggedIn {
+        /// The name of the account on AniList.
+        name: String,
+        /// When the token runs out, in seconds since the Unix epoch, and none
+        /// where the token does not say.
+        expires: Option<u64>,
+    },
+
+    /// The token is no longer kept, in answer to [`Request::Logout`].
+    LoggedOut,
 }
 
 /// The most recent decision, as a client is told it.
@@ -240,6 +273,7 @@ mod tests {
     use benshi_core::recognise::altname::Assignment;
     use benshi_core::recognise::parse::Episode;
     use benshi_core::recognise::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage};
+    use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
@@ -362,6 +396,15 @@ mod tests {
                 message: "expected value at line 1 column 1".to_owned(),
             },
             Response::Why(None),
+            Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: Some(1_900_000_000),
+            },
+            Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: None,
+            },
+            Response::LoggedOut,
         ];
         responses.extend(
             every_recognition()
@@ -382,6 +425,10 @@ mod tests {
                 policy: Policy::Allow,
             },
             Request::Why,
+            Request::Login {
+                token: Token::new("header.payload.signature"),
+            },
+            Request::Logout,
         ]
     }
 
@@ -568,6 +615,19 @@ mod tests {
 
         assert_eq!(close.outcome, Outcome::Unrecognised { best: Some(0.4) });
         assert_eq!(nothing.outcome, Outcome::Unrecognised { best: None });
+    }
+
+    #[test]
+    fn a_login_carries_the_token_as_its_text_and_shows_none_of_it_for_debugging() {
+        let asked = Request::Login {
+            token: Token::new("header.payload.signature"),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&asked).expect("serialise"),
+            r#"{"type":"Login","body":{"token":"header.payload.signature"}}"#
+        );
+        assert!(!format!("{asked:?}").contains("payload"), "{asked:?}");
     }
 
     #[test]

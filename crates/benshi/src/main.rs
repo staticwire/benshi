@@ -291,6 +291,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::time::SystemTime;
 
     use benshi_core::clock::SystemClock;
+    use benshi_daemon::accounts::OnAniList;
     use benshi_daemon::config;
     use benshi_daemon::paths::{DATABASE, Role, directory};
     use benshi_daemon::recognition::Recogniser;
@@ -368,6 +369,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         store,
         SystemTime::now,
         POLL_INTERVAL,
+        Arc::new(OnAniList::new(benshi_sync::anilist::transport::ANILIST)),
         // Said as it happens: the socket goes on answering once detection
         // has stopped, and the process does not end to say so. The
         // supervisor deals with no task that ended until this returns, so it

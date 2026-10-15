@@ -6,7 +6,9 @@
 //!
 //! A connection waits for its first answer until [`DEADLINE`] from the moment
 //! it began to connect, and no longer. What follows the first answer of a
-//! `watch` is a stream, which waits for as long as the user does.
+//! `watch` is a stream, which waits for as long as the user does, and what
+//! follows that of a `login` or a `logout` waits for as long as the daemon
+//! takes, which may be as long as a person takes to unlock the secret store.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -144,16 +146,36 @@ impl Daemon {
             .await
             .map_err(|_elapsed| did_not_answer(&self.socket))?;
 
-        match answered {
-            Ok(Some(answer)) => Ok(answer),
-            Ok(None) => bail!(CLOSED_WITHOUT_ANSWERING),
-            Err(failure) => match failure.downcast_ref::<io::Error>() {
-                Some(reset) if reset.kind() == io::ErrorKind::ConnectionReset => {
-                    bail!("{CLOSED_WITHOUT_ANSWERING}: {reset}")
-                }
-                _ => Err(failure),
-            },
-        }
+        unless_closed(answered)
+    }
+
+    /// The answer that follows the first, failing when the daemon closed
+    /// instead.
+    ///
+    /// Waits for as long as the daemon takes, for a request whose second
+    /// answer may wait on a person. The daemon gives each step of such a
+    /// request a deadline of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Daemon::expect_answer`], and never that the daemon did not
+    /// answer in time.
+    pub async fn expect_outcome(&mut self) -> Result<Response> {
+        unless_closed(self.answer().await)
+    }
+}
+
+/// An answer, or that the daemon closed the connection without one.
+fn unless_closed(answered: Result<Option<Response>>) -> Result<Response> {
+    match answered {
+        Ok(Some(answer)) => Ok(answer),
+        Ok(None) => bail!(CLOSED_WITHOUT_ANSWERING),
+        Err(failure) => match failure.downcast_ref::<io::Error>() {
+            Some(reset) if reset.kind() == io::ErrorKind::ConnectionReset => {
+                bail!("{CLOSED_WITHOUT_ANSWERING}: {reset}")
+            }
+            _ => Err(failure),
+        },
     }
 }
 
