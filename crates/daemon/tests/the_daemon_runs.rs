@@ -27,9 +27,11 @@ use benshi_core::path::RawPath;
 use benshi_core::policy::Policy;
 use benshi_core::recognise::altname::Altnames;
 use benshi_core::recognise::corpus::Corpus;
+use benshi_core::token::Token;
 use benshi_core::{
     AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
 };
+use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::ipc::bind;
 use benshi_daemon::protocol::{Request, Response, SourceListing};
@@ -287,6 +289,20 @@ impl Told {
     }
 }
 
+/// Logins no test here asks for.
+#[derive(Debug)]
+struct NoLogins;
+
+impl Accounts for NoLogins {
+    fn login(&self, _token: Token) -> Done<'_, LoggedIn> {
+        unreachable!("no test here logs in")
+    }
+
+    fn logout(&self) -> Done<'_, ()> {
+        unreachable!("no test here logs out")
+    }
+}
+
 /// A daemon over this platform with nothing to match a name against, as the
 /// binary starts one.
 fn a_daemon(
@@ -303,6 +319,7 @@ fn a_daemon(
         a_store(home),
         SystemTime::now,
         PERIOD,
+        Arc::new(NoLogins),
         |_notice| {},
     ))
 }
@@ -335,6 +352,7 @@ fn a_daemon_that_tells(
         Arc::clone(store),
         the_time,
         PERIOD,
+        Arc::new(NoLogins),
         told.listener(),
     ))
 }

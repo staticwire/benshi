@@ -5,7 +5,8 @@
 //! the daemon or the user ends it. `record` wants both an answer and a stream, so
 //! it takes a second connection for the answer: a stream is the last thing a
 //! connection carries. What it records goes to a file, and only a summary of
-//! it to the terminal.
+//! it to the terminal. `login` and `logout` are answered twice: once the
+//! daemon has read the request, and with what it came to.
 //!
 //! A failure is reported here rather than returned. This is where a `Result`
 //! stops being something a caller can act on and becomes a line on the error
@@ -13,13 +14,14 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use benshi_core::policy::Policy;
+use benshi_core::token::Token;
 use benshi_core::trace::{TraceHeader, header_line, snapshot_line};
 use benshi_core::{AppName, PlayerId, SourceInfo};
 use benshi_daemon::bus::BusEvent;
@@ -28,6 +30,7 @@ use clap::{Subcommand, ValueEnum};
 use humantime::format_rfc3339_seconds;
 
 use crate::client::Daemon;
+use crate::prompt::Typed;
 use crate::render;
 
 /// What a client can ask for.
@@ -75,6 +78,16 @@ pub enum Command {
         #[arg(long, short, value_name = "PATH")]
         output: PathBuf,
     },
+
+    /// Log in to AniList, keeping the token in the secret store.
+    ///
+    /// Prints the address of the page where AniList gives a token for
+    /// benshi, and reads the token pasted from it without showing it. The
+    /// daemon asks AniList whose the token is before it keeps it.
+    Login,
+
+    /// Remove the AniList token from the secret store.
+    Logout,
 }
 
 /// A policy as it is typed on the command line.
@@ -109,10 +122,11 @@ impl From<PolicyArgument> for Policy {
 pub async fn run(
     command: Command,
     socket: &Path,
+    typed: impl FnOnce() -> io::Result<Typed>,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> ExitCode {
-    match carry_out(command, socket, out).await {
+    match carry_out(command, socket, typed, out, err).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             // `{:#}` puts the cause on the same line as the context, so that
@@ -131,7 +145,13 @@ pub async fn run(
 }
 
 /// Run one command, failing rather than reporting.
-async fn carry_out(command: Command, socket: &Path, out: &mut impl Write) -> Result<()> {
+async fn carry_out(
+    command: Command,
+    socket: &Path,
+    typed: impl FnOnce() -> io::Result<Typed>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
     let mut daemon = Daemon::connect(socket).await?;
 
     match command {
@@ -142,6 +162,15 @@ async fn carry_out(command: Command, socket: &Path, out: &mut impl Write) -> Res
         Command::Record { duration, output } => {
             record(&mut daemon, socket, duration, &output, out).await
         }
+        // The connection says that a daemon is there before a token is asked
+        // for. The login goes on one of its own, made once the token is read:
+        // the deadline of a connection runs from when it is made, and a
+        // person takes longer than that to paste.
+        Command::Login => {
+            drop(daemon);
+            login(socket, typed, out, err).await
+        }
+        Command::Logout => logout(&mut daemon, out).await,
     }
 }
 
@@ -195,10 +224,80 @@ async fn sources(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
 async fn subscribe(daemon: &mut Daemon) -> Result<()> {
     daemon.ask(&Request::Watch).await?;
 
+    taken(daemon, "a watch").await
+}
+
+/// Read the answer that says a request is read, and that what it comes to
+/// follows. `asked` names the request in a line about an answer of another
+/// kind.
+async fn taken(daemon: &mut Daemon, asked: &str) -> Result<()> {
     match daemon.expect_answer().await? {
         Response::Ok => Ok(()),
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("daemon answered a watch with {unexpected:?}"),
+        unexpected => bail!("daemon answered {asked} with {unexpected:?}"),
+    }
+}
+
+/// The page where AniList gives a token for benshi's application.
+const AUTHORIZE: &str =
+    "https://anilist.co/api/v2/oauth/authorize?client_id=53750&response_type=token";
+
+/// Ask for a token, have the daemon check and keep it, and print whose it is.
+async fn login(
+    socket: &Path,
+    typed: impl FnOnce() -> io::Result<Typed>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
+    write!(
+        err,
+        "open this address and approve benshi:\n{AUTHORIZE}\n\
+         paste the token AniList shows (input is hidden): "
+    )
+    .and_then(|()| err.flush())
+    .context("prompt could not be printed")?;
+    // Holds the runtime while a person pastes, and nothing else is running
+    // on it: no connection is open.
+    let typed = typed();
+    // Nothing typed was shown, the end of the line included.
+    writeln!(err).context("prompt could not be printed")?;
+    let token = match typed.context("token could not be read")? {
+        Typed::Cancelled => bail!("login cancelled"),
+        Typed::Line(line) => line.secret().trim().to_owned(),
+    };
+    if token.is_empty() {
+        bail!("no token given");
+    }
+
+    let mut daemon = Daemon::connect(socket).await?;
+    daemon
+        .ask(&Request::Login {
+            token: Token::new(token),
+        })
+        .await?;
+    taken(&mut daemon, "a login").await?;
+
+    match daemon.expect_outcome().await? {
+        Response::LoggedIn { name, expires } => {
+            write!(out, "{}", render::logged_in(&name, expires))
+                .context("login could not be printed")
+        }
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a login with {unexpected:?}"),
+    }
+}
+
+/// Have the daemon remove the token, and say that it is gone.
+async fn logout(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::Logout).await?;
+    taken(daemon, "a logout").await?;
+
+    match daemon.expect_outcome().await? {
+        Response::LoggedOut => {
+            write!(out, "{}", render::LOGGED_OUT).context("logout could not be printed")
+        }
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a logout with {unexpected:?}"),
     }
 }
 
@@ -416,19 +515,23 @@ fn append(file: &mut File, line: &str, output: &Path) -> Result<()> {
 mod tests {
     use super::{Command, run};
     use crate::client::DEADLINE;
+    use crate::prompt::Typed;
     use benshi_core::clock::{Clock, TestClock};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
+    use benshi_core::token::Token;
     use benshi_core::trace::Trace;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, SessionState,
         SourceInfo,
     };
+    use benshi_daemon::accounts::{self, Accounts, Done, LoggedIn};
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
     use benshi_daemon::protocol::{Request, Response};
     use benshi_daemon::recognition::{Decided, Decision, Recogniser};
+    use benshi_daemon::secrets;
     use benshi_daemon::supervisor::TaskError;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::io::Write;
@@ -577,6 +680,67 @@ mod tests {
         }
     }
 
+    /// When the token of a login runs out: 2030-03-17 17:46:40 UTC.
+    const EXP: u64 = 1_900_000_000;
+
+    /// Logins and logouts that go through, or fail as they do where the
+    /// secret store is locked, with what each was asked.
+    #[derive(Debug, Default)]
+    struct Logins {
+        failing: bool,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Logins {
+        fn failing() -> Self {
+            Self {
+                failing: true,
+                ..Self::default()
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .expect("no test panics while it holds this")
+                .clone()
+        }
+
+        fn ask(&self, what: String) {
+            self.asked
+                .lock()
+                .expect("no test panics while it holds this")
+                .push(what);
+        }
+    }
+
+    impl Accounts for Logins {
+        fn login(&self, token: Token) -> Done<'_, LoggedIn> {
+            self.ask(format!("login {}", token.secret()));
+            let logged = if self.failing {
+                Err(accounts::Error::NotKept(secrets::Error::Locked))
+            } else {
+                Ok(LoggedIn {
+                    name: "someone".to_owned(),
+                    expires: Some(EXP),
+                })
+            };
+
+            Box::pin(std::future::ready(logged))
+        }
+
+        fn logout(&self) -> Done<'_, ()> {
+            self.ask("logout".to_owned());
+            let logged_out = if self.failing {
+                Err(accounts::Error::NotRemoved(secrets::Error::Locked))
+            } else {
+                Ok(())
+            };
+
+            Box::pin(std::future::ready(logged_out))
+        }
+    }
+
     /// A daemon listening on a socket of its own.
     struct Daemon {
         home: TempDir,
@@ -584,6 +748,7 @@ mod tests {
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
         decided: Decided,
+        accounts: Arc<Logins>,
         serving: JoinHandle<Result<(), TaskError>>,
     }
 
@@ -604,6 +769,20 @@ mod tests {
             Self::serving(home, socket, listener, sources, bus)
         }
 
+        /// A daemon whose logins and logouts go as `accounts` makes them.
+        fn logging_in(accounts: Logins) -> Self {
+            let (home, socket, listener) = a_socket_bound_and_not_served();
+
+            Self::built(
+                home,
+                socket,
+                listener,
+                Vec::new(),
+                EventBus::new(),
+                accounts,
+            )
+        }
+
         /// A daemon serving a socket that was bound before, as the daemon's
         /// is once its database is open.
         fn serving(
@@ -613,16 +792,29 @@ mod tests {
             sources: Vec<SourceInfo>,
             bus: EventBus,
         ) -> Self {
+            Self::built(home, socket, listener, sources, bus, Logins::default())
+        }
+
+        fn built(
+            home: TempDir,
+            socket: PathBuf,
+            listener: UnixListener,
+            sources: Vec<SourceInfo>,
+            bus: EventBus,
+            accounts: Logins,
+        ) -> Self {
             let bus = Arc::new(bus);
             let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
             let decided = Decided::new();
+            let accounts = Arc::new(accounts);
             let server = Arc::new(Server::new(
                 Arc::clone(&bus),
                 Arc::clone(&policy),
                 seen,
                 decided.clone(),
+                Arc::clone(&accounts) as Arc<dyn Accounts>,
             ));
 
             Self {
@@ -631,6 +823,7 @@ mod tests {
                 bus,
                 policy,
                 decided,
+                accounts,
                 serving: tokio::spawn(server.listen(Arc::new(listener))),
             }
         }
@@ -691,7 +884,7 @@ mod tests {
             let watching = tokio::spawn({
                 let mut out = out.clone();
                 let mut err = err.clone();
-                async move { run(Command::Watch, &socket, &mut out, &mut err).await }
+                async move { run(Command::Watch, &socket, untyped, &mut out, &mut err).await }
             });
 
             self.subscribed().await;
@@ -728,7 +921,7 @@ mod tests {
             let running = tokio::spawn({
                 let mut out = out.clone();
                 let mut err = err.clone();
-                async move { run(command, &socket, &mut out, &mut err).await }
+                async move { run(command, &socket, untyped, &mut out, &mut err).await }
             });
 
             self.subscribed().await;
@@ -897,11 +1090,67 @@ mod tests {
     }
 
     async fn go(command: Command, socket: &Path) -> (ExitCode, String, String) {
+        go_typing(command, socket, Typed::Line(Token::new(PASTED))).await
+    }
+
+    /// [`go`], with `typed` typed at a prompt.
+    async fn go_typing(
+        command: Command,
+        socket: &Path,
+        typed: Typed,
+    ) -> (ExitCode, String, String) {
         let mut out = Shared::default();
         let mut err = Shared::default();
-        let outcome = run(command, socket, &mut out, &mut err).await;
+        let outcome = run(command, socket, || Ok(typed), &mut out, &mut err).await;
 
         (outcome, out.text(), err.text())
+    }
+
+    /// [`go`], with the moment the command's deadline runs from: for a
+    /// login, the moment its token is typed, since it connects for its
+    /// request only then, and for any other command the moment it starts.
+    async fn go_timed(command: Command, socket: &Path) -> (Instant, ExitCode, String, String) {
+        let from = Arc::new(Mutex::new(Instant::now()));
+        let typed_at = Arc::clone(&from);
+        let mut out = Shared::default();
+        let mut err = Shared::default();
+        let outcome = run(
+            command,
+            socket,
+            move || {
+                *typed_at.lock().expect("no test panics while it holds this") = Instant::now();
+                Ok(Typed::Line(Token::new(PASTED)))
+            },
+            &mut out,
+            &mut err,
+        )
+        .await;
+        let from = *from.lock().expect("no test panics while it holds this");
+
+        (from, outcome, out.text(), err.text())
+    }
+
+    /// What a command that reads nothing typed is given to read.
+    fn untyped() -> std::io::Result<Typed> {
+        unreachable!("this command reads nothing typed")
+    }
+
+    /// The token pasted at a login.
+    const PASTED: &str = "a.pasted.token";
+
+    /// What a login asks before it reads a token, and the end of the line
+    /// the token was pasted on.
+    const ASKED: &str = "open this address and approve benshi:\n\
+        https://anilist.co/api/v2/oauth/authorize?client_id=53750&response_type=token\n\
+        paste the token AniList shows (input is hidden): \n";
+
+    /// What `command` says before it is answered: a login asks for a token.
+    fn asked_first(command: &Command) -> &'static str {
+        if *command == Command::Login {
+            ASKED
+        } else {
+            ""
+        }
     }
 
     #[tokio::test]
@@ -1092,7 +1341,7 @@ mod tests {
     }
 
     /// Every command, with the trace of a recording beside `socket`.
-    fn every_command(socket: &Path) -> [Command; 5] {
+    fn every_command(socket: &Path) -> [Command; 7] {
         [
             Command::Sources,
             Command::Watch,
@@ -1105,6 +1354,8 @@ mod tests {
                 duration: Duration::from_secs(60),
                 output: socket.with_file_name("trace.jsonl"),
             },
+            Command::Login,
+            Command::Logout,
         ]
     }
 
@@ -1162,15 +1413,16 @@ mod tests {
         let (_home, socket, listener) = a_socket_bound_and_not_served();
 
         for command in every_command(&socket) {
-            let began = Instant::now();
-            let (outcome, shown, complained) = timeout(ENDED_BY, go(command, &socket))
+            let asked = asked_first(&command);
+            let named = format!("{command:?}");
+            let (from, outcome, shown, complained) = timeout(ENDED_BY, go_timed(command, &socket))
                 .await
                 .expect("the client gave up");
 
-            assert_eq!(began.elapsed(), DEADLINE, "gave up at another time");
+            assert_eq!(from.elapsed(), DEADLINE, "{named} gave up at another time");
             assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
             assert!(shown.is_empty(), "printed an answer it never got: {shown}");
-            assert_eq!(complained, did_not_answer(&socket));
+            assert_eq!(complained, format!("{asked}{}", did_not_answer(&socket)));
         }
 
         assert!(
@@ -1308,15 +1560,16 @@ mod tests {
         });
 
         for command in every_command(&socket) {
-            let began = Instant::now();
-            let (outcome, shown, complained) = timeout(ENDED_BY, go(command, &socket))
+            let asked = asked_first(&command);
+            let named = format!("{command:?}");
+            let (from, outcome, shown, complained) = timeout(ENDED_BY, go_timed(command, &socket))
                 .await
                 .expect("the client gave up");
 
-            assert_eq!(began.elapsed(), DEADLINE, "gave up at another time");
+            assert_eq!(from.elapsed(), DEADLINE, "{named} gave up at another time");
             assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
             assert!(shown.is_empty(), "printed an answer it never got: {shown}");
-            assert_eq!(complained, did_not_answer(&socket));
+            assert_eq!(complained, format!("{asked}{}", did_not_answer(&socket)));
         }
 
         assert!(
@@ -1442,13 +1695,17 @@ mod tests {
         let reset = std::io::Read::read(&mut asking, &mut [0]).expect_err("the end is reset");
 
         for command in every_command(&socket) {
+            let asked = asked_first(&command);
             let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
                 .await
                 .expect("the client ended");
 
             assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
             assert!(shown.is_empty(), "printed an answer it never got: {shown}");
-            assert_eq!(complained, format!("{CLOSED_WITHOUT_ANSWERING}: {reset}\n"));
+            assert_eq!(
+                complained,
+                format!("{asked}{CLOSED_WITHOUT_ANSWERING}: {reset}\n")
+            );
         }
 
         assert!(
@@ -1463,13 +1720,14 @@ mod tests {
         let (_home, socket, hanging_up) = a_daemon_that_hangs_up(true);
 
         for command in every_command(&socket) {
+            let asked = asked_first(&command);
             let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
                 .await
                 .expect("the client ended");
 
             assert_eq!(outcome, ExitCode::FAILURE, "succeeded without an answer");
             assert!(shown.is_empty(), "printed an answer it never got: {shown}");
-            assert_eq!(complained, format!("{CLOSED_WITHOUT_ANSWERING}\n"));
+            assert_eq!(complained, format!("{asked}{CLOSED_WITHOUT_ANSWERING}\n"));
         }
 
         assert!(
@@ -1956,7 +2214,14 @@ mod tests {
         let (_home, socket) = nowhere();
         let mut out = Shared::default();
 
-        let outcome = run(Command::Sources, &socket, &mut out, &mut Unwritable).await;
+        let outcome = run(
+            Command::Sources,
+            &socket,
+            untyped,
+            &mut out,
+            &mut Unwritable,
+        )
+        .await;
 
         assert_eq!(outcome, ExitCode::FAILURE);
         assert!(out.text().is_empty(), "printed {:?}", out.text());
@@ -1967,7 +2232,14 @@ mod tests {
         let daemon = Daemon::listening(vec![a_source(PLAYER, "mpv")]);
         let mut err = Shared::default();
 
-        let outcome = run(Command::Sources, &daemon.socket, &mut Unwritable, &mut err).await;
+        let outcome = run(
+            Command::Sources,
+            &daemon.socket,
+            untyped,
+            &mut Unwritable,
+            &mut err,
+        )
+        .await;
 
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
@@ -1981,7 +2253,14 @@ mod tests {
         let daemon = Daemon::listening(Vec::new());
         let mut err = Shared::default();
 
-        let outcome = run(Command::Why, &daemon.socket, &mut Unwritable, &mut err).await;
+        let outcome = run(
+            Command::Why,
+            &daemon.socket,
+            untyped,
+            &mut Unwritable,
+            &mut err,
+        )
+        .await;
 
         assert_eq!(outcome, ExitCode::FAILURE);
         assert_eq!(
@@ -1997,7 +2276,7 @@ mod tests {
         let socket = daemon.socket.clone();
         let watching = tokio::spawn({
             let mut err = err.clone();
-            async move { run(Command::Watch, &socket, &mut Unwritable, &mut err).await }
+            async move { run(Command::Watch, &socket, untyped, &mut Unwritable, &mut err).await }
         });
         daemon.subscribed().await;
 
@@ -2023,7 +2302,7 @@ mod tests {
         let socket = daemon.socket.clone();
         let watching = tokio::spawn({
             let mut err = err.clone();
-            async move { run(Command::Watch, &socket, &mut Unflushable, &mut err).await }
+            async move { run(Command::Watch, &socket, untyped, &mut Unflushable, &mut err).await }
         });
         daemon.subscribed().await;
 
@@ -2058,7 +2337,7 @@ mod tests {
             let mut err = err.clone();
             async move {
                 let mut out = WritableForALine::default();
-                run(command, &socket, &mut out, &mut err).await
+                run(command, &socket, untyped, &mut out, &mut err).await
             }
         });
         daemon.subscribed().await;
@@ -2092,7 +2371,13 @@ mod tests {
 
         let outcome = timeout(
             PATIENCE,
-            run(recording, &daemon.socket, &mut Unwritable, &mut err),
+            run(
+                recording,
+                &daemon.socket,
+                untyped,
+                &mut Unwritable,
+                &mut err,
+            ),
         )
         .await
         .expect("the recording ended");
@@ -2101,6 +2386,402 @@ mod tests {
         assert_eq!(
             err.text(),
             "benshi: summary could not be printed: broken pipe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_asks_for_a_token_and_says_whose_it_is() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Login, &daemon.socket))
+            .await
+            .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(complained, ASKED);
+        assert_eq!(
+            shown,
+            "logged in to AniList as someone, token valid until 2030-03-17 17:46 UTC\n"
+        );
+        assert_eq!(daemon.accounts.asked(), [format!("login {PASTED}")]);
+    }
+
+    #[tokio::test]
+    async fn a_token_is_sent_without_the_space_pasted_around_it() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        let (outcome, _shown, complained) = timeout(
+            PATIENCE,
+            go_typing(
+                Command::Login,
+                &daemon.socket,
+                Typed::Line(Token::new(format!(" \t{PASTED} \r"))),
+            ),
+        )
+        .await
+        .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(daemon.accounts.asked(), [format!("login {PASTED}")]);
+    }
+
+    #[tokio::test]
+    async fn nothing_pasted_is_no_login() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        for nothing in ["", " \t "] {
+            let (outcome, shown, complained) = timeout(
+                PATIENCE,
+                go_typing(
+                    Command::Login,
+                    &daemon.socket,
+                    Typed::Line(Token::new(nothing)),
+                ),
+            )
+            .await
+            .expect("the client ended");
+
+            assert_eq!(outcome, ExitCode::FAILURE, "{nothing:?}");
+            assert!(shown.is_empty(), "{shown}");
+            assert_eq!(complained, format!("{ASKED}benshi: no token given\n"));
+        }
+        assert!(daemon.accounts.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_login_cancelled_at_the_prompt_is_no_login() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        let (outcome, shown, complained) = timeout(
+            PATIENCE,
+            go_typing(Command::Login, &daemon.socket, Typed::Cancelled),
+        )
+        .await
+        .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(complained, format!("{ASKED}benshi: login cancelled\n"));
+        assert!(daemon.accounts.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_token_that_cannot_be_read_is_no_login_and_says_why() {
+        let daemon = Daemon::logging_in(Logins::default());
+        let mut out = Shared::default();
+        let mut err = Shared::default();
+
+        let outcome = timeout(
+            PATIENCE,
+            run(
+                Command::Login,
+                &daemon.socket,
+                || Err(std::io::Error::other("the terminal went away")),
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await
+        .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(out.text().is_empty(), "{}", out.text());
+        assert_eq!(
+            err.text(),
+            format!("{ASKED}benshi: token could not be read: the terminal went away\n")
+        );
+        assert!(daemon.accounts.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_login_the_daemon_could_not_carry_out_says_why() {
+        let daemon = Daemon::logging_in(Logins::failing());
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Login, &daemon.socket))
+            .await
+            .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(
+            complained,
+            format!("{ASKED}benshi: token could not be kept: secret store is locked\n")
+        );
+    }
+
+    /// A socket served by something that answers each request it reads with
+    /// the answer that it is read, and with `then` once `after` has passed.
+    fn a_daemon_that_answers_late(
+        after: Duration,
+        then: &Response,
+    ) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let first = line_of(&Response::Ok);
+        let then = line_of(then);
+        let answering = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("a client arrived");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut requests = BufReader::new(reader).lines();
+                while let Ok(Some(_request)) = requests.next_line().await {
+                    writer.write_all(&first).await.expect("the client reads");
+                    tokio::time::sleep(after).await;
+                    writer.write_all(&then).await.expect("the client reads");
+                }
+            }
+        });
+
+        (home, socket, answering)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_login_waits_past_the_deadline_for_what_it_comes_to() {
+        // The secret store may ask a person to unlock it, and the daemon
+        // waits for them. The answer that the login is read is what comes
+        // within the deadline.
+        let (_home, socket, answering) = a_daemon_that_answers_late(
+            DEADLINE * 3,
+            &Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: None,
+            },
+        );
+
+        let (outcome, shown, complained) = settled(started(Command::Login, &socket)).await;
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "logged in to AniList as someone; token does not say when it runs out\n"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_logout_waits_past_the_deadline_for_what_it_comes_to() {
+        let (_home, socket, answering) =
+            a_daemon_that_answers_late(DEADLINE * 3, &Response::LoggedOut);
+
+        let (outcome, shown, complained) = settled(started(Command::Logout, &socket)).await;
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(shown, "AniList token removed\n");
+    }
+
+    #[tokio::test]
+    async fn a_login_or_a_logout_answered_with_another_kind_of_answer_says_so() {
+        for command in [Command::Login, Command::Logout] {
+            let asked = asked_first(&command);
+            let named = if command == Command::Login {
+                "a login"
+            } else {
+                "a logout"
+            };
+            let (_home, socket, answering) =
+                a_daemon_that_answers_late(Duration::ZERO, &Response::Why(None));
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert!(shown.is_empty(), "{shown}");
+            assert_eq!(
+                complained,
+                format!("{asked}benshi: daemon answered {named} with Why(None)\n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_or_a_logout_refused_at_once_says_why() {
+        for command in [Command::Login, Command::Logout] {
+            let asked = asked_first(&command);
+            let (_home, socket, answering) = a_daemon_that_answers_with(&Response::Error {
+                message: "not today".to_owned(),
+            });
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert!(shown.is_empty(), "{shown}");
+            assert_eq!(complained, format!("{asked}benshi: not today\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_logout_says_the_token_is_removed() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Logout, &daemon.socket))
+            .await
+            .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(complained.is_empty(), "{complained}");
+        assert_eq!(shown, "AniList token removed\n");
+        assert_eq!(daemon.accounts.asked(), ["logout"]);
+    }
+
+    #[tokio::test]
+    async fn a_logout_the_daemon_could_not_carry_out_says_why() {
+        let daemon = Daemon::logging_in(Logins::failing());
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Logout, &daemon.socket))
+            .await
+            .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(
+            complained,
+            "benshi: token could not be removed: secret store is locked\n"
+        );
+    }
+
+    /// A socket served by something that answers each request it reads with
+    /// the answer that it is read, and closes.
+    fn a_daemon_that_reads_and_goes() -> (TempDir, PathBuf, JoinHandle<()>) {
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let first = line_of(&Response::Ok);
+        let answering = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("a client arrived");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut requests = BufReader::new(reader).lines();
+                if let Ok(Some(_request)) = requests.next_line().await {
+                    writer.write_all(&first).await.expect("the client reads");
+                }
+            }
+        });
+
+        (home, socket, answering)
+    }
+
+    #[tokio::test]
+    async fn a_login_or_a_logout_the_daemon_reads_and_goes_away_from_says_so() {
+        for command in [Command::Login, Command::Logout] {
+            let asked = asked_first(&command);
+            let (_home, socket, answering) = a_daemon_that_reads_and_goes();
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert!(shown.is_empty(), "{shown}");
+            assert_eq!(complained, format!("{asked}{CLOSED_WITHOUT_ANSWERING}\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_or_a_logout_that_cannot_be_printed_says_so() {
+        let daemon = Daemon::logging_in(Logins::default());
+
+        for (command, said) in [
+            (
+                Command::Login,
+                format!("{ASKED}benshi: login could not be printed: broken pipe\n"),
+            ),
+            (
+                Command::Logout,
+                "benshi: logout could not be printed: broken pipe\n".to_owned(),
+            ),
+        ] {
+            let mut err = Shared::default();
+            let outcome = timeout(
+                PATIENCE,
+                run(
+                    command,
+                    &daemon.socket,
+                    || Ok(Typed::Line(Token::new(PASTED))),
+                    &mut Unwritable,
+                    &mut err,
+                ),
+            )
+            .await
+            .expect("the client ended");
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert_eq!(err.text(), said);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_whose_prompt_cannot_be_printed_sends_nothing() {
+        // Nobody can be told where to find a token, so nothing pasted can be
+        // taken for one.
+        let daemon = Daemon::logging_in(Logins::default());
+
+        let outcome = timeout(
+            PATIENCE,
+            run(
+                Command::Login,
+                &daemon.socket,
+                || Ok(Typed::Line(Token::new(PASTED))),
+                &mut Shared::default(),
+                &mut Unwritable,
+            ),
+        )
+        .await
+        .expect("the client ended");
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(daemon.accounts.asked().is_empty());
+    }
+
+    /// A socket served by something that closes the first connection it takes
+    /// without reading from it, and answers each request on the connections
+    /// after it with the answer that it is read and with `then`.
+    fn a_daemon_that_closes_the_first_connection(
+        then: &Response,
+    ) -> (TempDir, PathBuf, JoinHandle<()>) {
+        let (home, socket, listener) = a_socket_bound_and_not_served();
+        let first = line_of(&Response::Ok);
+        let then = line_of(then);
+        let answering = tokio::spawn(async move {
+            let (unread, _peer) = listener.accept().await.expect("a client arrived");
+            drop(unread);
+            loop {
+                let (stream, _peer) = listener.accept().await.expect("a client arrived");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut requests = BufReader::new(reader).lines();
+                while let Ok(Some(_request)) = requests.next_line().await {
+                    writer.write_all(&first).await.expect("the client reads");
+                    writer.write_all(&then).await.expect("the client reads");
+                }
+            }
+        });
+
+        (home, socket, answering)
+    }
+
+    #[tokio::test]
+    async fn a_login_sends_its_token_on_a_connection_of_its_own() {
+        // The first connection says that a daemon is there, and a person
+        // takes longer to paste than its deadline gives. This daemon closes
+        // it unread.
+        let (_home, socket, answering) =
+            a_daemon_that_closes_the_first_connection(&Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: None,
+            });
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(Command::Login, &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "logged in to AniList as someone; token does not say when it runs out\n"
         );
     }
 }

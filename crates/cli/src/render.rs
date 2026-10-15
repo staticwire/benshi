@@ -10,7 +10,7 @@
 //! in.
 
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
 use benshi_core::policy::Policy;
@@ -18,6 +18,7 @@ use benshi_core::recognise::parse::{Episode, Parsed};
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
+use humantime::format_rfc3339_seconds;
 
 /// What is shown for a source that cannot name what it opened.
 ///
@@ -308,9 +309,39 @@ pub fn event(of: &BusEvent) -> String {
     }
 }
 
+/// What is shown once the token is removed.
+pub const LOGGED_OUT: &str = "AniList token removed\n";
+
+/// Whose the token is and until when it holds, as a login answers.
+///
+/// The time is said in UTC. A time past the year 9999, for which no date is
+/// written, is said as one the token does not give.
+#[must_use]
+pub fn logged_in(name: &str, expires: Option<u64>) -> String {
+    match expires.and_then(day_and_minute) {
+        Some(until) => format!("logged in to AniList as {name}, token valid until {until}\n"),
+        None => format!("logged in to AniList as {name}; token does not say when it runs out\n"),
+    }
+}
+
+/// A time in seconds since the Unix epoch, as its day and minute in UTC:
+/// `2030-03-17 17:46 UTC`.
+fn day_and_minute(seconds: u64) -> Option<String> {
+    let at = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    let mut written = String::new();
+    // An error where the time is past the year 9999.
+    write!(written, "{}", format_rfc3339_seconds(at)).ok()?;
+
+    Some(format!(
+        "{} {} UTC",
+        written.get(..10)?,
+        written.get(11..16)?
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{capabilities, event, explanation, listing, moment, state, why};
+    use super::{capabilities, event, explanation, listing, logged_in, moment, state, why};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
@@ -848,6 +879,39 @@ mod tests {
             assert!(
                 !recognised.contains("episode 0"),
                 "an absence rendered as a number: {recognised}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_says_whose_the_token_is_and_until_when_in_utc() {
+        assert_eq!(
+            logged_in("someone", Some(1_900_000_000)),
+            "logged in to AniList as someone, token valid until 2030-03-17 17:46 UTC\n"
+        );
+    }
+
+    #[test]
+    fn a_token_that_does_not_say_when_it_runs_out_is_said_so() {
+        assert_eq!(
+            logged_in("someone", None),
+            "logged in to AniList as someone; token does not say when it runs out\n"
+        );
+    }
+
+    #[test]
+    fn a_time_past_the_last_date_written_is_said_as_none() {
+        // The last second of the year 9999 is the last time a date is
+        // written for.
+        assert_eq!(
+            logged_in("someone", Some(253_402_300_799)),
+            "logged in to AniList as someone, token valid until 9999-12-31 23:59 UTC\n"
+        );
+        for past in [253_402_300_800, u64::MAX] {
+            assert_eq!(
+                logged_in("someone", Some(past)),
+                "logged in to AniList as someone; token does not say when it runs out\n",
+                "{past}"
             );
         }
     }

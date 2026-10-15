@@ -24,6 +24,7 @@ use benshi_store::Store;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+use crate::accounts::Accounts;
 use crate::bus::EventBus;
 use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
@@ -31,6 +32,8 @@ use crate::ipc::Server;
 use crate::recognition::{Decided, Recogniser};
 #[cfg(unix)]
 use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
+
+pub mod accounts;
 
 pub mod bus;
 
@@ -83,7 +86,8 @@ pub mod voice;
 /// restart of detection: a detection task that is started again knows nothing
 /// of the one before it and goes on from what that one kept. `recogniser` is
 /// what a file's name is decided against, and `now` reads the time of day the
-/// store writes beside what it keeps.
+/// store writes beside what it keeps. `accounts` carries out a login and a
+/// logout the socket is asked for.
 ///
 /// `tell` is told of a task as the task is started again and as it stops,
 /// whatever the other task is doing. A daemon whose detection has stopped
@@ -95,6 +99,10 @@ pub mod voice;
 /// Returns once no task is left running, which for a daemon means every one of
 /// them stopped permanently. What stopped each is in its [`TaskRecord`], and
 /// `tell` has been told of each by then.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each part is built by the caller, so that a test can give its own"
+)]
 pub async fn run<W, B, F, T>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
@@ -102,6 +110,7 @@ pub async fn run<W, B, F, T>(
     store: Arc<Mutex<Store>>,
     now: fn() -> SystemTime,
     period: Duration,
+    accounts: Arc<dyn Accounts>,
     tell: T,
 ) -> Vec<TaskRecord>
 where
@@ -125,6 +134,7 @@ where
         Arc::clone(&wiring.policy),
         wiring.seen.clone(),
         wiring.decided.clone(),
+        accounts,
     ));
 
     let mut supervisor = Supervisor::telling(tell);

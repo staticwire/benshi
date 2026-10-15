@@ -137,6 +137,7 @@ dependencies = [
  "benshi-daemon",
  "benshi-detect",
  "benshi-store",
+ "benshi-sync",
  "benshi-tray",
  "clap",
  "tempfile",
@@ -154,6 +155,7 @@ dependencies = [
  "benshi-store",
  "clap",
  "humantime",
+ "rustix",
  "serde",
  "serde_json",
  "socket2",
@@ -179,6 +181,7 @@ name = "benshi-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "benshi-core",
  "benshi-detect",
  "benshi-sinks",

@@ -20,10 +20,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use benshi_cli::commands::{Command, PolicyArgument, run};
+use benshi_cli::prompt::Typed;
 use benshi_core::clock::Timestamp;
 use benshi_core::path::RawPath;
 use benshi_core::policy::PolicyTable;
+use benshi_core::token::Token;
 use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
+use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
@@ -33,6 +36,25 @@ use benshi_store::Store;
 use tempfile::TempDir;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::timeout;
+
+/// Logins no test here asks for.
+#[derive(Debug)]
+struct NoLogins;
+
+impl Accounts for NoLogins {
+    fn login(&self, _token: Token) -> Done<'_, LoggedIn> {
+        unreachable!("no test here logs in")
+    }
+
+    fn logout(&self) -> Done<'_, ()> {
+        unreachable!("no test here logs out")
+    }
+}
+
+/// What a command that reads nothing typed is given to read.
+fn untyped() -> std::io::Result<Typed> {
+    unreachable!("no command here reads anything typed")
+}
 
 /// How long a test waits before calling something lost.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -142,7 +164,13 @@ impl Daemon {
 
         let socket = home.path().join("run").join("benshi.sock");
         let listener = bind(&socket).expect("the socket binds");
-        let server = Arc::new(Server::new(Arc::clone(&bus), policy, seen, decided));
+        let server = Arc::new(Server::new(
+            Arc::clone(&bus),
+            policy,
+            seen,
+            decided,
+            Arc::new(NoLogins),
+        ));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 
         Self {
@@ -156,7 +184,7 @@ impl Daemon {
     async fn ask(&self, command: Command) -> (ExitCode, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let outcome = run(command, &self.socket, &mut out, &mut err).await;
+        let outcome = run(command, &self.socket, untyped, &mut out, &mut err).await;
 
         assert!(
             err.is_empty(),

@@ -13,10 +13,13 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
+use std::future::Future;
 use std::os::unix::net::UnixListener;
 use std::process::Command;
 use std::time::Duration;
 
+use benshi_core::token::Token;
+use benshi_daemon::accounts::{self, Accounts, OnAniList};
 use benshi_daemon::secrets::{Asking, Error, SecretService};
 
 /// Set in a run a test started, and in no other.
@@ -46,17 +49,37 @@ fn again(name: &str, address: &str) {
     assert!(said.contains("1 passed"), "{address}: {said}");
 }
 
-/// What connecting in this session answers.
-fn connected() -> Result<SecretService, Error> {
+/// What `call` comes to in this session.
+fn answered<T>(call: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a runtime")
         .block_on(async {
-            tokio::time::timeout(BOUND, SecretService::connect(SHORT, Asking::Never))
+            tokio::time::timeout(BOUND, call)
                 .await
-                .expect("connecting gives up on its own")
+                .expect("the call gives up on its own")
         })
+}
+
+/// What connecting in this session answers.
+fn connected() -> Result<SecretService, Error> {
+    answered(SecretService::connect(SHORT, Asking::Never))
+}
+
+/// Logins checked with a service at a port of this machine that nobody
+/// listens on, held by the socket handed back, so that no test here
+/// reaches AniList.
+fn accounts() -> (OnAniList, tokio::net::TcpSocket) {
+    let start = u16::try_from(std::process::id() % 20_000).expect("below 20000");
+    for offset in 0..20_000 {
+        let port = 20_000 + (start + offset) % 20_000;
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        if socket.bind(([127, 0, 0, 1], port).into()).is_ok() {
+            return (OnAniList::new(&format!("http://127.0.0.1:{port}/")), socket);
+        }
+    }
+    panic!("no port between 20000 and 40000 is free");
 }
 
 #[test]
@@ -98,5 +121,49 @@ fn a_bus_that_does_not_answer_is_given_up_on_at_the_deadline() {
     again(
         "a_bus_that_does_not_answer_is_given_up_on_at_the_deadline",
         &format!("unix:path={}", bus.display()),
+    );
+}
+
+#[test]
+fn a_login_in_a_session_with_no_bus_says_the_token_was_not_kept() {
+    if env::var_os(AGAIN).is_some() {
+        let (accounts, _held) = accounts();
+        let logged = answered(accounts.login(Token::new("a token")));
+
+        assert!(
+            matches!(
+                &logged,
+                Err(accounts::Error::NotKept(Error::Unreachable(_)))
+            ),
+            "{logged:?}"
+        );
+        return;
+    }
+
+    again(
+        "a_login_in_a_session_with_no_bus_says_the_token_was_not_kept",
+        "unix:path=/nowhere/bus",
+    );
+}
+
+#[test]
+fn a_logout_in_a_session_with_no_bus_says_the_token_was_not_removed() {
+    if env::var_os(AGAIN).is_some() {
+        let (accounts, _held) = accounts();
+        let logged_out = answered(accounts.logout());
+
+        assert!(
+            matches!(
+                &logged_out,
+                Err(accounts::Error::NotRemoved(Error::Unreachable(_)))
+            ),
+            "{logged_out:?}"
+        );
+        return;
+    }
+
+    again(
+        "a_logout_in_a_session_with_no_bus_says_the_token_was_not_removed",
+        "unix:path=/nowhere/bus",
     );
 }

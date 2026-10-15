@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use benshi_core::token::Token;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use serde_json::{Value, json};
 
@@ -58,7 +59,7 @@ pub trait Transport {
 pub struct Http {
     client: reqwest::Client,
     url: String,
-    token: String,
+    token: Token,
 }
 
 impl Http {
@@ -84,7 +85,7 @@ impl Http {
         Ok(Self {
             client: reqwest::Client::builder().build()?,
             url: url.to_owned(),
-            token: token.to_owned(),
+            token: Token::new(token),
         })
     }
 }
@@ -95,7 +96,7 @@ impl Transport for Http {
         let response = self
             .client
             .post(&self.url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.secret())
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .body(request.body())
@@ -232,6 +233,15 @@ mod tests {
             serde_json::from_str::<Value>(body).expect("the body is JSON"),
             json!({ "query": "query { Viewer { id name } }", "variables": { "chunk": 1 } })
         );
+    }
+
+    #[test]
+    fn a_transport_formatted_for_debugging_shows_none_of_its_token() {
+        let http = Http::new("http://127.0.0.1:20000/", TOKEN).expect("a client");
+
+        let shown = format!("{http:?}");
+
+        assert!(!shown.contains(TOKEN), "{shown}");
     }
 
     #[tokio::test]

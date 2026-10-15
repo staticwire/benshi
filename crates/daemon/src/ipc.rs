@@ -23,6 +23,7 @@ use tokio::net::UnixListener;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
 
+use crate::accounts::{Accounts, LoggedIn};
 use crate::bus::EventBus;
 use crate::detection::Seen;
 use crate::protocol::{Explanation, Request, Response, SourceListing};
@@ -267,24 +268,28 @@ pub struct Server {
     policy: Arc<RwLock<PolicyTable>>,
     seen: Seen,
     decided: Decided,
+    accounts: Arc<dyn Accounts>,
 }
 
 impl Server {
     /// A server over the bus a `Watch` streams, the table a listing reads and a
-    /// policy is set in, and the two records each detection round leaves
-    /// behind: what it saw, and what it last decided.
+    /// policy is set in, the two records each detection round leaves behind,
+    /// what it saw and what it last decided, and what a login and a logout
+    /// are carried out by.
     #[must_use]
     pub fn new(
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
         seen: Seen,
         decided: Decided,
+        accounts: Arc<dyn Accounts>,
     ) -> Self {
         Self {
             bus,
             policy,
             seen,
             decided,
+            accounts,
         }
     }
 
@@ -385,6 +390,26 @@ impl Server {
                 Ok(Request::Why) => {
                     Response::Why(self.decided.latest().as_ref().map(Explanation::of))
                 }
+                // Answered at once and again once done, since what is done
+                // may wait on a person.
+                Ok(Request::Login { token }) => {
+                    reply(&mut writer, &Response::Ok).await?;
+                    match self.accounts.login(token).await {
+                        Ok(LoggedIn { name, expires }) => Response::LoggedIn { name, expires },
+                        Err(failed) => Response::Error {
+                            message: failed.to_string(),
+                        },
+                    }
+                }
+                Ok(Request::Logout) => {
+                    reply(&mut writer, &Response::Ok).await?;
+                    match self.accounts.logout().await {
+                        Ok(()) => Response::LoggedOut,
+                        Err(failed) => Response::Error {
+                            message: failed.to_string(),
+                        },
+                    }
+                }
                 // A stream rather than an answer, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
@@ -472,14 +497,17 @@ fn client_left(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Fallback, NoRuntimeDirectory, Server, bind, fallback_from, socket_path_from};
+    use crate::accounts::{self, Accounts, Done, LoggedIn};
     use crate::bus::{BusEvent, EventBus};
     use crate::detection::Seen;
     use crate::protocol::{Outcome, Request, Response};
     use crate::recognition::{Decided, Decision, Recogniser};
+    use crate::secrets;
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognise::parse::Episode;
+    use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
@@ -488,12 +516,13 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, RwLock, mpsc};
+    use std::sync::{Arc, Mutex, RwLock, mpsc};
     use std::thread;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
     use tokio::net::UnixStream;
     use tokio::runtime::Handle;
+    use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -529,13 +558,105 @@ mod tests {
         }
     }
 
-    /// A server over a bus, a table and a record of decisions the test keeps
-    /// hold of.
+    /// When the token of a login runs out.
+    const EXP: u64 = 1_900_000_000;
+
+    /// Logins and logouts that go through or fail as a test makes them, each
+    /// once the test lets it end.
+    #[derive(Debug)]
+    struct Scripted {
+        /// What each login and logout waits for before it ends.
+        held: Semaphore,
+        /// Whether a login or a logout goes through.
+        goes_through: bool,
+        /// What was asked, in order.
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn going_through() -> Self {
+            Self {
+                held: Semaphore::new(Semaphore::MAX_PERMITS),
+                goes_through: true,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                goes_through: false,
+                ..Self::going_through()
+            }
+        }
+
+        /// Logins and logouts that go through once the test lets them.
+        fn held() -> Self {
+            Self {
+                held: Semaphore::new(0),
+                ..Self::going_through()
+            }
+        }
+
+        /// Let one login or logout end.
+        fn let_one_end(&self) {
+            self.held.add_permits(1);
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .expect("no test panics while it holds this")
+                .clone()
+        }
+
+        async fn ended(&self, asked: String) {
+            self.asked
+                .lock()
+                .expect("no test panics while it holds this")
+                .push(asked);
+            self.held
+                .acquire()
+                .await
+                .expect("the semaphore is never closed")
+                .forget();
+        }
+    }
+
+    impl Accounts for Scripted {
+        fn login(&self, token: Token) -> Done<'_, LoggedIn> {
+            Box::pin(async move {
+                self.ended(format!("login {}", token.secret())).await;
+                if !self.goes_through {
+                    return Err(accounts::Error::NotKept(secrets::Error::Locked));
+                }
+
+                Ok(LoggedIn {
+                    name: "someone".to_owned(),
+                    expires: Some(EXP),
+                })
+            })
+        }
+
+        fn logout(&self) -> Done<'_, ()> {
+            Box::pin(async {
+                self.ended("logout".to_owned()).await;
+                if !self.goes_through {
+                    return Err(accounts::Error::NotRemoved(secrets::Error::Locked));
+                }
+
+                Ok(())
+            })
+        }
+    }
+
+    /// A server over a bus, a table, a record of decisions and logins the
+    /// test keeps hold of.
     struct Daemon {
         server: Arc<Server>,
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
         decided: Decided,
+        accounts: Arc<Scripted>,
     }
 
     impl Daemon {
@@ -545,11 +666,21 @@ mod tests {
 
         /// A daemon whose bus keeps `capacity` events for a slow reader.
         fn holding(capacity: usize, sources: Vec<SourceInfo>) -> Self {
+            Self::built(capacity, sources, Scripted::going_through())
+        }
+
+        /// A daemon whose logins and logouts go as `accounts` makes them.
+        fn logging_in(accounts: Scripted) -> Self {
+            Self::built(crate::bus::CAPACITY, Vec::new(), accounts)
+        }
+
+        fn built(capacity: usize, sources: Vec<SourceInfo>, accounts: Scripted) -> Self {
             let bus = Arc::new(EventBus::with_capacity(capacity));
             let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
             let seen = Seen::new();
             seen.record(sources);
             let decided = Decided::new();
+            let accounts = Arc::new(accounts);
 
             Self {
                 server: Arc::new(Server::new(
@@ -557,10 +688,12 @@ mod tests {
                     Arc::clone(&policy),
                     seen,
                     decided.clone(),
+                    Arc::clone(&accounts) as Arc<dyn Accounts>,
                 )),
                 bus,
                 policy,
                 decided,
+                accounts,
             }
         }
 
@@ -631,6 +764,13 @@ mod tests {
                 .expect("the connection was not closed");
 
             serde_json::from_str(&line).expect("the answer is a response")
+        }
+
+        /// Fail where an answer arrives within a tenth of a second.
+        async fn answers_nothing_yet(&mut self) {
+            if let Ok(line) = timeout(Duration::from_millis(100), self.lines.next_line()).await {
+                panic!("answered before it was done: {line:?}");
+            }
         }
 
         /// Close the connection and hand back what the server is doing.
@@ -757,6 +897,100 @@ mod tests {
         client.ask(&Request::Watch).await;
 
         assert_eq!(client.answer().await, Response::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_login_is_answered_once_it_is_read_and_again_once_it_is_done() {
+        // The secret store may ask a person to unlock it, and the login waits
+        // for them. The first answer is what a client waits for under its
+        // deadline.
+        let daemon = Daemon::logging_in(Scripted::held());
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Login {
+                token: Token::new("a token"),
+            })
+            .await;
+
+        assert_eq!(client.answer().await, Response::Ok);
+        client.answers_nothing_yet().await;
+        assert_eq!(daemon.accounts.asked(), ["login a token"]);
+        daemon.accounts.let_one_end();
+        assert_eq!(
+            client.answer().await,
+            Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: Some(EXP),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_that_fails_is_answered_with_what_failed() {
+        let daemon = Daemon::logging_in(Scripted::failing());
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Login {
+                token: Token::new("a token"),
+            })
+            .await;
+
+        assert_eq!(client.answer().await, Response::Ok);
+        assert_eq!(
+            client.answer().await,
+            Response::Error {
+                message: "token could not be kept: secret store is locked".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_logout_is_answered_once_it_is_read_and_again_once_it_is_done() {
+        let daemon = Daemon::logging_in(Scripted::held());
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::Logout).await;
+
+        assert_eq!(client.answer().await, Response::Ok);
+        client.answers_nothing_yet().await;
+        assert_eq!(daemon.accounts.asked(), ["logout"]);
+        daemon.accounts.let_one_end();
+        assert_eq!(client.answer().await, Response::LoggedOut);
+    }
+
+    #[tokio::test]
+    async fn a_logout_that_fails_is_answered_with_what_failed() {
+        let daemon = Daemon::logging_in(Scripted::failing());
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::Logout).await;
+
+        assert_eq!(client.answer().await, Response::Ok);
+        assert_eq!(
+            client.answer().await,
+            Response::Error {
+                message: "token could not be removed: secret store is locked".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_goes_on_answering_after_a_login() {
+        let daemon = Daemon::logging_in(Scripted::going_through());
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Login {
+                token: Token::new("a token"),
+            })
+            .await;
+        assert_eq!(client.answer().await, Response::Ok);
+        let _logged_in = client.answer().await;
+        client.ask(&Request::Why).await;
+
+        assert_eq!(client.answer().await, Response::Why(None));
     }
 
     #[tokio::test]
