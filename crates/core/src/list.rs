@@ -48,6 +48,21 @@ pub struct Entry {
     pub score: Option<Rating>,
 }
 
+/// Where an account stands on one work, as a write tells a list.
+///
+/// The score is not in it: a write leaves the score as the list holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Write {
+    /// The work.
+    pub id: EntryId,
+    /// Where the account stands on it.
+    pub status: Status,
+    /// How many episodes the account has seen.
+    pub progress: u32,
+    /// How many times the account has seen the work again.
+    pub rewatches: u32,
+}
+
 /// What kind of release a work is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
