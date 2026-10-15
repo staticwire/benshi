@@ -16,9 +16,9 @@
 //! can tell whether the first one arrived.
 
 use benshi_core::ShowId;
+use benshi_core::list::{Rating, Status};
 use rusqlite::{Connection, params};
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::{Error, Store};
@@ -68,65 +68,6 @@ pub enum Kind {
         /// How many times the show has been seen again.
         rewatches: u32,
     },
-}
-
-/// Where a show stands on a list.
-///
-/// `Rewatching` is a status here because it is one on AniList and on
-/// Shikimori. MyAnimeList and Kitsu keep it as a flag beside the status. The
-/// other five are on all four lists, which name them differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    /// Meant to be watched and not begun.
-    Planned,
-    /// Being watched.
-    Watching,
-    /// Being watched again.
-    Rewatching,
-    /// Watched to the end.
-    Completed,
-    /// Set aside, to be taken up again.
-    OnHold,
-    /// Given up.
-    Dropped,
-}
-
-/// A score in whole points, from 1 to 100.
-///
-/// On AniList each user chooses the format a score is shown in, and the list
-/// takes and answers a score in a hundred points whichever was chosen.
-/// MyAnimeList and Shikimori score out of ten and Kitsu out of twenty, and
-/// both multiply into a hundred exactly. Nought is not a rating: an entry
-/// with no score carries none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Rating(u8);
-
-impl Rating {
-    /// A rating, or nothing where the points are not from 1 to 100.
-    #[must_use]
-    pub fn new(points: u8) -> Option<Self> {
-        (1..=100).contains(&points).then_some(Self(points))
-    }
-
-    /// The points, from 1 to 100.
-    #[must_use]
-    pub const fn points(self) -> u8 {
-        self.0
-    }
-}
-
-/// Read through [`Rating::new`], so that a score out of range in a payload is
-/// refused where a derived implementation would let it in.
-impl<'de> Deserialize<'de> for Rating {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let points = u8::deserialize(deserializer)?;
-        Self::new(points).ok_or_else(|| {
-            D::Error::custom(format_args!(
-                "rating is from 1 to 100, and this is {points}"
-            ))
-        })
-    }
 }
 
 /// One operation as it waits in the queue.
@@ -660,16 +601,6 @@ mod tests {
             matches!(refused, Err(Error::Operation { id: 1, .. })),
             "got {refused:?}"
         );
-    }
-
-    #[test]
-    fn a_rating_is_from_one_to_a_hundred() {
-        // Nought is no rating, and no rating is `None`: two ways to say it
-        // would be one too many.
-        assert_eq!(Rating::new(0), None);
-        assert_eq!(Rating::new(1).map(Rating::points), Some(1));
-        assert_eq!(Rating::new(100).map(Rating::points), Some(100));
-        assert_eq!(Rating::new(101), None);
     }
 
     #[test]

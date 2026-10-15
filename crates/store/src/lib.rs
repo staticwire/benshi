@@ -1,8 +1,8 @@
 //! The canonical local store.
 //!
-//! One SQLite database holds what was watched, what is being watched, and the
-//! operations still to be delivered to a list. Migrations are numbered and each
-//! has a test.
+//! One SQLite database holds what was watched, what is being watched, the
+//! operations still to be delivered to a list, and what each list held when it
+//! was last read. Migrations are numbered and each has a test.
 //!
 //! Recording an episode does not depend on a list being reachable. A network
 //! problem, a dead API or an expired token is a delivery problem, so marking an
@@ -17,6 +17,7 @@
 //! television, where the system may delete it between runs. Which directory
 //! that is belongs to the layer that knows the platform.
 
+mod list;
 mod migrate;
 pub mod queue;
 mod record;
@@ -27,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use benshi_core::ShowId;
+use benshi_core::list::EntryId;
 use rusqlite::Connection;
 
 pub use migrate::SCHEMA_VERSION;
@@ -111,6 +113,31 @@ pub enum Error {
     Orphan {
         /// The row's `id` in `sync_queue`.
         id: i64,
+    },
+    /// A row of `list_entries` that cannot be read as an entry: a status or
+    /// a format this build does not know, a score that is not a rating, or
+    /// spellings that are not a list of text.
+    #[error("entry {} of {backend} cannot be read: {cause}", .entry.0)]
+    Entry {
+        /// The backend whose list holds the row.
+        backend: String,
+        /// The entry the row is of.
+        entry: EntryId,
+        /// What the column failed on.
+        #[source]
+        cause: serde_json::Error,
+    },
+    /// A row of `list_entries` with no show: its link in `backend_ids` or the
+    /// show the link names is not there.
+    ///
+    /// Foreign keys keep one from being written through this crate, as they
+    /// keep an [`Error::Orphan`].
+    #[error("entry {} of {backend} has no show", .entry.0)]
+    Showless {
+        /// The backend whose list holds the row.
+        backend: String,
+        /// The entry the row is of.
+        entry: EntryId,
     },
     /// A row of `watching` whose media is not a path as this crate writes
     /// one: a per-cent sign with no two hexadecimal digits after it.
@@ -297,6 +324,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use benshi_core::ShowId;
+    use benshi_core::list::EntryId;
     use benshi_core::path::RawPath;
     use tempfile::TempDir;
 
@@ -548,6 +576,17 @@ mod tests {
     }
 
     #[test]
+    fn a_list_filed_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+
+        let refused = store.file("anilist", &[]);
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
     fn an_episode_recorded_while_another_connection_writes_is_refused_as_busy() {
         let (_home, database) = a_home();
         let mut store = a_store_in_a_hurry(&database);
@@ -686,6 +725,23 @@ mod tests {
         assert_eq!(
             Error::Orphan { id: 7 }.to_string(),
             "queued operation 7 is for a show that is not there"
+        );
+        assert_eq!(
+            Error::Entry {
+                backend: "anilist".to_owned(),
+                entry: EntryId(21),
+                cause: unread()
+            }
+            .to_string(),
+            format!("entry 21 of anilist cannot be read: {}", unread())
+        );
+        assert_eq!(
+            Error::Showless {
+                backend: "anilist".to_owned(),
+                entry: EntryId(21)
+            }
+            .to_string(),
+            "entry 21 of anilist has no show"
         );
         assert_eq!(
             Error::Media {
