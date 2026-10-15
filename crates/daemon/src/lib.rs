@@ -34,6 +34,8 @@ use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
 
 pub mod bus;
 
+pub mod config;
+
 pub mod detection;
 
 #[cfg(unix)]

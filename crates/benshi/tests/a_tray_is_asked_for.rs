@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{Daemon, Directory};
+use common::{Daemon, Directory, NO_SETTINGS};
 
 #[test]
 fn a_daemon_asked_for_a_tray_says_that_there_is_none() {
@@ -31,6 +31,7 @@ fn a_daemon_asked_for_a_tray_says_that_there_is_none() {
         said,
         [
             "benshi: there is no tray yet, running without one".to_owned(),
+            NO_SETTINGS.to_owned(),
             format!(
                 "benshi: listening on {}",
                 runtime.join("benshi.sock").display()

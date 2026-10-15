@@ -282,15 +282,16 @@ fn daemon(tray: bool) -> ExitCode {
     ExitCode::from(ended)
 }
 
-/// Bind the socket, open the database and supervise the daemon's tasks, until
-/// every one of them has stopped or a signal stops the daemon. The answer is
-/// the code the process ends with.
+/// Read the settings, bind the socket, open the database and supervise the
+/// daemon's tasks, until every one of them has stopped or a signal stops the
+/// daemon. The answer is the code the process ends with.
 #[cfg(target_os = "linux")]
 async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
     use benshi_core::clock::SystemClock;
+    use benshi_daemon::config;
     use benshi_daemon::paths::{DATABASE, Role, directory};
     use benshi_daemon::recognition::Recogniser;
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
@@ -304,6 +305,16 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     let mut stops = match waited_for(ignored, Stops::taken, |line| voice.say(line)) {
         Ok(stops) => stops,
         Err(code) => return code,
+    };
+    // Read ahead of the socket and the database, so that a file that cannot
+    // be used ends the daemon having touched neither. No task reads a
+    // setting.
+    let (_settings, origin) = match config::load(directory(Role::Config)) {
+        Ok(loaded) => loaded,
+        Err(unusable) => {
+            voice.say(format_args!("{unusable}"));
+            return FAILED;
+        }
     };
     let socket = benshi_daemon::ipc::socket_path();
     // The XDG Base Directory Specification asks for a warning where the
@@ -342,6 +353,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
             return FAILED;
         }
     };
+    voice.say(format_args!("{origin}"));
     voice.say(format_args!("listening on {}", socket.display()));
     voice.say(format_args!("recording in {}", database.display()));
 
