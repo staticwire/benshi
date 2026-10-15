@@ -121,6 +121,30 @@ fn a_daemon_that_cannot_say_where_its_socket_went_goes_on() {
 }
 
 #[test]
+fn a_daemon_whose_settings_cannot_be_used_ends_as_a_failure_unheard() {
+    let temporary = Directory::of("n-settings");
+    let config = temporary.path().join("config");
+    fs::create_dir_all(config.join("benshi")).expect("a configuration directory");
+    fs::write(
+        config.join("benshi").join("config.toml"),
+        "[send]\nwhen = \"sometimes\"\n",
+    )
+    .expect("a file of settings");
+
+    let ended = ends_unheard(
+        &[OsStr::new(NO_TRAY)],
+        &[
+            ("XDG_RUNTIME_DIR", temporary.path().join("run").as_os_str()),
+            ("XDG_CONFIG_HOME", config.as_os_str()),
+            ("BENSHI_DATA_DIR", temporary.path().join("data").as_os_str()),
+        ],
+        Descriptors::Plenty,
+    );
+
+    assert_eq!(ended, FAILED);
+}
+
+#[test]
 fn a_daemon_with_nowhere_to_record_ends_as_a_failure_unheard() {
     let temporary = Directory::of("n-nowhere");
     let runtime = temporary.path().join("run");
@@ -166,7 +190,7 @@ fn a_daemon_that_cannot_listen_ends_as_a_failure_unheard() {
         ),
     ]);
     let started = first.says();
-    assert_eq!(started.len(), 2, "the first daemon started: {started:?}");
+    assert_eq!(started.len(), 3, "the first daemon started: {started:?}");
 
     let ended = ends_unheard(
         &[OsStr::new(NO_TRAY)],
@@ -234,7 +258,7 @@ fn a_client_that_cannot_say_where_it_looks_is_answered_as_one_that_can() {
         ("BENSHI_DATA_DIR", data.as_os_str()),
     ]);
     let started = daemon.says();
-    assert_eq!(started.len(), 3, "the daemon started: {started:?}");
+    assert_eq!(started.len(), 4, "the daemon started: {started:?}");
     let mut heard = the_binary(&[OsStr::new("sources")], &session, Descriptors::Plenty);
     heard.stderr(Stdio::piped());
     let mut unheard = the_binary(&[OsStr::new("sources")], &session, Descriptors::Plenty);

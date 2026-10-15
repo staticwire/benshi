@@ -38,6 +38,14 @@ pub const NO_SOURCE: &str = "no source is open\n";
 /// What the last line a daemon says as it starts begins with.
 const STARTED: &str = "benshi: recording in ";
 
+/// What a daemon says of its settings in a session that names no
+/// configuration directory, which a session a test chose does unless it sets
+/// one.
+// Dead in a test binary that reads no daemon's first lines whole.
+#[allow(dead_code)]
+pub const NO_SETTINGS: &str = "benshi: default settings: no configuration directory: no absolute \
+                               path in `XDG_CONFIG_HOME` or `HOME`";
+
 /// The flag that asks for a daemon without a tray icon.
 pub const NO_TRAY: &str = "--no-tray";
 

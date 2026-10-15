@@ -33,7 +33,7 @@ fn the_daemon_says_that_detection_is_started_again() {
         ("BENSHI_DATA_DIR", data.as_os_str()),
     ]);
     let started = daemon.says();
-    assert_eq!(started.len(), 2, "the daemon started: {started:?}");
+    assert_eq!(started.len(), 3, "the daemon started: {started:?}");
 
     let said = daemon
         .says_next()
@@ -46,7 +46,7 @@ fn the_daemon_says_that_detection_is_started_again() {
 fn a_daemon_that_cannot_say_it_goes_on_running() {
     // A daemon that outlives the terminal it was started from writes to a
     // terminal that has gone, and the write fails. This one is read for its
-    // two lines and the first it says of detection, and the second is the
+    // three lines and the first it says of detection, and the second is the
     // one it cannot write.
     let temporary = Directory::of("t-unheard");
     let runtime = temporary.path().join("run");
@@ -56,10 +56,10 @@ fn a_daemon_that_cannot_say_it_goes_on_running() {
             ("XDG_RUNTIME_DIR", runtime.as_os_str()),
             ("BENSHI_DATA_DIR", data.as_os_str()),
         ],
-        3,
+        4,
     );
     let started = daemon.says();
-    assert_eq!(started.len(), 2, "the daemon started: {started:?}");
+    assert_eq!(started.len(), 3, "the daemon started: {started:?}");
     let said = daemon.says_next().expect("the daemon said something");
     assert!(said.starts_with(STARTED_AGAIN), "{said}");
 

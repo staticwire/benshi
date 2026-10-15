@@ -15,7 +15,7 @@ mod common;
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
 
-use common::{Directory, the_daemon_says};
+use common::{Directory, NO_SETTINGS, the_daemon_says};
 
 /// What the client says in this session, asked for the sources.
 fn the_client_says(session: &[(&str, &OsStr)], arguments: &[&OsStr]) -> Vec<String> {
@@ -52,6 +52,7 @@ fn the_daemon_says_that_the_runtime_directory_is_not_set() {
                 "benshi: `XDG_RUNTIME_DIR` is not set, so socket is {}",
                 socket.display()
             ),
+            NO_SETTINGS.to_owned(),
             format!("benshi: listening on {}", socket.display()),
             format!("benshi: recording in {}", data.join("benshi.db").display()),
         ]
@@ -78,6 +79,7 @@ fn the_daemon_says_what_is_wrong_with_the_runtime_directory_it_was_given() {
                  socket is {}",
                 socket.display()
             ),
+            NO_SETTINGS.to_owned(),
             format!("benshi: listening on {}", socket.display()),
             format!("benshi: recording in {}", data.join("benshi.db").display()),
         ]
@@ -99,6 +101,7 @@ fn the_daemon_says_nothing_of_a_runtime_directory_it_uses() {
     assert_eq!(
         said,
         [
+            NO_SETTINGS.to_owned(),
             format!(
                 "benshi: listening on {}",
                 runtime.join("benshi.sock").display()

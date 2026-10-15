@@ -14,7 +14,7 @@ mod common;
 use std::fs;
 
 use benshi_store::{SCHEMA_VERSION, Store};
-use common::{Daemon, Directory, the_daemon_says};
+use common::{Daemon, Directory, NO_SETTINGS, the_daemon_says};
 
 /// How a process ends on Linux whose `main` answered `ExitCode::FAILURE`.
 const FAILED: Option<i32> = Some(1);
@@ -35,6 +35,7 @@ fn the_daemon_says_where_it_records_and_the_database_is_there() {
     assert_eq!(
         said,
         [
+            NO_SETTINGS.to_owned(),
             format!(
                 "benshi: listening on {}",
                 runtime.join("benshi.sock").display()
@@ -125,7 +126,7 @@ fn a_daemon_that_cannot_listen_opens_no_database() {
         ),
     ]);
     let started = first.says();
-    assert_eq!(started.len(), 2, "the first daemon started: {started:?}");
+    assert_eq!(started.len(), 3, "the first daemon started: {started:?}");
     let untouched = temporary.path().join("second");
 
     let (said, ended) = the_daemon_says(&[
