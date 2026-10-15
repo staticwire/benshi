@@ -30,7 +30,8 @@ use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
-use benshi_daemon::recognition::{Decided, Recogniser};
+use benshi_daemon::listing::Wakes;
+use benshi_daemon::recognition::{Current, Decided, Recogniser};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use tempfile::TempDir;
@@ -153,7 +154,8 @@ impl Daemon {
                 bus: Arc::clone(&bus),
                 policy: Arc::clone(&policy),
                 seen: seen.clone(),
-                recogniser: Arc::new(Recogniser::empty()),
+                recogniser: Current::new(Recogniser::empty()),
+                wakes: Wakes::new(),
                 decided: decided.clone(),
                 store: Arc::new(Mutex::new(store)),
                 now: SystemTime::now,
@@ -170,6 +172,7 @@ impl Daemon {
             seen,
             decided,
             Arc::new(NoLogins),
+            Wakes::new(),
         ));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 

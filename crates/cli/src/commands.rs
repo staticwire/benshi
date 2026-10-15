@@ -529,6 +529,7 @@ mod tests {
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
+    use benshi_daemon::listing::Wakes;
     use benshi_daemon::protocol::{Request, Response};
     use benshi_daemon::recognition::{Decided, Decision, Recogniser};
     use benshi_daemon::secrets;
@@ -815,6 +816,7 @@ mod tests {
                 seen,
                 decided.clone(),
                 Arc::clone(&accounts) as Arc<dyn Accounts>,
+                Wakes::new(),
             ));
 
             Self {
