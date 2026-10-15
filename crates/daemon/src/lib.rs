@@ -49,6 +49,8 @@ pub mod protocol;
 
 pub mod recognition;
 
+pub mod secrets;
+
 pub mod supervisor;
 
 pub mod voice;
