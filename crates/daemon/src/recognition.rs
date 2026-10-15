@@ -11,7 +11,7 @@
 //! same reason: an explanation is of what the daemon acted on, and a second
 //! look would be free to disagree with it.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use benshi_core::path::RawPath;
 use benshi_core::recognise::altname::Altnames;
@@ -68,6 +68,38 @@ impl Recogniser {
     }
 }
 
+/// The recogniser the rounds decide against, which the list's task replaces
+/// when it has read a list.
+///
+/// A round takes the one in place as it begins and decides with it to its
+/// end, so a round that began before a replacement finishes on the list it
+/// began with. Cloning shares the place.
+#[derive(Debug, Clone)]
+pub struct Current(Arc<RwLock<Arc<Recogniser>>>);
+
+impl Current {
+    /// A place holding `recogniser`.
+    #[must_use]
+    pub fn new(recogniser: Recogniser) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(recogniser))))
+    }
+
+    /// The recogniser in place.
+    ///
+    /// Read through a lock a panic left poisoned: the recogniser is made
+    /// before the lock is taken and put in whole, so no panic leaves half of
+    /// one in place.
+    #[must_use]
+    pub fn now(&self) -> Arc<Recogniser> {
+        Arc::clone(&self.0.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Put `recogniser` in place of the one there.
+    pub fn replace(&self, recogniser: Recogniser) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(recogniser);
+    }
+}
+
 /// One decision: whose file, which file, what its name spelled, and the answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
@@ -119,7 +151,7 @@ impl Decided {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decided, Decision, Recogniser};
+    use super::{Current, Decided, Decision, Recogniser};
     use benshi_core::path::RawPath;
     use benshi_core::recognise::altname::Altnames;
     use benshi_core::recognise::corpus::Corpus;
@@ -259,6 +291,34 @@ mod tests {
                 answer,
                 Recognition::Unrecognised(Refusal { best: None, .. })
             ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_recogniser_put_in_place_is_the_one_taken_after() {
+        let current = Current::new(Recogniser::empty());
+        let shared = current.clone();
+
+        shared.replace(Recogniser::of(a_list_of(&["Show Title"]), Altnames::new()));
+        let (_parsed, answer) = current.now().decide(&a_path("[Group] Show Title - 03.mkv"));
+
+        assert!(
+            matches!(answer, Recognition::Recognised(_)),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_recogniser_taken_before_a_replacement_decides_as_it_did() {
+        let current = Current::new(Recogniser::empty());
+        let taken = current.now();
+
+        current.replace(Recogniser::of(a_list_of(&["Show Title"]), Altnames::new()));
+        let (_parsed, answer) = taken.decide(&a_path("[Group] Show Title - 03.mkv"));
+
+        assert!(
+            matches!(answer, Recognition::Unrecognised(_)),
             "got {answer:?}"
         );
     }

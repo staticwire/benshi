@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use crate::accounts::{Accounts, LoggedIn};
 use crate::bus::EventBus;
 use crate::detection::Seen;
+use crate::listing::Wakes;
 use crate::protocol::{Explanation, Request, Response, SourceListing};
 use crate::recognition::Decided;
 use crate::supervisor::TaskError;
@@ -269,13 +270,14 @@ pub struct Server {
     seen: Seen,
     decided: Decided,
     accounts: Arc<dyn Accounts>,
+    wakes: Wakes,
 }
 
 impl Server {
     /// A server over the bus a `Watch` streams, the table a listing reads and a
     /// policy is set in, the two records each detection round leaves behind,
-    /// what it saw and what it last decided, and what a login and a logout
-    /// are carried out by.
+    /// what it saw and what it last decided, what a login and a logout are
+    /// carried out by, and the list's task, which a login wakes.
     #[must_use]
     pub fn new(
         bus: Arc<EventBus>,
@@ -283,6 +285,7 @@ impl Server {
         seen: Seen,
         decided: Decided,
         accounts: Arc<dyn Accounts>,
+        wakes: Wakes,
     ) -> Self {
         Self {
             bus,
@@ -290,6 +293,7 @@ impl Server {
             seen,
             decided,
             accounts,
+            wakes,
         }
     }
 
@@ -395,7 +399,10 @@ impl Server {
                 Ok(Request::Login { token }) => {
                     reply(&mut writer, &Response::Ok).await?;
                     match self.accounts.login(token).await {
-                        Ok(LoggedIn { name, expires }) => Response::LoggedIn { name, expires },
+                        Ok(LoggedIn { name, expires }) => {
+                            self.wakes.logged_in();
+                            Response::LoggedIn { name, expires }
+                        }
                         Err(failed) => Response::Error {
                             message: failed.to_string(),
                         },
@@ -500,6 +507,7 @@ mod tests {
     use crate::accounts::{self, Accounts, Done, LoggedIn};
     use crate::bus::{BusEvent, EventBus};
     use crate::detection::Seen;
+    use crate::listing::Wakes;
     use crate::protocol::{Outcome, Request, Response};
     use crate::recognition::{Decided, Decision, Recogniser};
     use crate::secrets;
@@ -657,6 +665,7 @@ mod tests {
         policy: Arc<RwLock<PolicyTable>>,
         decided: Decided,
         accounts: Arc<Scripted>,
+        wakes: Wakes,
     }
 
     impl Daemon {
@@ -681,6 +690,7 @@ mod tests {
             seen.record(sources);
             let decided = Decided::new();
             let accounts = Arc::new(accounts);
+            let wakes = Wakes::new();
 
             Self {
                 server: Arc::new(Server::new(
@@ -689,11 +699,13 @@ mod tests {
                     seen,
                     decided.clone(),
                     Arc::clone(&accounts) as Arc<dyn Accounts>,
+                    wakes.clone(),
                 )),
                 bus,
                 policy,
                 decided,
                 accounts,
+                wakes,
             }
         }
 
@@ -943,6 +955,48 @@ mod tests {
             Response::Error {
                 message: "token could not be kept: secret store is locked".to_owned(),
             }
+        );
+    }
+
+    /// Whether the list's task was woken by a login.
+    async fn woken_by_a_login(wakes: &Wakes) -> bool {
+        timeout(Duration::from_millis(50), wakes.logged_in.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_login_that_goes_through_wakes_the_lists_task() {
+        let daemon = Daemon::logging_in(Scripted::going_through());
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Login {
+                token: Token::new("a token"),
+            })
+            .await;
+        assert_eq!(client.answer().await, Response::Ok);
+        let _logged_in = client.answer().await;
+
+        assert!(woken_by_a_login(&daemon.wakes).await, "nothing was woken");
+    }
+
+    #[tokio::test]
+    async fn a_login_that_fails_wakes_nothing() {
+        let daemon = Daemon::logging_in(Scripted::failing());
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Login {
+                token: Token::new("a token"),
+            })
+            .await;
+        assert_eq!(client.answer().await, Response::Ok);
+        let _failed = client.answer().await;
+
+        assert!(
+            !woken_by_a_login(&daemon.wakes).await,
+            "a failed login woke the task"
         );
     }
 

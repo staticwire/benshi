@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use benshi_core::token::Token;
 use benshi_daemon::accounts::{self, Accounts, OnAniList};
+use benshi_daemon::listing::{FromAniList, Source};
 use benshi_daemon::secrets::{Asking, Error, SecretService};
 
 /// Set in a run a test started, and in no other.
@@ -67,19 +68,26 @@ fn connected() -> Result<SecretService, Error> {
     answered(SecretService::connect(SHORT, Asking::Never))
 }
 
-/// Logins checked with a service at a port of this machine that nobody
-/// listens on, held by the socket handed back, so that no test here
-/// reaches AniList.
-fn accounts() -> (OnAniList, tokio::net::TcpSocket) {
+/// The address of a service at a port of this machine that nobody listens
+/// on, held by the socket handed back, so that no test here reaches
+/// AniList.
+fn nowhere() -> (String, tokio::net::TcpSocket) {
     let start = u16::try_from(std::process::id() % 20_000).expect("below 20000");
     for offset in 0..20_000 {
         let port = 20_000 + (start + offset) % 20_000;
         let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
         if socket.bind(([127, 0, 0, 1], port).into()).is_ok() {
-            return (OnAniList::new(&format!("http://127.0.0.1:{port}/")), socket);
+            return (format!("http://127.0.0.1:{port}/"), socket);
         }
     }
     panic!("no port between 20000 and 40000 is free");
+}
+
+/// Logins checked with [`nowhere`].
+fn accounts() -> (OnAniList, tokio::net::TcpSocket) {
+    let (address, held) = nowhere();
+
+    (OnAniList::new(&address), held)
 }
 
 #[test]
@@ -165,5 +173,54 @@ fn a_logout_in_a_session_with_no_bus_says_the_token_was_not_removed() {
     again(
         "a_logout_in_a_session_with_no_bus_says_the_token_was_not_removed",
         "unix:path=/nowhere/bus",
+    );
+}
+
+#[test]
+fn a_token_given_from_the_environment_is_read_without_asking_the_store() {
+    if env::var_os(AGAIN).is_some() {
+        let (address, _held) = nowhere();
+        let source = FromAniList::new(&address, Some(Token::new("given")));
+
+        let token = answered(source.token()).expect("a token");
+
+        assert_eq!(token.as_ref().map(Token::secret), Some("given"));
+        return;
+    }
+
+    again(
+        "a_token_given_from_the_environment_is_read_without_asking_the_store",
+        "unix:path=/nowhere/bus",
+    );
+}
+
+#[test]
+fn a_token_with_none_given_is_asked_of_the_store() {
+    if env::var_os(AGAIN).is_some() {
+        let (address, _held) = nowhere();
+        let source = FromAniList::new(&address, None);
+
+        let token = answered(source.token());
+
+        assert!(matches!(&token, Err(Error::Unreachable(_))), "{token:?}");
+        return;
+    }
+
+    again(
+        "a_token_with_none_given_is_asked_of_the_store",
+        "unix:path=/nowhere/bus",
+    );
+}
+
+#[test]
+fn a_list_is_read_from_the_address_given() {
+    let (address, _held) = nowhere();
+    let source = FromAniList::new(&address, None);
+
+    let list = answered(source.list(&Token::new("a token")));
+
+    assert!(
+        matches!(&list, Err(benshi_sync::Error::Unreachable(_))),
+        "{list:?}"
     );
 }

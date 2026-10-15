@@ -17,12 +17,14 @@
 // nothing to await, rather than being spelled out as the future it desugars to.
 #![allow(clippy::unused_async_trait_impl)]
 
+use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use benshi_core::clock::{Clock, TestClock, Timestamp};
+use benshi_core::list::{Entry, EntryId, Status};
 use benshi_core::path::RawPath;
 use benshi_core::policy::Policy;
 use benshi_core::recognise::altname::Altnames;
@@ -33,9 +35,12 @@ use benshi_core::{
 };
 use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::BusEvent;
+use benshi_daemon::config::{Period, Reading};
 use benshi_daemon::ipc::bind;
+use benshi_daemon::listing::{Listing, Source};
 use benshi_daemon::protocol::{Request, Response, SourceListing};
 use benshi_daemon::recognition::Recogniser;
+use benshi_daemon::secrets;
 use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, TaskRecord};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
@@ -303,8 +308,37 @@ impl Accounts for NoLogins {
     }
 }
 
-/// A daemon over this platform with nothing to match a name against, as the
-/// binary starts one.
+/// A list that answers with these entries, with a token always kept.
+struct Answering(Vec<Entry>);
+
+impl Source for Answering {
+    fn token(&self) -> impl Future<Output = Result<Option<Token>, secrets::Error>> + Send {
+        future::ready(Ok(Some(Token::new("a token"))))
+    }
+
+    fn list(
+        &self,
+        _token: &Token,
+    ) -> impl Future<Output = Result<Vec<Entry>, benshi_sync::Error>> + Send {
+        future::ready(Ok(self.0.clone()))
+    }
+}
+
+/// A list's task that never reads: no token, and no time to read at.
+fn reading_nothing() -> Listing<Answering> {
+    Listing {
+        source: Answering(Vec::new()),
+        reading: Reading {
+            refresh: Period::Off,
+            at_start: false,
+            on_miss: Period::Off,
+        },
+        say: Arc::new(|_line: &str| {}),
+    }
+}
+
+/// A daemon over this platform with nothing to match a name against and a
+/// list's task that never reads.
 fn a_daemon(
     platform: &Platform,
     home: &TempDir,
@@ -320,6 +354,7 @@ fn a_daemon(
         SystemTime::now,
         PERIOD,
         Arc::new(NoLogins),
+        reading_nothing(),
         |_notice| {},
     ))
 }
@@ -353,6 +388,7 @@ fn a_daemon_that_tells(
         the_time,
         PERIOD,
         Arc::new(NoLogins),
+        reading_nothing(),
         told.listener(),
     ))
 }
@@ -480,6 +516,152 @@ async fn a_running_daemon_records_what_its_detection_watched() {
         .query_row("SELECT seen_at FROM episodes_seen", [], |row| row.get(0))
         .expect("the one episode that was recorded");
     assert_eq!(seen_at, THE_TIME);
+}
+
+/// The one entry of the list the platform's file is of.
+fn the_entry() -> Entry {
+    Entry {
+        id: EntryId(900_001),
+        title: "Show".to_owned(),
+        spellings: Vec::new(),
+        format: None,
+        episodes: Some(12),
+        episode_length: None,
+        year: None,
+        released: true,
+        status: Status::Watching,
+        progress: 2,
+        rewatches: 0,
+        score: None,
+    }
+}
+
+/// Logins that go through.
+#[derive(Debug)]
+struct Taking;
+
+impl Accounts for Taking {
+    fn login(&self, _token: Token) -> Done<'_, LoggedIn> {
+        Box::pin(future::ready(Ok(LoggedIn {
+            name: "someone".to_owned(),
+            expires: None,
+        })))
+    }
+
+    fn logout(&self) -> Done<'_, ()> {
+        Box::pin(future::ready(Ok(())))
+    }
+}
+
+/// A daemon over this platform with nothing to match a name against and an
+/// empty store, whose list's task reads [`the_entry`] at the times `reading`
+/// names, and whose logins go through.
+fn a_daemon_reading(
+    platform: &Platform,
+    store: &Arc<Mutex<Store>>,
+    socket: &Path,
+    reading: Reading,
+) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+    let listener = Arc::new(bind(socket).expect("the socket binds"));
+
+    tokio::spawn(benshi_daemon::run(
+        platform.factory(),
+        listener,
+        Recogniser::empty(),
+        Arc::clone(store),
+        the_time,
+        PERIOD,
+        Arc::new(Taking),
+        Listing {
+            source: Answering(vec![the_entry()]),
+            reading,
+            say: Arc::new(|_line: &str| {}),
+        },
+        |_notice| {},
+    ))
+}
+
+/// An empty store, as a daemon makes one in a directory of its own.
+fn an_empty_store(home: &TempDir) -> Arc<Mutex<Store>> {
+    Arc::new(Mutex::new(
+        Store::open(&the_database(home)).expect("the database opens"),
+    ))
+}
+
+/// The one operation a daemon queues once it has recorded the platform's
+/// file as an episode of [`the_entry`].
+fn the_episode_queued() -> [Operation; 1] {
+    [Operation {
+        id: 1,
+        show: THE_SHOW,
+        title: "Show".to_owned(),
+        kind: Kind::Progress { episode: Some(3) },
+    }]
+}
+
+#[tokio::test]
+async fn a_running_daemon_records_what_the_list_it_read_holds() {
+    // A daemon that starts with nothing to match a name against, and an
+    // empty store: the file it plays is recognised only by a list its own
+    // task read, filed and put in place for detection.
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::default();
+
+    let running = a_daemon_reading(&platform, &store, &socket, Reading::default());
+
+    let queued = once_queued(&store, "the daemon recorded an episode of its list").await;
+    running.abort();
+
+    assert_eq!(queued, the_episode_queued());
+}
+
+#[tokio::test]
+async fn a_running_daemon_reads_its_list_where_a_name_misses_it() {
+    // Read at no time but on a miss: the file the platform plays misses
+    // the empty list, the round wakes the list's task, and what it reads
+    // recognises the file.
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::default();
+    let reading = Reading {
+        refresh: Period::Off,
+        at_start: false,
+        on_miss: Period::Every(Duration::ZERO),
+    };
+
+    let running = a_daemon_reading(&platform, &store, &socket, reading);
+
+    let queued = once_queued(&store, "a miss brought a reading of the list").await;
+    running.abort();
+
+    assert_eq!(queued, the_episode_queued());
+}
+
+#[tokio::test]
+async fn a_running_daemon_reads_its_list_once_a_login_goes_through() {
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::default();
+    let reading = Reading {
+        refresh: Period::Off,
+        at_start: false,
+        on_miss: Period::Off,
+    };
+    let running = a_daemon_reading(&platform, &store, &socket, reading);
+
+    let taken = ask(
+        &socket,
+        &Request::Login {
+            token: Token::new("a token"),
+        },
+    )
+    .await;
+    assert_eq!(taken, Response::Ok);
+    let queued = once_queued(&store, "a login brought a reading of the list").await;
+    running.abort();
+
+    assert_eq!(queued, the_episode_queued());
 }
 
 #[tokio::test]

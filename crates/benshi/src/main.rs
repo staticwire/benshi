@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 #[cfg(target_os = "linux")]
 use std::task::Poll;
 #[cfg(target_os = "linux")]
@@ -50,6 +50,10 @@ const STOPPED: u8 = 0;
 /// left running.
 #[cfg(target_os = "linux")]
 const FAILED: u8 = 1;
+
+/// Where a token for AniList may be given from the environment.
+#[cfg(target_os = "linux")]
+const TOKEN: &str = "BENSHI_TOKEN_ANILIST";
 
 /// What one invocation of this binary is for.
 ///
@@ -293,10 +297,11 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use benshi_core::clock::SystemClock;
     use benshi_daemon::accounts::OnAniList;
     use benshi_daemon::config;
+    use benshi_daemon::listing::{self, FromAniList, Listing};
     use benshi_daemon::paths::{DATABASE, Role, directory};
-    use benshi_daemon::recognition::Recogniser;
     use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
     use benshi_store::Store;
+    use benshi_sync::anilist::transport::ANILIST;
 
     // Taken ahead of the socket and the database, so that a signal sent
     // while one is bound and the other opened stops the daemon once its
@@ -308,9 +313,8 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         Err(code) => return code,
     };
     // Read ahead of the socket and the database, so that a file that cannot
-    // be used ends the daemon having touched neither. No task reads a
-    // setting.
-    let (_settings, origin) = match config::load(directory(Role::Config)) {
+    // be used ends the daemon having touched neither.
+    let (settings, origin) = match config::load(directory(Role::Config)) {
         Ok(loaded) => loaded,
         Err(unusable) => {
             voice.say(format_args!("{unusable}"));
@@ -354,22 +358,42 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
             return FAILED;
         }
     };
+    // What the store holds of the list is what the first round decides
+    // against, so a daemon recognises before it reads the list again.
+    let recogniser = match listing::kept(&store.lock().expect("nothing has used the store yet")) {
+        Ok(recogniser) => recogniser,
+        Err(unread) => {
+            voice.say(format_args!(
+                "{} cannot be used: {unread}",
+                database.display()
+            ));
+            return FAILED;
+        }
+    };
+    let given = given();
+    let words = Arc::new(UpToTheLast::default());
     voice.say(format_args!("{origin}"));
     voice.say(format_args!("listening on {}", socket.display()));
     voice.say(format_args!("recording in {}", database.display()));
+    if given.is_some() {
+        voice.say(format_args!("AniList token from {TOKEN}"));
+    }
 
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
     let running = benshi_daemon::run(
         || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
         listener,
-        // No list to match a name against, so every file is refused and
-        // `benshi why` says so.
-        Recogniser::empty(),
+        recogniser,
         store,
         SystemTime::now,
         POLL_INTERVAL,
-        Arc::new(OnAniList::new(benshi_sync::anilist::transport::ANILIST)),
+        Arc::new(OnAniList::new(ANILIST)),
+        Listing {
+            source: FromAniList::new(ANILIST, given),
+            reading: settings.list,
+            say: saying(voice, &words),
+        },
         // Said as it happens: the socket goes on answering once detection
         // has stopped, and the process does not end to say so. The
         // supervisor deals with no task that ended until this returns, so it
@@ -393,9 +417,57 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     // task as it is dropped. A task that is aborted ends at an await: the
     // one it waits at, or the next it reaches. The runtime waits for that
     // as it is dropped, and for a call into the store that is under way.
-    voice.say(format_args!("stopped by {signal}"));
+    words.last(|| voice.say(format_args!("stopped by {signal}")));
 
     STOPPED
+}
+
+/// The token for AniList given from the environment, where one is: for tests
+/// and development, and said in no help text. A token given here is read in
+/// place of the one a login keeps, for as long as the daemon runs.
+#[cfg(target_os = "linux")]
+fn given() -> Option<benshi_core::token::Token> {
+    std::env::var(TOKEN)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .map(benshi_core::token::Token::new)
+}
+
+/// Lines said up to the daemon's last words, and none after them.
+///
+/// A task that is stopped runs on to the next await it reaches. A call it
+/// waits for can fail as the runtime goes, and the task would say so after
+/// the line that says why the daemon stopped.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct UpToTheLast(std::sync::Mutex<bool>);
+
+#[cfg(target_os = "linux")]
+impl UpToTheLast {
+    /// Say a line through `say`, where the last words are not said yet.
+    fn say(&self, say: impl FnOnce()) {
+        let said_last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*said_last {
+            say();
+        }
+    }
+
+    /// Say the last words through `say`. Nothing is said after them.
+    fn last(&self, say: impl FnOnce()) {
+        let mut said_last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *said_last = true;
+        say();
+    }
+}
+
+/// A line a task says, said by `voice` up to the last words of `words`.
+#[cfg(target_os = "linux")]
+fn saying(voice: &Arc<Voice>, words: &Arc<UpToTheLast>) -> benshi_daemon::listing::Say {
+    let voice = Arc::clone(voice);
+    let words = Arc::clone(words);
+
+    Arc::new(move |line: &str| words.say(|| voice.say(format_args!("{line}"))))
 }
 
 /// There is no adapter for this platform, so there is no daemon to run.
@@ -418,6 +490,21 @@ mod tests {
     use std::io;
 
     use super::Invocation;
+    #[cfg(target_os = "linux")]
+    use super::UpToTheLast;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nothing_is_said_after_the_last_words() {
+        let words = UpToTheLast::default();
+        let said = RefCell::new(Vec::new());
+
+        words.say(|| said.borrow_mut().push("a line"));
+        words.last(|| said.borrow_mut().push("the last words"));
+        words.say(|| said.borrow_mut().push("a line after them"));
+
+        assert_eq!(said.into_inner(), ["a line", "the last words"]);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
