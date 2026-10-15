@@ -27,7 +27,7 @@ pub struct Entry {
     /// Every other spelling the service gives of the title.
     pub spellings: Vec<String>,
     /// What kind of release the work is, and none where the service does
-    /// not say.
+    /// not say or names one this build does not know.
     pub format: Option<Format>,
     /// How many episodes the work has, and none where the service holds no
     /// count.

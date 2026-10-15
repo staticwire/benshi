@@ -19,7 +19,7 @@ pub const DEADLINE: Duration = Duration::from_secs(15);
 pub const LISTED: EntryId = EntryId(21);
 
 /// A work the service has and the list does not hold.
-pub const UNLISTED: EntryId = EntryId(437);
+pub const UNLISTED: EntryId = EntryId(112_151);
 
 /// A number the service has no work under.
 pub const MISSING: EntryId = EntryId(9);
