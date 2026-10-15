@@ -217,6 +217,8 @@ name = "benshi-sync"
 version = "0.1.0"
 dependencies = [
  "benshi-core",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
