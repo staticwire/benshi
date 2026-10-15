@@ -13,6 +13,7 @@
 //! A new backend is finished when it passes the shared contract suite, in
 //! `tests/contract`, not when it seems to work.
 
+pub mod anilist;
 pub mod memory;
 
 use std::time::Duration;

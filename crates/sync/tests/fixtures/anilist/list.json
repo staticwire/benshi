@@ -1,0 +1,153 @@
+[
+  {
+    "query": "query { Viewer { id name } }",
+    "variables": {},
+    "status": 200,
+    "retry_after": null,
+    "body": {
+      "data": {
+        "Viewer": {
+          "id": 8344475,
+          "name": "bentest"
+        }
+      }
+    }
+  },
+  {
+    "query": "query ($user: Int, $chunk: Int) { MediaListCollection(userId: $user, type: ANIME, chunk: $chunk) { hasNextChunk lists { isCustomList entries { mediaId status progress repeat score(format: POINT_100) media { format episodes duration status seasonYear startDate { year } title { userPreferred romaji english native } synonyms } } } } }",
+    "variables": {
+      "chunk": 1,
+      "user": 8344475
+    },
+    "status": 200,
+    "retry_after": null,
+    "body": {
+      "data": {
+        "MediaListCollection": {
+          "hasNextChunk": false,
+          "lists": [
+            {
+              "entries": [
+                {
+                  "media": {
+                    "duration": 24,
+                    "episodes": 25,
+                    "format": "TV",
+                    "seasonYear": 2013,
+                    "startDate": {
+                      "year": 2013
+                    },
+                    "status": "FINISHED",
+                    "synonyms": [
+                      "SnK",
+                      "AoT",
+                      "Ataque a los Titanes",
+                      "Ataque dos Titãs",
+                      "L'Attacco dei Giganti",
+                      "מתקפת הטיטאנים",
+                      "进击的巨人",
+                      "L’Attaque des Titans",
+                      "الهجوم على العمالقة",
+                      "ผ่าพิภพไททัน",
+                      "حمله به تایتان",
+                      "Ataque de Titãs",
+                      "Atak Tytanów",
+                      "Атака титанов",
+                      "Đại Chiến Titan"
+                    ],
+                    "title": {
+                      "english": "Attack on Titan",
+                      "native": "進撃の巨人",
+                      "romaji": "Shingeki no Kyojin",
+                      "userPreferred": "Shingeki no Kyojin"
+                    }
+                  },
+                  "mediaId": 16498,
+                  "progress": 3,
+                  "repeat": 0,
+                  "score": 0,
+                  "status": "PAUSED"
+                }
+              ],
+              "isCustomList": false
+            },
+            {
+              "entries": [
+                {
+                  "media": {
+                    "duration": 25,
+                    "episodes": 6,
+                    "format": "OVA",
+                    "seasonYear": 2000,
+                    "startDate": {
+                      "year": 2000
+                    },
+                    "status": "FINISHED",
+                    "synonyms": [
+                      "Fooly Cooly",
+                      "Furi Kuri"
+                    ],
+                    "title": {
+                      "english": "FLCL",
+                      "native": "フリクリ",
+                      "romaji": "FLCL",
+                      "userPreferred": "FLCL"
+                    }
+                  },
+                  "mediaId": 227,
+                  "progress": 1,
+                  "repeat": 0,
+                  "score": 0,
+                  "status": "CURRENT"
+                }
+              ],
+              "isCustomList": false
+            },
+            {
+              "entries": [
+                {
+                  "media": {
+                    "duration": 117,
+                    "episodes": 1,
+                    "format": "MOVIE",
+                    "seasonYear": 2020,
+                    "startDate": {
+                      "year": 2020
+                    },
+                    "status": "FINISHED",
+                    "synonyms": [
+                      "KnY Movie",
+                      "Els Guardians de la Nit: El Tren Infinit",
+                      "Guardianes de la Noche: Tren Infinito",
+                      "Demon Slayer: Mugen Treni",
+                      "Demon Slayer: Il Treno Mugen",
+                      "鬼灭之刃：无限列车篇",
+                      "قاتل الشياطين الفيلم: قطار اللانهاية",
+                      "ดาบพิฆาตอสูร เดอะมูฟวี่ : ศึกรถไฟสู่นิรันดร์",
+                      "Demon Slayer: Kimetsu no Yaiba - Le film : Le train de l'Infini",
+                      "ΚΥΝΗΓΟΣ ΔΑΙΜΟΝΩΝ: KIMETSU NO YAIBA – Η ΤΑΙΝΙΑ: ΤΟ ΤΡΕΝΟ ΜΟΥΓΚΕΝ",
+                      "극장판 귀멸의 칼날: 무한열차편",
+                      "Клинок, Рассекающий Демонов: Бесконечный Поезд"
+                    ],
+                    "title": {
+                      "english": "Demon Slayer -Kimetsu no Yaiba- The Movie: Mugen Train",
+                      "native": "鬼滅の刃 無限列車編",
+                      "romaji": "Kimetsu no Yaiba: Mugen Ressha-hen",
+                      "userPreferred": "Kimetsu no Yaiba: Mugen Ressha-hen"
+                    }
+                  },
+                  "mediaId": 112151,
+                  "progress": 1,
+                  "repeat": 0,
+                  "score": 80,
+                  "status": "COMPLETED"
+                }
+              ],
+              "isCustomList": false
+            }
+          ]
+        }
+      }
+    }
+  }
+]
