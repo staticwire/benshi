@@ -226,12 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn an_event_serialises_as_published() {
+    fn an_event_serializes_as_published() {
         // `benshi watch` streams these over the socket unchanged, so the wire
         // form is this type and there is no second representation to drift.
         let event = BusEvent::Snapshot(a_snapshot());
 
-        let text = serde_json::to_string(&event).expect("serialise");
+        let text = serde_json::to_string(&event).expect("serialize");
 
         assert!(text.contains("Snapshot"), "got {text}");
         assert!(text.contains("/anime/ep 03.mkv"), "got {text}");

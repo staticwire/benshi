@@ -176,12 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn a_player_is_allowed_however_it_capitalises_its_own_name() {
+    fn a_player_is_allowed_however_it_capitalizes_its_own_name() {
         // Not hypothetical, and the reason the list holds published names
         // rather than commands. mpc-qt registers
         // org.mpris.MediaPlayer2.MpcQt, which is not the command a user types.
         // The constructor and a lookup both lowercase, so the published name
-        // and the entry meet however either is capitalised; the command
+        // and the entry meet however either is capitalized; the command
         // spelling never does, hyphen and all.
         let table = PolicyTable::allowing_video_players();
 

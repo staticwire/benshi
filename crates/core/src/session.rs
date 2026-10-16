@@ -64,8 +64,8 @@ use std::time::Duration;
 
 use crate::clock::Timestamp;
 use crate::path::RawPath;
-use crate::recognise::Recognition;
-use crate::recognise::parse::Episode;
+use crate::recognize::Recognition;
+use crate::recognize::parse::Episode;
 use crate::timeline::{Progress, Timeline, WatchedPolicy};
 use crate::{Known, MediaRef, PlayerId, PlayerSnapshot, ShowId};
 
@@ -175,8 +175,8 @@ impl<'reading> Named<'reading> {
             return None;
         };
         let found = match decision? {
-            Recognition::Recognised(found) => found,
-            Recognition::Ambiguous(_) | Recognition::Unrecognised(_) => return None,
+            Recognition::Recognized(found) => found,
+            Recognition::Ambiguous(_) | Recognition::Unrecognized(_) => return None,
         };
         let episode = match found.episode {
             Episode::Only(number) => Some(number),
@@ -598,11 +598,11 @@ mod tests {
     use super::{Effect, Question, Resumed, Session};
     use crate::clock::{Clock, TestClock, Timestamp};
     use crate::path::RawPath;
-    use crate::recognise::altname::Altnames;
-    use crate::recognise::corpus::Corpus;
-    use crate::recognise::index::Index;
-    use crate::recognise::parse::{Episode, parse};
-    use crate::recognise::{Ambiguity, Candidate, Match, Recognition, Refusal, Stage, decide};
+    use crate::recognize::altname::Altnames;
+    use crate::recognize::corpus::Corpus;
+    use crate::recognize::index::Index;
+    use crate::recognize::parse::{Episode, parse};
+    use crate::recognize::{Ambiguity, Candidate, Match, Recognition, Refusal, Stage, decide};
     use crate::timeline::{WATCHED_FALLBACK, WatchedPolicy};
     use crate::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
     use std::cell::Cell;
@@ -640,7 +640,7 @@ mod tests {
     const NOT_LISTED: &str = "/anime/[Group] Some Other Show - 03 [1080p].mkv";
 
     /// What a run answers where it answers nothing, named because an empty
-    /// array otherwise needs its element type spelt out at every use.
+    /// array otherwise needs its element type spelled out at every use.
     const NOTHING: [Effect; 0] = [];
 
     /// The readings that recorded an episode in a run that recorded none.
@@ -798,8 +798,8 @@ mod tests {
     }
 
     /// A decision written out by hand, for a test that is about the decision.
-    fn recognised(show: ShowId, episode: Episode) -> Recognition {
-        Recognition::Recognised(Match {
+    fn recognized(show: ShowId, episode: Episode) -> Recognition {
+        Recognition::Recognized(Match {
             show,
             title: title_of(show).to_owned(),
             episode,
@@ -2074,7 +2074,7 @@ mod tests {
         let player = Player::named("mpv");
         assert_eq!(
             decided(&player.playing(THE_FILM)),
-            Some(recognised(FILM, Episode::Absent))
+            Some(recognized(FILM, Episode::Absent))
         );
 
         let answers = watch(&mut session, &player, THE_FILM, 150, None);
@@ -2092,14 +2092,14 @@ mod tests {
 
     #[test]
     fn a_file_of_several_episodes_is_not_recorded() {
-        // The show is recognised, which the first assertion holds, so what
+        // The show is recognized, which the first assertion holds, so what
         // is refused is the episode: a file of twelve is neither the first
         // nor the twelfth, and with no episode it would arrive as a film.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
         assert_eq!(
             decided(&player.playing(A_BATCH)),
-            Some(recognised(SERIES, Episode::Several))
+            Some(recognized(SERIES, Episode::Several))
         );
 
         let answers = watch(&mut session, &player, A_BATCH, 150, None);
@@ -2113,7 +2113,7 @@ mod tests {
         let player = Player::named("mpv");
         assert_eq!(
             decided(&player.playing(A_HALF)),
-            Some(recognised(SERIES, Episode::NotWhole))
+            Some(recognized(SERIES, Episode::NotWhole))
         );
 
         let answers = watch(&mut session, &player, A_HALF, 150, None);
@@ -2127,7 +2127,7 @@ mod tests {
         let player = Player::named("mpv");
         assert!(matches!(
             decided(&player.playing(NOT_LISTED)),
-            Some(Recognition::Unrecognised(_))
+            Some(Recognition::Unrecognized(_))
         ));
 
         let answers = watch(&mut session, &player, NOT_LISTED, 150, None);
@@ -2177,7 +2177,7 @@ mod tests {
     fn a_reading_that_names_no_file_is_not_recorded_whatever_was_decided() {
         // What is kept and what is recorded both carry the file. An address
         // is not one, and neither is a title with nothing underneath it.
-        let decision = recognised(SERIES, Episode::Only(3));
+        let decision = recognized(SERIES, Episode::Only(3));
 
         for media in [
             MediaRef::Remote("https://example.invalid/show-title-03.m3u8".to_owned()),
@@ -2207,10 +2207,10 @@ mod tests {
         // and then it is what it was at the start.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
-        let the_third = recognised(SERIES, Episode::Only(3));
-        let the_fourth = recognised(SERIES, Episode::Only(4));
-        let of_the_second = recognised(SECOND_SERIES, Episode::Only(4));
-        let nothing = Recognition::Unrecognised(Refusal {
+        let the_third = recognized(SERIES, Episode::Only(3));
+        let the_fourth = recognized(SERIES, Episode::Only(4));
+        let of_the_second = recognized(SECOND_SERIES, Episode::Only(4));
+        let nothing = Recognition::Unrecognized(Refusal {
             parsed: "Show Title".to_owned(),
             best: None,
         });
@@ -2258,8 +2258,8 @@ mod tests {
         // old one.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
-        let the_third = recognised(SERIES, Episode::Only(3));
-        let the_fourth = recognised(SERIES, Episode::Only(4));
+        let the_third = recognized(SERIES, Episode::Only(3));
+        let the_fourth = recognized(SERIES, Episode::Only(4));
         let mut round = |at: u64, decision: &Recognition| {
             let first = session.advance(&stamps.playing("mpv", THIRD, at), Some(decision));
             let second = session.advance(&stamps.playing("vlc", THIRD, at + 200), Some(decision));
@@ -2287,8 +2287,8 @@ mod tests {
         // total of the other.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
-        let of_one = recognised(ShowId(7), Episode::Only(3));
-        let of_the_other = recognised(ShowId(9), Episode::Only(3));
+        let of_one = recognized(ShowId(7), Episode::Only(3));
+        let of_the_other = recognized(ShowId(9), Episode::Only(3));
 
         let one = session.advance(&stamps.playing("mpv", THIRD, 1000), Some(&of_one));
         let the_other = session.advance(

@@ -122,7 +122,7 @@ struct Version {
 
 /// A recording: a header, and the readings taken under it.
 ///
-/// Not serialisable as one value, deliberately. A trace is a file of lines
+/// Not serializable as one value, deliberately. A trace is a file of lines
 /// rather than a JSON document, and a derived `Serialize` would put a second
 /// representation - one object with an array inside it - beside the format,
 /// free to drift from it and easy to reach for by mistake.
@@ -141,7 +141,7 @@ impl Trace {
     /// # Errors
     ///
     /// [`TraceError::NotWritten`] if the header or a reading cannot be
-    /// serialised.
+    /// serialized.
     pub fn to_jsonl(&self) -> Result<String, TraceError> {
         let mut text = header_line(&self.header)?;
         for snapshot in &self.snapshots {
@@ -199,7 +199,7 @@ impl Trace {
 ///
 /// # Errors
 ///
-/// [`TraceError::NotWritten`] if the header cannot be serialised.
+/// [`TraceError::NotWritten`] if the header cannot be serialized.
 pub fn header_line(header: &TraceHeader) -> Result<String, TraceError> {
     line(header)
 }
@@ -210,7 +210,7 @@ pub fn header_line(header: &TraceHeader) -> Result<String, TraceError> {
 ///
 /// # Errors
 ///
-/// [`TraceError::NotWritten`] if the reading cannot be serialised.
+/// [`TraceError::NotWritten`] if the reading cannot be serialized.
 pub fn snapshot_line(snapshot: &PlayerSnapshot) -> Result<String, TraceError> {
     line(snapshot)
 }
@@ -268,7 +268,7 @@ pub enum TraceError {
     /// A line could not be produced.
     #[error("trace line could not be written: {source}")]
     NotWritten {
-        /// What the serialiser said.
+        /// What the serializer said.
         #[source]
         source: serde_json::Error,
     },
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_cannot_be_written_says_what_the_serialiser_said() {
+    fn a_line_that_cannot_be_written_says_what_the_serializer_said() {
         // A map keyed by a pair is one JSON cannot spell.
         let unwritable = std::collections::BTreeMap::from([((1, 2), 3)]);
 

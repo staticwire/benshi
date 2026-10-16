@@ -344,10 +344,10 @@ impl Server {
                         }
                         // Nothing here aborts a connection and the set outlives
                         // the loop, so a cancellation cannot arise. It is
-                        // matched rather than asserted away because a cancelled
+                        // matched rather than asserted away because a canceled
                         // connection has already ended, which is the outcome
                         // above.
-                        Err(_cancelled) => (),
+                        Err(_canceled) => (),
                     }
                 }
             }
@@ -509,12 +509,12 @@ mod tests {
     use crate::detection::Seen;
     use crate::listing::Wakes;
     use crate::protocol::{Outcome, Request, Response};
-    use crate::recognition::{Decided, Decision, Recogniser};
+    use crate::recognition::{Decided, Decision, Recognizer};
     use crate::secrets;
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
-    use benshi_core::recognise::parse::Episode;
+    use benshi_core::recognize::parse::Episode;
     use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
@@ -716,7 +716,7 @@ mod tests {
             let MediaRef::LocalFile(path) = &snapshot.media else {
                 panic!("the snapshot has a file open");
             };
-            let (parsed, answer) = Recogniser::empty().decide(path);
+            let (parsed, answer) = Recognizer::empty().decide(path);
 
             self.decided.record(Decision {
                 player: snapshot.player.clone(),
@@ -755,7 +755,7 @@ mod tests {
         }
 
         async fn ask(&mut self, request: &Request) {
-            let line = serde_json::to_string(request).expect("serialise");
+            let line = serde_json::to_string(request).expect("serialize");
             self.send(&line).await;
         }
 
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(explained.player, PlayerId("mpv".to_owned()));
         assert_eq!(explained.media, a_snapshot().media);
         assert_eq!(explained.spelled.episode, Episode::Only(3));
-        assert_eq!(explained.outcome, Outcome::Unrecognised { best: None });
+        assert_eq!(explained.outcome, Outcome::Unrecognized { best: None });
     }
 
     #[tokio::test]

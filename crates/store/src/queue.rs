@@ -28,7 +28,7 @@ use crate::{Error, Store};
 /// Kept in two columns: the name of the variant in `kind` and its fields as
 /// JSON in `payload`. The name decides how the payload is read, and a payload
 /// is read whole or refused. A name this build does not know, a field the
-/// kind does not have, a field it has that is missing and a field spelt twice
+/// kind does not have, a field it has that is missing and a field spelled twice
 /// are each an [`Error::Operation`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(

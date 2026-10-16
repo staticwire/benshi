@@ -386,7 +386,7 @@ mod tests {
                     "english": "The Show Title",
                     "native": "Show Native Title"
                 },
-                "synonyms": ["Show Title Spelt Otherwise", "The Show Title"]
+                "synonyms": ["Show Title Spelled Otherwise", "The Show Title"]
             }
         })
     }
@@ -399,7 +399,7 @@ mod tests {
             spellings: vec![
                 "The Show Title".to_owned(),
                 "Show Native Title".to_owned(),
-                "Show Title Spelt Otherwise".to_owned(),
+                "Show Title Spelled Otherwise".to_owned(),
             ],
             format: Some(Format::Tv),
             episodes: Some(12),
@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_score_of_nought_is_no_score() {
+    async fn a_score_of_zero_is_no_score() {
         let mut entry = a_series_entry();
         entry["score"] = json!(0);
 

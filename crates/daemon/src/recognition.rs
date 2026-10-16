@@ -1,8 +1,8 @@
 //! What the daemon decided a file was, kept for `benshi why`.
 //!
 //! Recognition is pure logic in `benshi-core` and decides against a corpus the
-//! caller supplies. A [`Recogniser`] holds one, with its index and the names
-//! the user gave. Against [`Recogniser::empty`] every name reaches the end of
+//! caller supplies. A [`Recognizer`] holds one, with its index and the names
+//! the user gave. Against [`Recognizer::empty`] every name reaches the end of
 //! the sequence and is refused. A round decides, the decision is left here,
 //! and a client reads it.
 //!
@@ -14,11 +14,11 @@
 use std::sync::{Arc, PoisonError, RwLock};
 
 use benshi_core::path::RawPath;
-use benshi_core::recognise::altname::Altnames;
-use benshi_core::recognise::corpus::Corpus;
-use benshi_core::recognise::index::Index;
-use benshi_core::recognise::parse::{Parsed, parse};
-use benshi_core::recognise::{Recognition, decide};
+use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::corpus::Corpus;
+use benshi_core::recognize::index::Index;
+use benshi_core::recognize::parse::{Parsed, parse};
+use benshi_core::recognize::{Recognition, decide};
 use benshi_core::{MediaRef, PlayerId};
 
 /// What is said when the record of the last decision cannot be trusted.
@@ -26,13 +26,13 @@ const POISONED: &str = "last decision was poisoned by a panic in another task";
 
 /// What a name is decided against: the corpus, its index and the assignments.
 #[derive(Debug)]
-pub struct Recogniser {
+pub struct Recognizer {
     corpus: Corpus,
     index: Index,
     altnames: Altnames,
 }
 
-impl Recogniser {
+impl Recognizer {
     /// Nothing to match against: an empty corpus and no assignments.
     ///
     /// Every name is refused with nothing scored.
@@ -68,35 +68,35 @@ impl Recogniser {
     }
 }
 
-/// The recogniser the rounds decide against, which the list's task replaces
+/// The recognizer the rounds decide against, which the list's task replaces
 /// when it has read a list.
 ///
 /// A round takes the one in place as it begins and decides with it to its
 /// end, so a round that began before a replacement finishes on the list it
 /// began with. Cloning shares the place.
 #[derive(Debug, Clone)]
-pub struct Current(Arc<RwLock<Arc<Recogniser>>>);
+pub struct Current(Arc<RwLock<Arc<Recognizer>>>);
 
 impl Current {
-    /// A place holding `recogniser`.
+    /// A place holding `recognizer`.
     #[must_use]
-    pub fn new(recogniser: Recogniser) -> Self {
-        Self(Arc::new(RwLock::new(Arc::new(recogniser))))
+    pub fn new(recognizer: Recognizer) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(recognizer))))
     }
 
-    /// The recogniser in place.
+    /// The recognizer in place.
     ///
-    /// Read through a lock a panic left poisoned: the recogniser is made
+    /// Read through a lock a panic left poisoned: the recognizer is made
     /// before the lock is taken and put in whole, so no panic leaves half of
     /// one in place.
     #[must_use]
-    pub fn now(&self) -> Arc<Recogniser> {
+    pub fn now(&self) -> Arc<Recognizer> {
         Arc::clone(&self.0.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Put `recogniser` in place of the one there.
-    pub fn replace(&self, recogniser: Recogniser) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(recogniser);
+    /// Put `recognizer` in place of the one there.
+    pub fn replace(&self, recognizer: Recognizer) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(recognizer);
     }
 }
 
@@ -151,12 +151,12 @@ impl Decided {
 
 #[cfg(test)]
 mod tests {
-    use super::{Current, Decided, Decision, Recogniser};
+    use super::{Current, Decided, Decision, Recognizer};
     use benshi_core::path::RawPath;
-    use benshi_core::recognise::altname::Altnames;
-    use benshi_core::recognise::corpus::Corpus;
-    use benshi_core::recognise::parse::Episode;
-    use benshi_core::recognise::{Match, Recognition, Refusal, Stage};
+    use benshi_core::recognize::altname::Altnames;
+    use benshi_core::recognize::corpus::Corpus;
+    use benshi_core::recognize::parse::Episode;
+    use benshi_core::recognize::{Match, Recognition, Refusal, Stage};
     use benshi_core::{MediaRef, PlayerId, ShowId};
 
     fn a_path(name: &str) -> RawPath {
@@ -179,12 +179,12 @@ mod tests {
         // `benshi why` explains the most recent decision, so the record holds
         // one and the next reading's decision takes its place.
         let decided = Decided::new();
-        let recogniser = Recogniser::empty();
+        let recognizer = Recognizer::empty();
         let first = a_path("/anime/[Group] Show Title - 03.mkv");
         let second = a_path("/anime/[Group] Another Show - 07.mkv");
 
         for path in [&first, &second] {
-            let (parsed, answer) = recogniser.decide(path);
+            let (parsed, answer) = recognizer.decide(path);
             decided.record(Decision {
                 player: PlayerId("mpv".to_owned()),
                 media: MediaRef::LocalFile(path.clone()),
@@ -204,22 +204,22 @@ mod tests {
         // a folder named after another show would otherwise carry that show's
         // words into the name the stages read.
         let (parsed, _answer) =
-            Recogniser::empty().decide(&a_path("/anime/Other Show/[Group] Show Title - 03.mkv"));
+            Recognizer::empty().decide(&a_path("/anime/Other Show/[Group] Show Title - 03.mkv"));
 
         assert_eq!(parsed.title.as_deref(), Some("Show Title"));
         assert_eq!(parsed.episode, Episode::Only(3));
     }
 
     #[test]
-    fn a_name_the_list_holds_is_recognised_as_the_list_spells_it() {
-        let recogniser = Recogniser::of(a_list_of(&["Show Title", "A Film"]), Altnames::new());
+    fn a_name_the_list_holds_is_recognized_as_the_list_spells_it() {
+        let recognizer = Recognizer::of(a_list_of(&["Show Title", "A Film"]), Altnames::new());
 
         let (_parsed, answer) =
-            recogniser.decide(&a_path("/anime/[Group] Show Title - 03 [1080p].mkv"));
+            recognizer.decide(&a_path("/anime/[Group] Show Title - 03 [1080p].mkv"));
 
         assert_eq!(
             answer,
-            Recognition::Recognised(Match {
+            Recognition::Recognized(Match {
                 show: ShowId(1),
                 title: "Show Title".to_owned(),
                 episode: Episode::Only(3),
@@ -235,14 +235,14 @@ mod tests {
         named
             .name("ShoTi", ShowId(1), &list)
             .expect("text that reaches no entry can be named");
-        let recogniser = Recogniser::of(list, named);
+        let recognizer = Recognizer::of(list, named);
 
-        let (_parsed, answer) = recogniser.decide(&a_path("/anime/[Group] ShoTi - 03.mkv"));
+        let (_parsed, answer) = recognizer.decide(&a_path("/anime/[Group] ShoTi - 03.mkv"));
 
         assert!(
             matches!(
                 &answer,
-                Recognition::Recognised(Match {
+                Recognition::Recognized(Match {
                     show: ShowId(1),
                     title,
                     episode: Episode::Only(3),
@@ -257,18 +257,18 @@ mod tests {
     fn a_name_the_key_misses_is_found_through_an_index_of_the_list() {
         // The name spells more than either title, so no key reaches it, and
         // the scorer is handed the candidates the index narrowed the list to.
-        let recogniser = Recogniser::of(
+        let recognizer = Recognizer::of(
             a_list_of(&["Show Title", "Show Title Cour 2 The Subtitle"]),
             Altnames::new(),
         );
 
         let (_parsed, answer) =
-            recogniser.decide(&a_path("/anime/Show Title Cour 2 - The Subtitle - 03.mkv"));
+            recognizer.decide(&a_path("/anime/Show Title Cour 2 - The Subtitle - 03.mkv"));
 
         assert!(
             matches!(
                 &answer,
-                Recognition::Recognised(Match {
+                Recognition::Recognized(Match {
                     show: ShowId(2),
                     title,
                     episode: Episode::Only(3),
@@ -284,41 +284,41 @@ mod tests {
         // With nothing to match against, a refusal with nothing scored is the
         // honest answer rather than a guess. It is what an explanation has to
         // show for every file.
-        let (_parsed, answer) = Recogniser::empty().decide(&a_path("[Group] Show Title - 03.mkv"));
+        let (_parsed, answer) = Recognizer::empty().decide(&a_path("[Group] Show Title - 03.mkv"));
 
         assert!(
             matches!(
                 answer,
-                Recognition::Unrecognised(Refusal { best: None, .. })
+                Recognition::Unrecognized(Refusal { best: None, .. })
             ),
             "got {answer:?}"
         );
     }
 
     #[test]
-    fn a_recogniser_put_in_place_is_the_one_taken_after() {
-        let current = Current::new(Recogniser::empty());
+    fn a_recognizer_put_in_place_is_the_one_taken_after() {
+        let current = Current::new(Recognizer::empty());
         let shared = current.clone();
 
-        shared.replace(Recogniser::of(a_list_of(&["Show Title"]), Altnames::new()));
+        shared.replace(Recognizer::of(a_list_of(&["Show Title"]), Altnames::new()));
         let (_parsed, answer) = current.now().decide(&a_path("[Group] Show Title - 03.mkv"));
 
         assert!(
-            matches!(answer, Recognition::Recognised(_)),
+            matches!(answer, Recognition::Recognized(_)),
             "got {answer:?}"
         );
     }
 
     #[test]
-    fn a_recogniser_taken_before_a_replacement_decides_as_it_did() {
-        let current = Current::new(Recogniser::empty());
+    fn a_recognizer_taken_before_a_replacement_decides_as_it_did() {
+        let current = Current::new(Recognizer::empty());
         let taken = current.now();
 
-        current.replace(Recogniser::of(a_list_of(&["Show Title"]), Altnames::new()));
+        current.replace(Recognizer::of(a_list_of(&["Show Title"]), Altnames::new()));
         let (_parsed, answer) = taken.decide(&a_path("[Group] Show Title - 03.mkv"));
 
         assert!(
-            matches!(answer, Recognition::Unrecognised(_)),
+            matches!(answer, Recognition::Unrecognized(_)),
             "got {answer:?}"
         );
     }

@@ -359,9 +359,9 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         }
     };
     // What the store holds of the list is what the first round decides
-    // against, so a daemon recognises before it reads the list again.
-    let recogniser = match listing::kept(&store.lock().expect("nothing has used the store yet")) {
-        Ok(recogniser) => recogniser,
+    // against, so a daemon recognizes before it reads the list again.
+    let recognizer = match listing::kept(&store.lock().expect("nothing has used the store yet")) {
+        Ok(recognizer) => recognizer,
         Err(unread) => {
             voice.say(format_args!(
                 "{} cannot be used: {unread}",
@@ -384,7 +384,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     let running = benshi_daemon::run(
         || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
         listener,
-        recogniser,
+        recognizer,
         store,
         SystemTime::now,
         POLL_INTERVAL,

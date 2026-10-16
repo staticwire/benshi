@@ -3,7 +3,7 @@
 //! One function, and everything the parser reports that this crate does not
 //! read is dropped here rather than further down. **Which kinds are dropped is
 //! written out rather than caught by a wildcard**, so a kind added upstream
-//! stops the build and has to be given an answer instead of changing behaviour
+//! stops the build and has to be given an answer instead of changing behavior
 //! quietly.
 //!
 //! Six kinds are kept. `EpisodeTitle` is not one of them: for
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoding::{Confidence, decode};
 use crate::path::RawPath;
-use crate::recognise::normalise::part_in;
+use crate::recognize::normalize::part_in;
 
 /// What a filename says about which episode it holds.
 ///
@@ -47,7 +47,7 @@ pub enum Episode {
     /// One episode, spelled as something other than a whole number.
     ///
     /// `5.5` is a real episode of some series and there is nowhere to put it, so
-    /// it is neither rounded into a neighbour it is not nor called absent.
+    /// it is neither rounded into a neighbor it is not nor called absent.
     ///
     /// **Apart from [`Absent`](Episode::Absent) for the reason [`Several`](Episode::Several) is
     /// apart from it.** A film spells no episode and is a work this program can
@@ -55,7 +55,7 @@ pub enum Episode {
     /// alike would mark a whole series watched because somebody played a recap.
     NotWhole,
     /// None spelled at all: a film, or a name that does not say. A name
-    /// spelling nought for the season and for the episode at once is read as
+    /// spelling zero for the season and for the episode at once is read as
     /// spelling none.
     Absent,
 }
@@ -76,8 +76,8 @@ pub struct Parsed {
     /// `Season 2`, `2nd Season` and `Season II` all arrive here as two. A
     /// numeral ending the title does not: `Show Title II` comes back with the
     /// numeral still in the title and no season at all, which is why the
-    /// normaliser carries a rule of its own for it. A season of nought
-    /// beside an episode of nought is not kept.
+    /// normalizer carries a rule of its own for it. Season zero beside episode
+    /// zero is not kept.
     pub season: Option<u32>,
     /// The part of a season, where the parser reported one or [`parse`] read
     /// one back from after the season marker.
@@ -107,7 +107,7 @@ pub struct Parsed {
     ///
     /// **What a stage comparing text is given, and it is not
     /// [`title`](Parsed::title).** A title ends at the first thing the parser
-    /// recognises, so a name spelling `Show Title - The Subtitle - 03` reports
+    /// recognizes, so a name spelling `Show Title - The Subtitle - 03` reports
     /// a title of `Show Title` and the subtitle belongs to no element at all.
     /// A stage reading the title alone cannot tell such a file from the series
     /// it extends. What is struck out is the release group, the episode, the
@@ -192,10 +192,10 @@ pub fn parse(name: &RawPath) -> Parsed {
         [] => Episode::Absent,
         _ => Episode::Several,
     };
-    // Nought for the season and for the episode at once counts nothing, as
+    // Zero for the season and for the episode at once counts nothing, as
     // in a film named with `s00e00`, and the name is read as spelling
-    // neither. Either nought alone is kept: an episode of nought can
-    // number a prologue, and an episode in a season of nought a special.
+    // neither. Either zero alone is kept: episode zero can number a prologue,
+    // and an episode in season zero a special.
     if parsed.season == Some(0) && parsed.episode == Episode::Only(0) {
         parsed.season = None;
         parsed.episode = Episode::Absent;
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn the_release_is_struck_out_of_the_text_a_stage_compares() {
-        // A title ends at the first thing the parser recognises, so a subtitle
+        // A title ends at the first thing the parser recognizes, so a subtitle
         // beyond it belongs to no element at all and a stage reading the title
         // alone cannot tell this file from the series it extends. What the
         // release itself spells goes, because no list entry spells any of it.
@@ -700,9 +700,9 @@ mod tests {
     }
 
     #[test]
-    fn a_season_and_an_episode_of_nought_together_spell_neither() {
-        // A film named with `s00e00`. Left as spelled, the season of nought
-        // goes into the key, and the film's entry is filed with no season.
+    fn season_zero_and_episode_zero_together_spell_neither() {
+        // A film named with `s00e00`. Left as spelled, season zero goes into
+        // the key, and the film's entry is filed with no season.
         let parsed = spelled("Show.Title.The.Movie.s00e00.HD1080p.WEBRip.mp4");
 
         assert_eq!(parsed.title.as_deref(), Some("Show Title The Movie"));
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn an_episode_in_a_season_of_nought_keeps_its_season() {
+    fn an_episode_in_season_zero_keeps_its_season() {
         // `S00E03` numbers a special. With the season taken off, the name
         // would reach the series and name its third episode.
         for (name, episode) in [
@@ -727,8 +727,8 @@ mod tests {
     }
 
     #[test]
-    fn a_season_of_nought_beside_no_whole_episode_keeps_its_season() {
-        // A whole episode of nought is all that takes the season with it.
+    fn season_zero_beside_no_whole_episode_keeps_its_season() {
+        // A whole episode numbered zero is all that takes the season with it.
         // Read as spelling no season, a name with no episode beside it would
         // reach the series and name the whole of it.
         for (name, episode) in [
@@ -744,8 +744,8 @@ mod tests {
     }
 
     #[test]
-    fn an_episode_of_nought_outside_a_season_of_nought_is_an_episode() {
-        // A series can number a prologue nought.
+    fn episode_zero_outside_season_zero_is_an_episode() {
+        // A series can number a prologue zero.
         for name in ["Show Title - 00.mkv", "Show.Title.S01E00.1080p.WEB.mkv"] {
             let parsed = spelled(name);
 
@@ -768,12 +768,12 @@ mod tests {
     #[test]
     fn a_roman_numeral_season_stays_in_the_title() {
         // The other half, and the parser does not do it: `Show Title II` comes
-        // back whole, with no season at all, so the normaliser reads the
+        // back whole, with no season at all, so the normalizer reads the
         // numeral out of the title.
         //
         // The test is here rather than beside that rule because this is a fact
         // about the parser. A parser that started reading such a numeral would
-        // change what reaches the normaliser from a filename, and this test is
+        // change what reaches the normalizer from a filename, and this test is
         // what would say so.
         let parsed = spelled("Show Title II - 03.mkv");
 
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn an_episode_that_is_not_a_whole_number_is_neither_rounded_nor_absent() {
         // `05.5` arrives as one episode element whose value is the text "05.5".
-        // Rounded into a neighbour it would record progress against an episode
+        // Rounded into a neighbor it would record progress against an episode
         // nobody watched; called absent it would be indistinguishable from a
         // film, and a film is a work this program marks watched as a whole. It
         // is neither.
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn a_part_the_parser_reports_is_kept() {
-        // `Cour 2` is a part the parser recognises on its own. AniList lists
+        // `Cour 2` is a part the parser recognizes on its own. AniList lists
         // the second part of some seasons as an entry of its own, so a name
         // that spells one has to say so.
         let parsed = spelled("Show Title Season 2 Cour 2 - 03.mkv");
@@ -909,7 +909,7 @@ mod tests {
     fn a_part_inside_the_title_stays_in_the_title() {
         // With no season in front of it, the parser keeps `Part 2` inside the
         // title. Nothing here reads it out. A list entry is text that never
-        // meets the parser, so the normaliser has to take a part out of a
+        // meets the parser, so the normalizer has to take a part out of a
         // title's text anyway, and one place doing that is one rule where two
         // would have to agree.
         let parsed = spelled("Show Title Part 2 - 03.mkv");

@@ -29,7 +29,7 @@ pub fn a_series(id: EntryId) -> Entry {
     Entry {
         id,
         title: "Show Title".to_owned(),
-        spellings: vec!["Show Title Spelt Otherwise".to_owned()],
+        spellings: vec!["Show Title Spelled Otherwise".to_owned()],
         format: Some(Format::Tv),
         episodes: Some(12),
         episode_length: Some(Duration::from_mins(24)),

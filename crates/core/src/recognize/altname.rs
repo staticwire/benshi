@@ -28,9 +28,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ShowId;
-use crate::recognise::corpus::Corpus;
-use crate::recognise::normalise::Key;
-use crate::recognise::parse::Parsed;
+use crate::recognize::corpus::Corpus;
+use crate::recognize::normalize::Key;
+use crate::recognize::parse::Parsed;
 
 /// One assignment, as the user made it.
 ///
@@ -206,9 +206,9 @@ mod tests {
     use super::{Altnames, Assignment, Unnameable};
     use crate::ShowId;
     use crate::path::RawPath;
-    use crate::recognise::corpus::Corpus;
-    use crate::recognise::normalise::Key;
-    use crate::recognise::parse::{Parsed, parse};
+    use crate::recognize::corpus::Corpus;
+    use crate::recognize::normalize::Key;
+    use crate::recognize::parse::{Parsed, parse};
 
     /// What a file of this name spells.
     fn named(name: &str) -> Parsed {

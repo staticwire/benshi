@@ -1,7 +1,7 @@
 //! What a filename turned out to be, and which stage decided it.
 //!
 //! The pipeline has four stages: a mapping the user made by hand, an exact match
-//! on a normalised key, a token index that narrows the corpus to a handful, and
+//! on a normalized key, a token index that narrows the corpus to a handful, and
 //! a score over what is left. **Only three of them can answer.** The index
 //! decides nothing - it hands candidates to the scorer - so [`Stage`] has three
 //! variants and not four. Why they run in that order is written on [`Stage`].
@@ -17,17 +17,17 @@
 pub mod altname;
 pub mod corpus;
 pub mod index;
-pub mod normalise;
+pub mod normalize;
 pub mod parse;
 pub mod score;
 
 use crate::ShowId;
-use crate::recognise::altname::{Altnames, Assignment};
-use crate::recognise::corpus::Corpus;
-use crate::recognise::index::Index;
-use crate::recognise::normalise::Key;
-use crate::recognise::parse::{Episode, Parsed};
-use crate::recognise::score::by_score;
+use crate::recognize::altname::{Altnames, Assignment};
+use crate::recognize::corpus::Corpus;
+use crate::recognize::index::Index;
+use crate::recognize::normalize::Key;
+use crate::recognize::parse::{Episode, Parsed};
+use crate::recognize::score::by_score;
 
 /// What the stages answer, in the order they are asked.
 ///
@@ -43,7 +43,7 @@ use crate::recognise::score::by_score;
 #[must_use]
 pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Index) -> Recognition {
     by_altname(parsed, altnames)
-        .map(Recognition::Recognised)
+        .map(Recognition::Recognized)
         .or_else(|| by_key(parsed, corpus))
         .unwrap_or_else(|| {
             let candidates = parsed
@@ -74,12 +74,12 @@ pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
     })
 }
 
-/// What an exact match on the normalised key answers, where it answers at all.
+/// What an exact match on the normalized key answers, where it answers at all.
 ///
 /// Nothing where the name reaches no entry: an exact key hits or misses, and a
 /// name that misses is what the stages below are for. A refusal is the whole
 /// sequence's answer rather than this stage's, so nothing here says a name was
-/// not recognised - only that this stage did not recognise it.
+/// not recognized - only that this stage did not recognize it.
 ///
 /// Several entries under one key is an answer, and the answer is that the name
 /// does not say. Two list entries share a key honestly - a remake spelled like
@@ -101,7 +101,7 @@ pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
 
     match candidates.as_slice() {
         [] => None,
-        [one] => Some(Recognition::Recognised(Match {
+        [one] => Some(Recognition::Recognized(Match {
             show: one.show,
             title: one.title.clone(),
             episode: parsed.episode,
@@ -122,7 +122,7 @@ pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
 /// quietly moved into range makes an explanation disagree with what actually
 /// happened, and the whole purpose of carrying a score is to be believed.
 ///
-/// Not serialisable, deliberately. A derived `Deserialize` on a newtype is
+/// Not serializable, deliberately. A derived `Deserialize` on a newtype is
 /// transparent and would let a message arriving over the socket carry a score
 /// of five, which is the kind of hole this crate refuses to open. The wire form
 /// belongs with the request that needs one, and it can convert through
@@ -162,18 +162,18 @@ pub enum Stage {
     /// user gave and the season and part it was bound to, which is where a
     /// file of another season fails to match it.
     Altname(Assignment),
-    /// An exact match on the normalised key.
+    /// An exact match on the normalized key.
     Key,
     /// The best candidate the scorer found, and how well it scored.
     ///
     /// The score lives inside the stage rather than beside it, so that a stage
-    /// which did not score has no score to lose and none to invent. Nought
+    /// which did not score has no score to lose and none to invent. Zero
     /// would read as the worst possible match and one as a perfect comparison
     /// that never happened; both are false of an exact match.
     Scored(Score),
 }
 
-/// A filename that was recognised.
+/// A filename that was recognized.
 ///
 /// The show is the corpus entry that matched, rather than the text the filename
 /// spelled. A [`Refusal`] carries that second thing, and confusing the two is how
@@ -204,7 +204,7 @@ pub struct Match {
     pub stage: Stage,
 }
 
-/// Why a filename was not recognised.
+/// Why a filename was not recognized.
 ///
 /// Reported and never guessed at. Writing progress against the wrong title is
 /// the worst failure this program can have, and a best guess below the threshold
@@ -262,7 +262,7 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Recognition {
     /// A show, and the stage that decided it.
-    Recognised(Match),
+    Recognized(Match),
     /// Several entries, and nothing in the name to choose between them.
     ///
     /// A variant of its own rather than a refusal carrying a list, because a
@@ -272,11 +272,11 @@ pub enum Recognition {
     Ambiguous(Ambiguity),
     /// Nothing matched, and why.
     ///
-    /// A variant rather than an `Err`, because an unrecognised filename is a
+    /// A variant rather than an `Err`, because an unrecognized filename is a
     /// fact about the filename and not a failure of the program. Nothing
     /// retries it, nothing logs it as a fault, and something downstream has to
     /// tell the user about it.
-    Unrecognised(Refusal),
+    Unrecognized(Refusal),
 }
 
 #[cfg(test)]
@@ -284,14 +284,14 @@ mod tests {
     use super::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage, by_key, decide};
     use crate::ShowId;
     use crate::path::RawPath;
-    use crate::recognise::altname::{Altnames, Assignment};
-    use crate::recognise::corpus::Corpus;
-    use crate::recognise::index::Index;
-    use crate::recognise::parse::{Episode, Parsed, parse};
+    use crate::recognize::altname::{Altnames, Assignment};
+    use crate::recognize::corpus::Corpus;
+    use crate::recognize::index::Index;
+    use crate::recognize::parse::{Episode, Parsed, parse};
 
     /// A score the tests use where the exact value is not the point.
     fn a_score(value: f64) -> Score {
-        Score::new(value).expect("the value is between nought and one")
+        Score::new(value).expect("the value is between zero and one")
     }
 
     /// What a file of this name spells, so that a test names a file rather
@@ -306,8 +306,8 @@ mod tests {
     }
 
     /// A recognition of this show by this stage, for comparing against.
-    fn recognised(show: i64, title: &str, episode: Episode) -> Recognition {
-        Recognition::Recognised(Match {
+    fn recognized(show: i64, title: &str, episode: Episode) -> Recognition {
+        Recognition::Recognized(Match {
             show: ShowId(show),
             title: title.to_owned(),
             episode,
@@ -330,14 +330,14 @@ mod tests {
         // a key and a best guess among candidates are not the same kind of
         // certainty, and a stage on its own does not say how close the call
         // was. The two travel together or neither is worth printing.
-        let scored = Recognition::Recognised(Match {
+        let scored = Recognition::Recognized(Match {
             show: ShowId(1),
             title: "Show".to_owned(),
             episode: Episode::Only(3),
             stage: Stage::Scored(a_score(0.91)),
         });
 
-        let Recognition::Recognised(found) = &scored else {
+        let Recognition::Recognized(found) = &scored else {
             panic!("the answer is a recognition")
         };
         assert_eq!(found.stage, Stage::Scored(a_score(0.91)));
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn a_stage_that_does_not_score_carries_no_score_to_lose() {
         // An exact match has no score, and a type that carried one anyway would
-        // need a value invented for it - nought, which reads as the worst
+        // need a value invented for it - zero, which reads as the worst
         // possible match, or one, which reads as a perfect comparison that
         // never happened. Neither is true, so the stage holds the score where
         // there is one and nothing where there is not.
@@ -391,15 +391,15 @@ mod tests {
 
     #[test]
     fn a_filename_nothing_matched_is_an_answer_and_not_an_error() {
-        // Unrecognised is a fact about the filename, not a failure of the
+        // Unrecognized is a fact about the filename, not a failure of the
         // program, so it is a variant rather than an `Err`. It carries what the
         // parser made of the name, because that is the first thing anybody
         // asking why will want, and how close the best candidate came.
-        let nothing_close = Recognition::Unrecognised(Refusal {
+        let nothing_close = Recognition::Unrecognized(Refusal {
             parsed: "Some Show".to_owned(),
             best: Some(a_score(0.41)),
         });
-        let nothing_to_compare = Recognition::Unrecognised(Refusal {
+        let nothing_to_compare = Recognition::Unrecognized(Refusal {
             parsed: "Some Show".to_owned(),
             best: None,
         });
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn a_score_outside_nought_to_one_is_refused_and_each_bound_is_not() {
+    fn a_score_outside_zero_to_one_is_refused_and_each_bound_is_not() {
         // A score is a proportion and nothing else can be one. Refused rather
         // than clamped, for the reason the watched policy gives: a number
         // quietly moved into range makes the explanation disagree with what
@@ -450,7 +450,7 @@ mod tests {
 
         assert_eq!(
             found("[Group] Show Title - 03 [1080p].mkv", &corpus),
-            Some(recognised(1, "Show Title", Episode::Only(3)))
+            Some(recognized(1, "Show Title", Episode::Only(3)))
         );
     }
 
@@ -502,7 +502,7 @@ mod tests {
 
         assert_eq!(
             found("Another Show - 03.mkv", &corpus),
-            Some(Recognition::Recognised(Match {
+            Some(Recognition::Recognized(Match {
                 show: ShowId(9),
                 title: "Another Show".to_owned(),
                 episode: Episode::Only(3),
@@ -515,7 +515,7 @@ mod tests {
     fn a_name_no_entry_is_filed_under_leaves_the_answer_to_the_stages_below() {
         // Not a refusal. An exact key hits or misses, and a name the parser
         // shortened or a list spells differently misses it while still being
-        // recognisable further down, so this stage says nothing rather than
+        // recognizable further down, so this stage says nothing rather than
         // saying no.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
@@ -531,7 +531,7 @@ mod tests {
 
         assert_eq!(
             found("Nisekoi: - 03.mkv", &corpus),
-            Some(recognised(2, "Nisekoi:", Episode::Only(3)))
+            Some(recognized(2, "Nisekoi:", Episode::Only(3)))
         );
         assert_eq!(
             found("Nisekoi - 03.mkv", &corpus),
@@ -557,7 +557,7 @@ mod tests {
 
         assert_eq!(
             found("Gokushufudou S2 - 03.mkv", &corpus),
-            Some(recognised(3, "Gokushufudou Season 2", Episode::Only(3)))
+            Some(recognized(3, "Gokushufudou Season 2", Episode::Only(3)))
         );
     }
 
@@ -581,7 +581,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            Recognition::Recognised(Match {
+            Recognition::Recognized(Match {
                 show: ShowId(2),
                 title: "Nisekoi:".to_owned(),
                 episode: Episode::Only(3),
@@ -626,7 +626,7 @@ mod tests {
 
         assert_eq!(
             decide(&third, &altnames, &corpus, &Index::of(&corpus)),
-            Recognition::Recognised(Match {
+            Recognition::Recognized(Match {
                 show: ShowId(2),
                 title: "Kaguya-sama: Love is War -Ultra Romantic-".to_owned(),
                 episode: Episode::Only(3),
@@ -646,7 +646,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            recognised(1, "Kaguya-sama: Love is War", Episode::Only(3))
+            recognized(1, "Kaguya-sama: Love is War", Episode::Only(3))
         );
     }
 
@@ -664,7 +664,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            recognised(1, "Show Title", Episode::Only(3))
+            recognized(1, "Show Title", Episode::Only(3))
         );
     }
 
@@ -683,7 +683,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: "Some Other Show".to_owned(),
                 best: Some(a_score(0.4)),
             })
@@ -691,9 +691,9 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_with_nothing_to_score_carries_no_score_rather_than_nought() {
+    fn a_refusal_with_nothing_to_score_carries_no_score_rather_than_zero() {
         // No entry shares a word with the name, so the index hands the scorer
-        // nothing and no comparison is made. Nought would say one was made
+        // nothing and no comparison is made. Zero would say one was made
         // and the closest entry shared nothing, which sends a reader to the
         // name; an absence sends them to the list.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
@@ -705,7 +705,7 @@ mod tests {
                 &corpus,
                 &Index::of(&corpus)
             ),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: "Completely Different".to_owned(),
                 best: None,
             })
@@ -725,7 +725,7 @@ mod tests {
 
         assert_eq!(
             decide(&nothing, &Altnames::new(), &corpus, &Index::of(&corpus)),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: String::new(),
                 best: None,
             })
@@ -734,14 +734,14 @@ mod tests {
 
     #[test]
     fn a_file_of_several_episodes_names_its_title_and_none_of_them() {
-        // The title was recognised and the episode was not, which is one
+        // The title was recognized and the episode was not, which is one
         // answer rather than two. A batch reduced to no episode would arrive
         // looking like a film, and a consumer would mark the series watched.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
         assert_eq!(
             found("[Group] Show Title 01-12 [BD].mkv", &corpus),
-            Some(recognised(1, "Show Title", Episode::Several))
+            Some(recognized(1, "Show Title", Episode::Several))
         );
     }
 }

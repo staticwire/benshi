@@ -25,7 +25,7 @@ pub enum Typed {
     /// before the end. A token is what a prompt reads, so it is held as one.
     Line(Token),
     /// Ctrl-C or Ctrl-D, at a terminal.
-    Cancelled,
+    Canceled,
 }
 
 /// Read one line from `input`, which a terminal does not show.
@@ -74,7 +74,7 @@ fn line(input: BorrowedFd<'_>, at_a_terminal: bool) -> io::Result<Typed> {
         match byte[0] {
             b'\n' => break,
             b'\r' if at_a_terminal => break,
-            CTRL_C | CTRL_D if at_a_terminal => return Ok(Typed::Cancelled),
+            CTRL_C | CTRL_D if at_a_terminal => return Ok(Typed::Canceled),
             key if at_a_terminal && BACKSPACE.contains(&key) => {
                 line.pop();
             }
@@ -254,7 +254,7 @@ mod tests {
         let terminal = Terminal::new();
         let modes = terminal.modes();
 
-        assert_eq!(terminal.typing(b"part of a token\x03"), Typed::Cancelled);
+        assert_eq!(terminal.typing(b"part of a token\x03"), Typed::Canceled);
         assert_eq!(terminal.modes(), modes, "the terminal was not put back");
     }
 
@@ -263,7 +263,7 @@ mod tests {
         let terminal = Terminal::new();
         let modes = terminal.modes();
 
-        assert_eq!(terminal.typing(b"\x04"), Typed::Cancelled);
+        assert_eq!(terminal.typing(b"\x04"), Typed::Canceled);
         assert_eq!(terminal.modes(), modes, "the terminal was not put back");
     }
 

@@ -12,11 +12,11 @@
 use std::time::Duration;
 
 use benshi_core::path::RawPath;
-use benshi_core::recognise::altname::Altnames;
-use benshi_core::recognise::corpus::Corpus;
-use benshi_core::recognise::index::Index;
-use benshi_core::recognise::parse::{Episode, parse};
-use benshi_core::recognise::{Match, Recognition, Stage, decide};
+use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::corpus::Corpus;
+use benshi_core::recognize::index::Index;
+use benshi_core::recognize::parse::{Episode, parse};
+use benshi_core::recognize::{Match, Recognition, Stage, decide};
 use benshi_core::session::{Effect, Session};
 use benshi_core::timeline::{WATCHED_MINIMUM, WATCHED_PERCENT_MIN, WatchedPolicy};
 use benshi_core::trace::Trace;
@@ -67,7 +67,7 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
     let readings = recording();
     assert_eq!(
         decided(&readings[0]),
-        Recognition::Recognised(Match {
+        Recognition::Recognized(Match {
             show: SHOW,
             title: TITLE.to_owned(),
             episode: Episode::Only(3),

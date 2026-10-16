@@ -57,7 +57,7 @@ use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::recognise::parse::Parsed;
+use crate::recognize::parse::Parsed;
 
 /// The form a title is compared in.
 ///
@@ -682,7 +682,7 @@ mod tests {
     use super::{Key, words_in};
     use crate::encoding::Confidence;
     use crate::path::RawPath;
-    use crate::recognise::parse::{Episode, Parsed, parse};
+    use crate::recognize::parse::{Episode, Parsed, parse};
 
     /// The key a list entry spelled this way is filed under.
     fn listed(title: &str) -> Key {

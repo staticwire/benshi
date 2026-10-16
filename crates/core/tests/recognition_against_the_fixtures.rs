@@ -24,11 +24,11 @@
 
 use benshi_core::ShowId;
 use benshi_core::path::RawPath;
-use benshi_core::recognise::altname::Altnames;
-use benshi_core::recognise::corpus::Corpus;
-use benshi_core::recognise::index::Index;
-use benshi_core::recognise::parse::{Episode, Parsed, parse};
-use benshi_core::recognise::{Recognition, Stage, decide};
+use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::corpus::Corpus;
+use benshi_core::recognize::index::Index;
+use benshi_core::recognize::parse::{Episode, Parsed, parse};
+use benshi_core::recognize::{Recognition, Stage, decide};
 use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("fixtures/filenames.jsonl");
@@ -73,13 +73,13 @@ enum Named {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Expect {
-    Recognised {
+    Recognized {
         title: String,
         episode: EpisodeSpelled,
         stage: StageName,
     },
     Ambiguous(Vec<String>),
-    Unrecognised(Refused),
+    Unrecognized(Refused),
 }
 
 /// An episode as the fixture file writes it: a number, or a word for the
@@ -109,24 +109,24 @@ enum Refused {
 /// An answer reduced to what a fixture can say about it.
 #[derive(Debug, PartialEq)]
 enum Shape {
-    Recognised {
+    Recognized {
         title: String,
         episode: Episode,
         stage: StageName,
     },
     Ambiguous(Vec<String>),
-    Unrecognised(Refused),
+    Unrecognized(Refused),
 }
 
 impl Shape {
     /// What a fixture expects, read into the same shape an answer reduces to.
     fn expected(of: &Expect, rule: &str) -> Self {
         match of {
-            Expect::Recognised {
+            Expect::Recognized {
                 title,
                 episode,
                 stage,
-            } => Self::Recognised {
+            } => Self::Recognized {
                 title: title.clone(),
                 episode: match episode {
                     EpisodeSpelled::Only(number) => Episode::Only(*number),
@@ -143,14 +143,14 @@ impl Shape {
                 stage: *stage,
             },
             Expect::Ambiguous(candidates) => Self::Ambiguous(candidates.clone()),
-            Expect::Unrecognised(refused) => Self::Unrecognised(*refused),
+            Expect::Unrecognized(refused) => Self::Unrecognized(*refused),
         }
     }
 
     /// What recognition answered, reduced.
     fn of(answer: &Recognition) -> Self {
         match answer {
-            Recognition::Recognised(found) => Self::Recognised {
+            Recognition::Recognized(found) => Self::Recognized {
                 title: found.title.clone(),
                 episode: found.episode,
                 stage: match found.stage {
@@ -166,7 +166,7 @@ impl Shape {
                     .map(|candidate| candidate.title.clone())
                     .collect(),
             ),
-            Recognition::Unrecognised(refusal) => Self::Unrecognised(if refusal.best.is_some() {
+            Recognition::Unrecognized(refusal) => Self::Unrecognized(if refusal.best.is_some() {
                 Refused::Scored
             } else {
                 Refused::NothingScored

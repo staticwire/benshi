@@ -10,7 +10,7 @@ pub mod encoding;
 pub mod list;
 pub mod path;
 pub mod policy;
-pub mod recognise;
+pub mod recognize;
 pub mod session;
 pub mod timeline;
 pub mod token;
@@ -31,7 +31,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 ///
 /// Three-valued rather than [`Option`], because "the player did not publish a
 /// length" and "this detection method cannot carry a length" are different
-/// facts that lead to different behaviour: the first may be retried or shown as
+/// facts that lead to different behavior: the first may be retried or shown as
 /// unknown, the second means the capability is absent and the user should be
 /// told so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,8 +241,8 @@ mod tests {
             observed_at: Timestamp::epoch(),
         };
 
-        let text = serde_json::to_string(&snapshot).expect("serialise");
-        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&snapshot).expect("serialize");
+        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(snapshot, back);
     }
@@ -252,7 +252,7 @@ mod tests {
         // A filename from a Japanese archive unpacked with the wrong encoding
         // is not valid UTF-8, and this is exactly the snapshot a trace has to
         // carry. Refusing it, or replacing the bytes it cannot read, would make
-        // the file unrecognisable and the trace a lie.
+        // the file unrecognizable and the trace a lie.
         let broken = b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e.mkv".to_vec();
         let snapshot = PlayerSnapshot {
             player: PlayerId("mpv".to_owned()),
@@ -263,8 +263,8 @@ mod tests {
             observed_at: Timestamp::epoch(),
         };
 
-        let text = serde_json::to_string(&snapshot).expect("serialise");
-        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&snapshot).expect("serialize");
+        let back: PlayerSnapshot = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(snapshot, back);
         match back.media {
@@ -285,8 +285,8 @@ mod tests {
 
         assert_ne!(remote, title);
         assert_ne!(
-            serde_json::to_string(&remote).expect("serialise"),
-            serde_json::to_string(&title).expect("serialise")
+            serde_json::to_string(&remote).expect("serialize"),
+            serde_json::to_string(&title).expect("serialize")
         );
     }
 
@@ -297,8 +297,8 @@ mod tests {
         let unsupported: Known<Duration> = Known::Unsupported;
         let not_reported: Known<Duration> = Known::NotReported;
 
-        let a = serde_json::to_string(&unsupported).expect("serialise");
-        let b = serde_json::to_string(&not_reported).expect("serialise");
+        let a = serde_json::to_string(&unsupported).expect("serialize");
+        let b = serde_json::to_string(&not_reported).expect("serialize");
 
         assert_ne!(a, b);
     }

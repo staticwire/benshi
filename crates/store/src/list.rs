@@ -212,7 +212,7 @@ mod tests {
         Entry {
             id: EntryId(id),
             title: title.to_owned(),
-            spellings: vec![format!("{title} Spelt Otherwise"), format!("{title} 2")],
+            spellings: vec![format!("{title} Spelled Otherwise"), format!("{title} 2")],
             format: Some(Format::Tv),
             episodes: Some(12),
             episode_length: Some(Duration::from_mins(24)),
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_length_below_nought_is_refused() {
+    fn a_length_below_zero_is_refused() {
         let (_home, mut store) = a_store();
         store
             .file(BACKEND, &[a_series(21, "Show Title")])
