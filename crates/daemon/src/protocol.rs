@@ -11,9 +11,9 @@
 //! value that is not an object cannot be mistaken for a complete message.
 
 use benshi_core::policy::Policy;
-use benshi_core::recognise::altname::Assignment;
-use benshi_core::recognise::parse::{Episode, Parsed};
-use benshi_core::recognise::{Recognition, Score, Stage};
+use benshi_core::recognize::altname::Assignment;
+use benshi_core::recognize::parse::{Episode, Parsed};
+use benshi_core::recognize::{Recognition, Score, Stage};
 use benshi_core::token::Token;
 use benshi_core::{AppName, Capabilities, MediaRef, PlayState, PlayerId};
 use benshi_detect::SourceInfo;
@@ -192,13 +192,13 @@ impl Explanation {
 /// What recognition answered, on the wire.
 ///
 /// A form of its own rather than the domain's, because a score is a checked
-/// proportion that deliberately does not deserialise: a message carrying a
+/// proportion that deliberately does not deserialize: a message carrying a
 /// score of five must not be able to become one. Here a score is a number, and
 /// a consumer that needs the checked kind converts through the check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     /// A title, an episode and the stage that decided.
-    Recognised {
+    Recognized {
         /// The title as the corpus spells it.
         title: String,
         /// The episode in the release's numbering, as it was read from the name.
@@ -213,7 +213,7 @@ pub enum Outcome {
         candidates: Vec<String>,
     },
     /// Nothing matched.
-    Unrecognised {
+    Unrecognized {
         /// How close the best candidate came, where there was one to compare.
         best: Option<f64>,
     },
@@ -222,7 +222,7 @@ pub enum Outcome {
 impl Outcome {
     fn of(answer: &Recognition) -> Self {
         match answer {
-            Recognition::Recognised(found) => Self::Recognised {
+            Recognition::Recognized(found) => Self::Recognized {
                 title: found.title.clone(),
                 episode: found.episode,
                 stage: DecidedBy::of(&found.stage),
@@ -234,7 +234,7 @@ impl Outcome {
                     .map(|candidate| candidate.title.clone())
                     .collect(),
             },
-            Recognition::Unrecognised(refusal) => Self::Unrecognised {
+            Recognition::Unrecognized(refusal) => Self::Unrecognized {
                 best: refusal.best.map(Score::value),
             },
         }
@@ -246,7 +246,7 @@ impl Outcome {
 pub enum DecidedBy {
     /// The assignment the user made, as they made it.
     Altname(Assignment),
-    /// An exact match on the normalised key.
+    /// An exact match on the normalized key.
     Key,
     /// The best candidate the scorer found, and how well it scored.
     Scored(f64),
@@ -266,13 +266,13 @@ impl DecidedBy {
 mod tests {
     use super::{DecidedBy, Explanation, Outcome, Request, Response, SourceListing};
     use crate::bus::BusEvent;
-    use crate::recognition::{Decision, Recogniser};
+    use crate::recognition::{Decision, Recognizer};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
-    use benshi_core::recognise::altname::Assignment;
-    use benshi_core::recognise::parse::Episode;
-    use benshi_core::recognise::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage};
+    use benshi_core::recognize::altname::Assignment;
+    use benshi_core::recognize::parse::Episode;
+    use benshi_core::recognize::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage};
     use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
@@ -320,7 +320,7 @@ mod tests {
         let MediaRef::LocalFile(path) = &snapshot.media else {
             panic!("the snapshot has a file open");
         };
-        let (parsed, _refused) = Recogniser::empty().decide(path);
+        let (parsed, _refused) = Recognizer::empty().decide(path);
 
         Decision {
             player: snapshot.player.clone(),
@@ -342,7 +342,7 @@ mod tests {
 
     /// A match of this title by this stage, for building decisions from.
     fn found_by(stage: Stage) -> Recognition {
-        Recognition::Recognised(Match {
+        Recognition::Recognized(Match {
             show: ShowId(1),
             title: "Shingeki no Kyojin".to_owned(),
             episode: Episode::Only(3),
@@ -370,11 +370,11 @@ mod tests {
                     },
                 ],
             }),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: "Some Other Show".to_owned(),
                 best: Some(Score::new(0.4).expect("a proportion")),
             }),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: String::new(),
                 best: None,
             }),
@@ -432,7 +432,7 @@ mod tests {
         ]
     }
 
-    /// Every message either side may put on the wire, serialised.
+    /// Every message either side may put on the wire, serialized.
     ///
     /// Both directions, because the rules below are about the transport and
     /// hold in both. A check written over one of them would say "every message"
@@ -441,10 +441,10 @@ mod tests {
         let mut lines = Vec::new();
 
         for request in every_request() {
-            lines.push(serde_json::to_string(&request).expect("serialise"));
+            lines.push(serde_json::to_string(&request).expect("serialize"));
         }
         for response in every_response() {
-            lines.push(serde_json::to_string(&response).expect("serialise"));
+            lines.push(serde_json::to_string(&response).expect("serialize"));
         }
 
         lines
@@ -475,8 +475,8 @@ mod tests {
     #[test]
     fn a_request_read_back_is_the_request_that_was_sent() {
         for request in every_request() {
-            let text = serde_json::to_string(&request).expect("serialise");
-            let back: Request = serde_json::from_str(&text).expect("deserialise");
+            let text = serde_json::to_string(&request).expect("serialize");
+            let back: Request = serde_json::from_str(&text).expect("deserialize");
 
             assert_eq!(request, back);
         }
@@ -485,8 +485,8 @@ mod tests {
     #[test]
     fn a_response_read_back_is_the_response_that_was_sent() {
         for response in every_response() {
-            let text = serde_json::to_string(&response).expect("serialise");
-            let back: Response = serde_json::from_str(&text).expect("deserialise");
+            let text = serde_json::to_string(&response).expect("serialize");
+            let back: Response = serde_json::from_str(&text).expect("deserialize");
 
             assert_eq!(response, back);
         }
@@ -497,11 +497,11 @@ mod tests {
         // A name out of a Japanese archive unpacked with the wrong encoding is
         // not valid UTF-8, and it is the reading a user is most likely to be
         // watching when something goes wrong. Replacing the bytes it cannot
-        // read would make the file unrecognisable and the stream a lie.
+        // read would make the file unrecognizable and the stream a lie.
         let published = BusEvent::Snapshot(a_snapshot());
 
-        let text = serde_json::to_string(&Response::Event(published.clone())).expect("serialise");
-        let back: Response = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&Response::Event(published.clone())).expect("serialize");
+        let back: Response = serde_json::from_str(&text).expect("deserialize");
 
         let Response::Event(BusEvent::Snapshot(snapshot)) = back else {
             panic!("expected a reading, got {back:?}");
@@ -549,7 +549,7 @@ mod tests {
 
         assert_eq!(
             explained.outcome,
-            Outcome::Recognised {
+            Outcome::Recognized {
                 title: "Shingeki no Kyojin".to_owned(),
                 episode: Episode::Only(3),
                 stage: DecidedBy::Altname(an_assignment()),
@@ -565,7 +565,7 @@ mod tests {
 
         assert_eq!(
             explained.outcome,
-            Outcome::Recognised {
+            Outcome::Recognized {
                 title: "Shingeki no Kyojin".to_owned(),
                 episode: Episode::Only(3),
                 stage: DecidedBy::Scored(0.83),
@@ -604,17 +604,17 @@ mod tests {
     fn an_explanation_of_a_refusal_carries_how_close_the_best_came() {
         // Absent and low are different answers, and they stay different on
         // the wire: one points at the list and the other at the name.
-        let close = Explanation::of(&a_decision(Recognition::Unrecognised(Refusal {
+        let close = Explanation::of(&a_decision(Recognition::Unrecognized(Refusal {
             parsed: "Some Other Show".to_owned(),
             best: Some(Score::new(0.4).expect("a proportion")),
         })));
-        let nothing = Explanation::of(&a_decision(Recognition::Unrecognised(Refusal {
+        let nothing = Explanation::of(&a_decision(Recognition::Unrecognized(Refusal {
             parsed: "Some Other Show".to_owned(),
             best: None,
         })));
 
-        assert_eq!(close.outcome, Outcome::Unrecognised { best: Some(0.4) });
-        assert_eq!(nothing.outcome, Outcome::Unrecognised { best: None });
+        assert_eq!(close.outcome, Outcome::Unrecognized { best: Some(0.4) });
+        assert_eq!(nothing.outcome, Outcome::Unrecognized { best: None });
     }
 
     #[test]
@@ -624,7 +624,7 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_string(&asked).expect("serialise"),
+            serde_json::to_string(&asked).expect("serialize"),
             r#"{"type":"Login","body":{"token":"header.payload.signature"}}"#
         );
         assert!(!format!("{asked:?}").contains("payload"), "{asked:?}");

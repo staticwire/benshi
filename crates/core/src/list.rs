@@ -110,7 +110,7 @@ pub enum Status {
 /// On AniList each user chooses the format a score is shown in, and the list
 /// takes and answers a score in a hundred points whichever was chosen.
 /// MyAnimeList and Shikimori score out of ten and Kitsu out of twenty, and
-/// both multiply into a hundred exactly. Nought is not a rating: an entry
+/// both multiply into a hundred exactly. Zero is not a rating: an entry
 /// with no score carries none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Rating(u8);
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn a_rating_is_from_one_to_a_hundred() {
-        // Nought is no rating, and no rating is `None`: two ways to say it
+        // Zero is no rating, and no rating is `None`: two ways to say it
         // would be one too many.
         assert_eq!(Rating::new(0), None);
         assert_eq!(Rating::new(1).map(Rating::points), Some(1));

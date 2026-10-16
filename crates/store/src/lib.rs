@@ -164,7 +164,7 @@ pub enum Error {
 /// what they hold it lies on.
 ///
 /// The whole second the reading lies in, as `date +%s` prints it: below
-/// nought before 1970, and the second that began before a reading between
+/// zero before 1970, and the second that began before a reading between
 /// two. A reading that is not before 1970 is taken to be one after 9999,
 /// since the store raises [`Error::Instant`] for no other.
 fn out_of_range(at: &SystemTime) -> String {

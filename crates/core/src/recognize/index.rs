@@ -10,7 +10,7 @@
 //! miss it. Their words do not miss.
 //!
 //! **The words are read by the key's own rules** through
-//! [`super::normalise::words_in`], so everything a key forgives is gone from
+//! [`super::normalize::words_in`], so everything a key forgives is gone from
 //! them as well and this stage repeats none of it. The words cannot be read out
 //! of a key, because a key erases the breaks between words so that `Fate/Zero`
 //! and `Fate Zero` reach one.
@@ -34,8 +34,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ShowId;
-use crate::recognise::corpus::Corpus;
-use crate::recognise::normalise::words_in;
+use crate::recognize::corpus::Corpus;
+use crate::recognize::normalize::words_in;
 
 /// A word narrows nothing once more than one entry in this many carries it.
 ///
@@ -152,9 +152,9 @@ mod tests {
     use super::Index;
     use crate::ShowId;
     use crate::path::RawPath;
-    use crate::recognise::by_key;
-    use crate::recognise::corpus::Corpus;
-    use crate::recognise::parse::parse;
+    use crate::recognize::by_key;
+    use crate::recognize::corpus::Corpus;
+    use crate::recognize::parse::parse;
 
     /// The titles of these shows, in the order they are given.
     fn titled(corpus: &Corpus, shows: Vec<ShowId>) -> Vec<&str> {

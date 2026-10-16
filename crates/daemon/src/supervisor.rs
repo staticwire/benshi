@@ -26,7 +26,7 @@
 //! would have two clocks to move, the one a wait is slept on and the one a
 //! run is measured on, free to disagree about whether a task had been running
 //! long enough. What the rule is for still holds: `tokio::time` is
-//! virtualised under a paused runtime, so
+//! virtualized under a paused runtime, so
 //! `a_long_backoff_does_not_count_as_work` winds through 2223 seconds of
 //! retries and takes no measurable time to run.
 
@@ -137,7 +137,7 @@ pub enum Stopped {
     /// It finished what it was doing and returned.
     Finished,
     /// A failure that will not pass, rendered here for a person. Usually one
-    /// the task reported; a task cancelled from outside is recorded here too,
+    /// the task reported; a task canceled from outside is recorded here too,
     /// because it is not coming back either.
     Permanent(String),
     /// It kept panicking. The last panic is rendered here.
@@ -495,7 +495,7 @@ impl Supervisor {
                 // Nothing here aborts a task and the set outlives the loop, so
                 // a cancellation means something else reached in and took the
                 // handle. Recorded rather than guessed at.
-                Err(_cancelled) => Some(Stopped::Permanent("task was cancelled".to_owned())),
+                Err(_canceled) => Some(Stopped::Permanent("task was canceled".to_owned())),
             };
 
             if let Some(stopped_by) = stopped_by {

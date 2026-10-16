@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `{:?}` prints no part of it, so a token formatted into a message, a log
 /// line or the output of a failed test is not given away there. The text is
-/// read with [`Token::secret`] and serialised whole, where the token is sent
+/// read with [`Token::secret`] and serialized whole, where the token is sent
 /// or kept.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -50,8 +50,8 @@ mod tests {
     fn a_token_travels_as_its_text() {
         let token = Token::new("header.payload.signature");
 
-        let text = serde_json::to_string(&token).expect("serialise");
-        let back: Token = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&token).expect("serialize");
+        let back: Token = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(text, "\"header.payload.signature\"");
         assert_eq!(back.secret(), "header.payload.signature");

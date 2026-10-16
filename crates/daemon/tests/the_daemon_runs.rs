@@ -27,8 +27,8 @@ use benshi_core::clock::{Clock, TestClock, Timestamp};
 use benshi_core::list::{Entry, EntryId, Status};
 use benshi_core::path::RawPath;
 use benshi_core::policy::Policy;
-use benshi_core::recognise::altname::Altnames;
-use benshi_core::recognise::corpus::Corpus;
+use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::corpus::Corpus;
 use benshi_core::token::Token;
 use benshi_core::{
     AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
@@ -39,7 +39,7 @@ use benshi_daemon::config::{Period, Reading};
 use benshi_daemon::ipc::bind;
 use benshi_daemon::listing::{Listing, Source};
 use benshi_daemon::protocol::{Request, Response, SourceListing};
-use benshi_daemon::recognition::Recogniser;
+use benshi_daemon::recognition::Recognizer;
 use benshi_daemon::secrets;
 use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, TaskRecord};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
@@ -349,7 +349,7 @@ fn a_daemon(
     tokio::spawn(benshi_daemon::run(
         platform.factory(),
         listener,
-        Recogniser::empty(),
+        Recognizer::empty(),
         a_store(home),
         SystemTime::now,
         PERIOD,
@@ -383,7 +383,7 @@ fn a_daemon_that_tells(
     tokio::spawn(benshi_daemon::run(
         platform.factory(),
         listener,
-        Recogniser::of(list, Altnames::new()),
+        Recognizer::of(list, Altnames::new()),
         Arc::clone(store),
         the_time,
         PERIOD,
@@ -429,7 +429,7 @@ async fn ask(socket: &Path, request: &Request) -> Response {
         .expect("the daemon answers");
     let (reading, mut writing) = tokio::io::split(stream);
 
-    let mut line = serde_json::to_vec(request).expect("serialise");
+    let mut line = serde_json::to_vec(request).expect("serialize");
     line.push(b'\n');
     writing
         .write_all(&line)
@@ -567,7 +567,7 @@ fn a_daemon_reading(
     tokio::spawn(benshi_daemon::run(
         platform.factory(),
         listener,
-        Recogniser::empty(),
+        Recognizer::empty(),
         Arc::clone(store),
         the_time,
         PERIOD,
@@ -602,7 +602,7 @@ fn the_episode_queued() -> [Operation; 1] {
 #[tokio::test]
 async fn a_running_daemon_records_what_the_list_it_read_holds() {
     // A daemon that starts with nothing to match a name against, and an
-    // empty store: the file it plays is recognised only by a list its own
+    // empty store: the file it plays is recognized only by a list its own
     // task read, filed and put in place for detection.
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
@@ -620,7 +620,7 @@ async fn a_running_daemon_records_what_the_list_it_read_holds() {
 async fn a_running_daemon_reads_its_list_where_a_name_misses_it() {
     // Read at no time but on a miss: the file the platform plays misses
     // the empty list, the round wakes the list's task, and what it reads
-    // recognises the file.
+    // recognizes the file.
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
     let platform = Platform::default();
@@ -701,7 +701,7 @@ async fn a_running_daemon_streams_what_its_own_detection_published() {
         .await
         .expect("the daemon answers");
     let (reading, mut writing) = tokio::io::split(stream);
-    let mut line = serde_json::to_vec(&Request::Watch).expect("serialise");
+    let mut line = serde_json::to_vec(&Request::Watch).expect("serialize");
     line.push(b'\n');
     writing
         .write_all(&line)

@@ -203,7 +203,7 @@ fn did_not_answer(socket: &Path) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_request_that_cannot_be_written_says_what_the_serialiser_said() {
+    fn a_request_that_cannot_be_written_says_what_the_serializer_said() {
         // A map keyed by a pair is one JSON cannot spell.
         let unwritable = std::collections::BTreeMap::from([((1, 2), 3)]);
         let cause = serde_json::to_vec(&unwritable).expect_err("JSON has no such key");

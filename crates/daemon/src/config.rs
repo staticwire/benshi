@@ -27,7 +27,7 @@
 //! a table this build does not know, and a value a key does not take. What the
 //! daemon says names the line and the column where `toml` gives a place.
 //! Running on the defaults in its place would set aside what the file says,
-//! `when = "manual"` among it. A key spelt wrong is refused for the same
+//! `when = "manual"` among it. A key spelled wrong is refused for the same
 //! reason, where it would be read as one left out.
 
 use std::fmt;

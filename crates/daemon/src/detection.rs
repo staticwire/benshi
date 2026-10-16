@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use benshi_core::policy::PolicyTable;
-use benshi_core::recognise::Recognition;
+use benshi_core::recognize::Recognition;
 use benshi_core::session::{Effect, Resumed, Session};
 use benshi_core::timeline::WatchedPolicy;
 use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
@@ -67,7 +67,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::bus::{BusEvent, EventBus};
 use crate::listing::Wakes;
-use crate::recognition::{Current, Decided, Decision, Recogniser};
+use crate::recognition::{Current, Decided, Decision, Recognizer};
 use crate::supervisor::TaskError;
 
 /// What is said about a reading whose source the same round did not describe.
@@ -195,7 +195,7 @@ pub struct Wiring {
     /// Where each round leaves the sources it described.
     pub seen: Seen,
     /// What a reading's file is decided against.
-    pub recogniser: Current,
+    pub recognizer: Current,
     /// What a name the list does not hold wakes.
     pub wakes: Wakes,
     /// Where each round leaves its last decision.
@@ -257,7 +257,7 @@ pub struct Detection<W> {
     bus: Arc<EventBus>,
     policy: Arc<RwLock<PolicyTable>>,
     seen: Seen,
-    recogniser: Current,
+    recognizer: Current,
     wakes: Wakes,
     decided: Decided,
     store: Arc<Mutex<Store>>,
@@ -282,7 +282,7 @@ impl<W: PlayerWatcher> Detection<W> {
             bus,
             policy,
             seen,
-            recogniser,
+            recognizer,
             wakes,
             decided,
             store,
@@ -295,7 +295,7 @@ impl<W: PlayerWatcher> Detection<W> {
             bus,
             policy,
             seen,
-            recogniser,
+            recognizer,
             wakes,
             decided,
             store,
@@ -337,7 +337,7 @@ impl<W: PlayerWatcher> Detection<W> {
     /// One round: read the platform, apply policy, record and publish what
     /// was admitted, and let go of whoever has left.
     async fn round(&mut self) -> Result<(), TaskError> {
-        let recogniser = self.recogniser.now();
+        let recognizer = self.recognizer.now();
         let PollOutcome {
             sources,
             snapshots,
@@ -382,7 +382,7 @@ impl<W: PlayerWatcher> Detection<W> {
                 if !self.heard.contains(&snapshot.player) {
                     self.heard.insert(snapshot.player.clone());
                 }
-                let decision = self.decide(&recogniser, &snapshot);
+                let decision = self.decide(&recognizer, &snapshot);
                 let effects = self.session.advance(&snapshot, decision.as_ref());
                 self.carry_out(effects).await?;
                 self.bus.publish(BusEvent::Snapshot(snapshot));
@@ -434,12 +434,12 @@ impl<W: PlayerWatcher> Detection<W> {
     /// what a client reads is the decision about the reading the daemon last
     /// acted on. A name that spells a title the list does not hold wakes the
     /// list's task, which may read the list again.
-    fn decide(&self, recogniser: &Recogniser, snapshot: &PlayerSnapshot) -> Option<Recognition> {
+    fn decide(&self, recognizer: &Recognizer, snapshot: &PlayerSnapshot) -> Option<Recognition> {
         let MediaRef::LocalFile(path) = &snapshot.media else {
             return None;
         };
-        let (parsed, answer) = recogniser.decide(path);
-        if let Recognition::Unrecognised(refusal) = &answer
+        let (parsed, answer) = recognizer.decide(path);
+        if let Recognition::Unrecognized(refusal) = &answer
             && !refusal.parsed.is_empty()
         {
             self.wakes.missed();
@@ -552,15 +552,15 @@ mod tests {
     use super::{Detection, Seen, Wiring};
     use crate::bus::{BusEvent, EventBus};
     use crate::listing::Wakes;
-    use crate::recognition::{Current, Decided, Recogniser};
+    use crate::recognition::{Current, Decided, Recognizer};
     use crate::supervisor::TaskError;
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
-    use benshi_core::recognise::Recognition;
-    use benshi_core::recognise::altname::Altnames;
-    use benshi_core::recognise::corpus::Corpus;
-    use benshi_core::recognise::parse::Episode;
+    use benshi_core::recognize::Recognition;
+    use benshi_core::recognize::altname::Altnames;
+    use benshi_core::recognize::corpus::Corpus;
+    use benshi_core::recognize::parse::Episode;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
@@ -592,7 +592,7 @@ mod tests {
     const STEP: Duration = Duration::from_secs(5);
 
     /// The reading at which half of [`LENGTH`] has been watched, counted
-    /// from nought.
+    /// from zero.
     ///
     /// The first reading of a sitting adds nothing and each one after it adds
     /// a [`STEP`], so two minutes are watched at the twenty-fourth after it.
@@ -794,13 +794,13 @@ mod tests {
     }
 
     /// The list, and nothing named by hand.
-    fn a_list() -> Recogniser {
+    fn a_list() -> Recognizer {
         let mut corpus = Corpus::new();
         for (show, title) in LIST {
             corpus.file(show, title, Vec::<&str>::new());
         }
 
-        Recogniser::of(corpus, Altnames::new())
+        Recognizer::of(corpus, Altnames::new())
     }
 
     /// Wiring to this database and [`the_time`], with the table a user starts
@@ -810,7 +810,7 @@ mod tests {
             bus: Arc::new(EventBus::new()),
             policy: Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
             seen: Seen::new(),
-            recogniser: Current::new(Recogniser::empty()),
+            recognizer: Current::new(Recognizer::empty()),
             wakes: Wakes::new(),
             decided: Decided::new(),
             store: Arc::clone(&database.store),
@@ -867,7 +867,7 @@ mod tests {
     ) -> Detection<ScriptedWatcher> {
         let wiring = Wiring {
             policy,
-            recogniser: Current::new(a_list()),
+            recognizer: Current::new(a_list()),
             ..wired_to(database)
         };
 
@@ -1414,7 +1414,7 @@ mod tests {
         assert_eq!(decision.parsed.title.as_deref(), Some("Show Title"));
         assert_eq!(decision.parsed.episode, Episode::Only(3));
         assert!(
-            matches!(decision.answer, Recognition::Unrecognised(_)),
+            matches!(decision.answer, Recognition::Unrecognized(_)),
             "nothing to match against, got {:?}",
             decision.answer
         );
@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     /// What `episodes_seen` holds where nothing was recorded, named because
-    /// an empty array otherwise needs its element type spelt out.
+    /// an empty array otherwise needs its element type spelled out.
     const NOTHING_SEEN: [Viewed; 0] = [];
 
     /// The third episode as the store holds it once `watched` of it is kept.
@@ -1726,7 +1726,7 @@ mod tests {
         let mpv = a_source("mpv", "mpv");
         let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
         let wiring = Wiring {
-            recogniser: Current::new(a_list()),
+            recognizer: Current::new(a_list()),
             now: a_second_on,
             ..wired_to(&database)
         };
@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_player_that_opens_a_file_nobody_recognised_closes_its_episode() {
+    async fn a_player_that_opens_a_file_nobody_recognized_closes_its_episode() {
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
         let moved_on = a_round_of(&[&mpv], vec![playing(&mpv, NOT_LISTED, HALF_AT + 1)]);
@@ -2087,7 +2087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_nobody_recognised_reaches_no_table() {
+    async fn a_file_nobody_recognized_reaches_no_table() {
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
         let watcher = ScriptedWatcher::of(watching(&mpv, NOT_LISTED, 0..=HALF_AT));
@@ -2199,7 +2199,7 @@ mod tests {
         let mpv = a_source("mpv", "mpv");
         let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=1));
         let wiring = Wiring {
-            recogniser: Current::new(a_list()),
+            recognizer: Current::new(a_list()),
             now: before_1970,
             ..wired_to(&database)
         };
@@ -2270,7 +2270,7 @@ mod tests {
 
     #[test]
     fn a_call_a_runtime_that_shut_down_gave_up_stops_the_task() {
-        // A runtime that shuts down hands back as cancelled a call it had
+        // A runtime that shuts down hands back as canceled a call it had
         // not started. Nothing in that is a bug, so it is no panic.
         let database = Database::new();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2300,7 +2300,7 @@ mod tests {
     struct Replacing {
         rounds: ScriptedWatcher,
         current: Current,
-        with: Option<Recogniser>,
+        with: Option<Recognizer>,
     }
 
     impl PlayerWatcher for Replacing {
@@ -2326,7 +2326,7 @@ mod tests {
     ) -> (Database, Detection<W>) {
         let database = Database::new();
         let wiring = Wiring {
-            recogniser: current,
+            recognizer: current,
             wakes,
             decided,
             ..wired_to(&database)
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_round_that_began_before_a_list_was_put_in_place_decides_against_the_one_before() {
-        let current = Current::new(Recogniser::empty());
+        let current = Current::new(Recognizer::empty());
         let decided = Decided::new();
         let watcher = Replacing {
             rounds: reading(THIRD),
@@ -2370,7 +2370,7 @@ mod tests {
 
         let decision = decided.latest().expect("the reading was decided");
         assert!(
-            matches!(decision.answer, Recognition::Unrecognised(_)),
+            matches!(decision.answer, Recognition::Unrecognized(_)),
             "got {:?}",
             decision.answer
         );
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_list_put_in_place_is_decided_against_from_the_next_round() {
-        let current = Current::new(Recogniser::empty());
+        let current = Current::new(Recognizer::empty());
         let decided = Decided::new();
         let (_database, mut detection) = deciding_against(
             reading(THIRD),
@@ -2393,7 +2393,7 @@ mod tests {
 
         let decision = decided.latest().expect("the reading was decided");
         assert!(
-            matches!(&decision.answer, Recognition::Recognised(found) if found.title == SERIES),
+            matches!(&decision.answer, Recognition::Recognized(found) if found.title == SERIES),
             "got {:?}",
             decision.answer
         );
@@ -2459,7 +2459,7 @@ mod tests {
         let decided = Decided::new();
         let (_database, mut detection) = deciding_against(
             reading(THIRD),
-            Current::new(Recogniser::of(corpus, Altnames::new())),
+            Current::new(Recognizer::of(corpus, Altnames::new())),
             wakes.clone(),
             decided.clone(),
         );

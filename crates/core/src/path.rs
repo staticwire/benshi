@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 /// A path on Linux is an arbitrary byte string, so this type holds bytes. It is
 /// never opened: callers parse the filename and display it.
 ///
-/// The serialised form keeps runs of valid UTF-8 verbatim, so an ordinary name
+/// The serialized form keeps runs of valid UTF-8 verbatim, so an ordinary name
 /// stays readable in a trace, and escapes every other byte, plus the escape
 /// character itself, as `%XX`. The mapping is reversible for any input.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,7 +33,7 @@ impl RawPath {
         &self.0
     }
 
-    /// The path as text, in the form the serialised path quotes.
+    /// The path as text, in the form the serialized path quotes.
     ///
     /// Runs of valid UTF-8 are kept verbatim and every other byte becomes
     /// `%XX`, the escape itself included: a name holding a per-cent sign
@@ -60,7 +60,7 @@ impl RawPath {
     /// Only `/` separates. A backslash does not, because 0x5C is the trailing
     /// byte of several Shift-JIS characters and splitting on it would cut a
     /// Japanese filename in half. A platform whose separator is the backslash
-    /// normalises before constructing this type: which byte separates is
+    /// normalizes before constructing this type: which byte separates is
     /// platform knowledge, and an adapter is where platform knowledge lives.
     #[must_use]
     pub fn file_name(&self) -> &[u8] {
@@ -184,15 +184,15 @@ mod tests {
     #[test]
     fn a_utf8_path_round_trips() {
         let path = RawPath::from_bytes(b"/anime/[Group] Show - 03.mkv".to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&path).expect("serialize");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(path, back);
     }
 
     #[test]
     fn a_japanese_utf8_path_round_trips_and_stays_readable() {
         let path = RawPath::from_bytes("/anime/日本語.mkv".as_bytes().to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
+        let text = serde_json::to_string(&path).expect("serialize");
 
         // Valid UTF-8 passes through unescaped, so a trace stays greppable by
         // the name a person would type.
@@ -201,15 +201,15 @@ mod tests {
             "expected readable text, got {text}"
         );
 
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(path, back);
     }
 
     #[test]
     fn a_shift_jis_path_round_trips_byte_for_byte() {
         let path = RawPath::from_bytes(SHIFT_JIS.to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&path).expect("serialize");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(path, back);
         assert_eq!(back.as_bytes(), SHIFT_JIS);
@@ -218,19 +218,19 @@ mod tests {
     #[test]
     fn a_windows_1251_path_round_trips_byte_for_byte() {
         let path = RawPath::from_bytes(CP1251.to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&path).expect("serialize");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(path, back);
         assert_eq!(back.as_bytes(), CP1251);
     }
 
     #[test]
-    fn an_invalid_path_still_serialises_as_a_string() {
+    fn an_invalid_path_still_serializes_as_a_string() {
         // Not an array of numbers: a trace is read by people, and a wall of
         // byte values is not readable at any length.
         let path = RawPath::from_bytes(SHIFT_JIS.to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
+        let text = serde_json::to_string(&path).expect("serialize");
         assert!(text.starts_with('"'), "expected a JSON string, got {text}");
     }
 
@@ -239,8 +239,8 @@ mod tests {
         // The escape character has to escape itself, or a filename containing
         // a per-cent sign decodes as something else entirely.
         let path = RawPath::from_bytes(b"/anime/100%25 Pascal-sensei.mkv".to_vec());
-        let text = serde_json::to_string(&path).expect("serialise");
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&path).expect("serialize");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(path, back);
     }
 
@@ -254,9 +254,9 @@ mod tests {
 
         assert_eq!(escaped, "/anime/%FF 100%25.mkv");
         assert_eq!(
-            serde_json::to_string(&path).expect("serialise"),
+            serde_json::to_string(&path).expect("serialize"),
             format!("{escaped:?}"),
-            "and it is what the serialised form quotes"
+            "and it is what the serialized form quotes"
         );
     }
 
@@ -288,8 +288,8 @@ mod tests {
         let all: Vec<u8> = (0..=u8::MAX).collect();
         let path = RawPath::from_bytes(all.clone());
 
-        let text = serde_json::to_string(&path).expect("serialise");
-        let back: RawPath = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&path).expect("serialize");
+        let back: RawPath = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(back.as_bytes(), all.as_slice());
     }

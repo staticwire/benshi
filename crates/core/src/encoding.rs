@@ -3,8 +3,8 @@
 //! A filename on Linux is bytes, and those bytes are frequently not UTF-8: an
 //! archive unpacked with the wrong setting, a share mounted from Windows, a
 //! file copied off a disc pressed in 2004. Refusing such a name means the
-//! episode is never recognised; replacing the bytes it cannot read means it is
-//! recognised as the wrong thing, which is worse.
+//! episode is never recognized; replacing the bytes it cannot read means it is
+//! recognized as the wrong thing, which is worse.
 //!
 //! So every name is decoded, and the decision is **reported rather than
 //! hidden**: the caller learns which encoding was used and whether that was a
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// How far the text can be trusted.
 ///
 /// Two-valued for the same reason [`crate::Known`] is three-valued: a fact and
-/// an inference lead to different behaviour, and a type that cannot tell them
+/// an inference lead to different behavior, and a type that cannot tell them
 /// apart forces every consumer to assume the worse of the two or the better.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {

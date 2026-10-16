@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn a_command_that_does_not_exist_is_refused() {
-        assert!(Cli::try_parse_from(["benshi", "recognise"]).is_err());
+        assert!(Cli::try_parse_from(["benshi", "recognize"]).is_err());
     }
 
     #[test]

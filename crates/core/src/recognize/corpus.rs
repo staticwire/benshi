@@ -1,6 +1,6 @@
 //! The entries a name reaches, filed under the key each spelling reaches.
 //!
-//! Stage two is an exact match on the normalised key, and this is what it
+//! Stage two is an exact match on the normalized key, and this is what it
 //! matches against. **The caller builds it**, because this crate performs no
 //! I/O and a list of entries comes from somewhere that does.
 //!
@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use crate::ShowId;
-use crate::recognise::normalise::Key;
+use crate::recognize::normalize::Key;
 
 /// The shows recognition matches against.
 ///
@@ -168,7 +168,7 @@ impl<S: AsRef<str>> FromIterator<S> for Corpus {
 mod tests {
     use super::Corpus;
     use crate::ShowId;
-    use crate::recognise::normalise::Key;
+    use crate::recognize::normalize::Key;
 
     /// The key a list entry spelled this way is filed under.
     fn listed(title: &str) -> Key {

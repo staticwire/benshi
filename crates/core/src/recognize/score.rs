@@ -8,7 +8,7 @@
 //! **The text it scores is the whole name**, through
 //! [`Parsed::text`](super::parse::Parsed::text), which is the filename with the
 //! release's own words struck out. A title ends at the first thing the parser
-//! recognises, so a file of a special whose name extends a series' name reports
+//! recognizes, so a file of a special whose name extends a series' name reports
 //! the series and nothing of the subtitle that tells the two apart.
 //!
 //! **A candidate is judged by how much of the name it accounts for**, as the
@@ -54,10 +54,10 @@
 use std::collections::HashSet;
 
 use crate::ShowId;
-use crate::recognise::corpus::Corpus;
-use crate::recognise::normalise::wording_of;
-use crate::recognise::parse::Parsed;
-use crate::recognise::{Match, Recognition, Refusal, Score, Stage};
+use crate::recognize::corpus::Corpus;
+use crate::recognize::normalize::wording_of;
+use crate::recognize::parse::Parsed;
+use crate::recognize::{Match, Recognition, Refusal, Score, Stage};
 
 /// How many words a comparison has to spell before the ordinary margin applies.
 ///
@@ -83,7 +83,7 @@ pub const NEAR_ENOUGH: f64 = 0.70;
 /// How much of the two the name and the spelling have in common.
 ///
 /// The words they share against the words they spell between them, so that
-/// neither a long entry nor a long name is favoured by its length alone.
+/// neither a long entry nor a long name is favored by its length alone.
 ///
 /// # Panics
 ///
@@ -95,7 +95,7 @@ pub fn alike(name: &[String], spelling: &[String]) -> Score {
     let spelling: HashSet<&String> = spelling.iter().collect();
     let between = name.len() + spelling.len();
     if between == 0 {
-        return Score::new(0.0).expect("nought is a proportion");
+        return Score::new(0.0).expect("zero is a proportion");
     }
     let shared = name.intersection(&spelling).count();
     let of = |count: usize| f64::from(u32::try_from(count).unwrap_or(u32::MAX));
@@ -121,7 +121,7 @@ pub fn alike(name: &[String], spelling: &[String]) -> Score {
 pub fn by_score(parsed: &Parsed, candidates: &[ShowId], corpus: &Corpus) -> Recognition {
     let name = wording_of(&parsed.text);
     let refused = |best| {
-        Recognition::Unrecognised(Refusal {
+        Recognition::Unrecognized(Refusal {
             parsed: parsed.title.clone().unwrap_or_default(),
             best,
         })
@@ -160,7 +160,7 @@ pub fn by_score(parsed: &Parsed, candidates: &[ShowId], corpus: &Corpus) -> Reco
     if best.value() < NEAR_ENOUGH || best.value() - runner_up < ahead {
         return refused(Some(best));
     }
-    Recognition::Recognised(Match {
+    Recognition::Recognized(Match {
         show,
         title: corpus.title_of(show).unwrap_or_default().to_owned(),
         episode: parsed.episode,
@@ -190,19 +190,19 @@ mod tests {
     use crate::ShowId;
     use crate::encoding::Confidence;
     use crate::path::RawPath;
-    use crate::recognise::corpus::Corpus;
-    use crate::recognise::normalise::{Key, words_in};
-    use crate::recognise::parse::{Episode, Parsed, parse};
-    use crate::recognise::{Match, Recognition, Refusal, Score, Stage};
+    use crate::recognize::corpus::Corpus;
+    use crate::recognize::normalize::{Key, words_in};
+    use crate::recognize::parse::{Episode, Parsed, parse};
+    use crate::recognize::{Match, Recognition, Refusal, Score, Stage};
 
     /// What a file of this name spells.
-    fn named(name: &str) -> crate::recognise::parse::Parsed {
+    fn named(name: &str) -> crate::recognize::parse::Parsed {
         parse(&RawPath::from_bytes(name.as_bytes().to_vec()))
     }
 
     /// A score the tests use where the exact value is not the point.
     fn a_score(value: f64) -> Score {
-        Score::new(value).expect("the value is between nought and one")
+        Score::new(value).expect("the value is between zero and one")
     }
 
     /// The shows these titles are filed as, for a test that names its
@@ -224,7 +224,7 @@ mod tests {
     /// The match an answer carries, where the test says it has to be one.
     fn answered(answer: Recognition, must: &str) -> Match {
         match answer {
-            Recognition::Recognised(found) => found,
+            Recognition::Recognized(found) => found,
             refused => panic!("{must}, got {refused:?}"),
         }
     }
@@ -256,11 +256,11 @@ mod tests {
         );
 
         assert!(
-            matches!(by_the_short, Recognition::Unrecognised(_)),
+            matches!(by_the_short, Recognition::Unrecognized(_)),
             "a two-word entry needs a wider win"
         );
         assert!(
-            matches!(by_the_long, Recognition::Recognised(_)),
+            matches!(by_the_long, Recognition::Recognized(_)),
             "the same win is enough for four words"
         );
     }
@@ -301,7 +301,7 @@ mod tests {
             &corpus,
         );
 
-        assert!(matches!(alone, Recognition::Unrecognised(_)));
+        assert!(matches!(alone, Recognition::Unrecognized(_)));
         assert!(alike(&words_in("Some Other Show"), &words_in("Show Title")).value() < NEAR_ENOUGH);
     }
 
@@ -319,7 +319,7 @@ mod tests {
                 &shows(&corpus, &["Show Title Alpha", "Show Title Beta"]),
                 &corpus
             ),
-            Recognition::Unrecognised(_)
+            Recognition::Unrecognized(_)
         ));
     }
 
@@ -341,7 +341,7 @@ mod tests {
                 &shows(&corpus, &["Show Title Alpha", "Show Title Beta Gamma"]),
                 &corpus
             ),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: "Show Title".to_owned(),
                 best: Some(a_score(0.8)),
             })
@@ -349,14 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_score_is_no_score_rather_than_nought() {
-        // No candidate reached the scorer, so no comparison was made. Nought
+    fn nothing_to_score_is_no_score_rather_than_zero() {
+        // No candidate reached the scorer, so no comparison was made. Zero
         // would say one was made and the closest entry shared nothing.
         let corpus: Corpus = ["Show Title"].into_iter().collect();
 
         assert_eq!(
             by_score(&named("Show Title - 03.mkv"), &[], &corpus),
-            Recognition::Unrecognised(Refusal {
+            Recognition::Unrecognized(Refusal {
                 parsed: "Show Title".to_owned(),
                 best: None,
             })
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn the_name_is_scored_rather_than_the_title_the_parser_left() {
         // What this stage exists for. A title ends at the first thing the
-        // parser recognises, so this file reports `Show Title` and nothing of
+        // parser recognizes, so this file reports `Show Title` and nothing of
         // the subtitle after it. Judged on that title the series wins, and the
         // special it extends is never answered at all.
         let corpus: Corpus = ["Show Title", "Show Title Cour 2 The Subtitle"]
@@ -460,7 +460,7 @@ mod tests {
     fn nothing_was_scored(answer: &Recognition) -> bool {
         matches!(
             answer,
-            Recognition::Unrecognised(Refusal { best: None, .. })
+            Recognition::Unrecognized(Refusal { best: None, .. })
         )
     }
 
@@ -622,7 +622,7 @@ mod tests {
         assert!(
             matches!(
                 by_another_season,
-                Recognition::Unrecognised(Refusal { best, .. }) if best.is_some_and(|score| score.value() < NEAR_ENOUGH)
+                Recognition::Unrecognized(Refusal { best, .. }) if best.is_some_and(|score| score.value() < NEAR_ENOUGH)
             ),
             "the words of the other spelling were scored: {by_another_season:?}"
         );

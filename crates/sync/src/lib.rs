@@ -66,7 +66,7 @@ pub enum Error {
     Unreadable(#[source] BoxError),
 }
 
-/// A remote list a local record can be synchronised to.
+/// A remote list a local record can be synchronized to.
 ///
 /// Every call carries the deadline of the backend that makes it, and a
 /// service that never answers is an [`Error::Timeout`] once it has passed.

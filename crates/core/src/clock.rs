@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// A monotonic instant, measured from an unspecified epoch.
 ///
-/// Unlike [`std::time::Instant`] this is an ordinary value: it serialises, so a
+/// Unlike [`std::time::Instant`] this is an ordinary value: it serializes, so a
 /// recorded trace replays to exactly the state that was recorded. The epoch is
 /// arbitrary and only differences between timestamps are meaningful; comparing
 /// timestamps taken from two different [`Clock`] instances is not defined.
@@ -149,8 +149,8 @@ mod tests {
         clock.advance(Duration::from_micros(1_234_567));
         let stamp = clock.now();
 
-        let text = serde_json::to_string(&stamp).expect("serialise");
-        let back: Timestamp = serde_json::from_str(&text).expect("deserialise");
+        let text = serde_json::to_string(&stamp).expect("serialize");
+        let back: Timestamp = serde_json::from_str(&text).expect("deserialize");
 
         assert_eq!(stamp, back);
     }

@@ -30,7 +30,7 @@ use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
 use crate::ipc::Server;
 use crate::listing::{Listing, Reader, Source, Wakes};
-use crate::recognition::{Current, Decided, Recogniser};
+use crate::recognition::{Current, Decided, Recognizer};
 #[cfg(unix)]
 use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
 
@@ -88,7 +88,7 @@ pub mod voice;
 ///
 /// The store is opened by the caller for the same reason, and it outlives a
 /// restart of detection: a detection task that is started again knows nothing
-/// of the one before it and goes on from what that one kept. `recogniser` is
+/// of the one before it and goes on from what that one kept. `recognizer` is
 /// what a file's name is decided against until the list's task puts a list
 /// in its place, and `now` reads the time of day the store writes beside what
 /// it keeps. `accounts` carries out a login and a
@@ -112,7 +112,7 @@ pub mod voice;
 pub async fn run<W, B, F, T, S>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
-    recogniser: Recogniser,
+    recognizer: Recognizer,
     store: Arc<Mutex<Store>>,
     now: fn() -> SystemTime,
     period: Duration,
@@ -131,7 +131,7 @@ where
         bus: Arc::new(EventBus::new()),
         policy: Arc::new(RwLock::new(PolicyTable::allowing_video_players())),
         seen: Seen::new(),
-        recogniser: Current::new(recogniser),
+        recognizer: Current::new(recognizer),
         wakes: Wakes::new(),
         decided: Decided::new(),
         store,
@@ -150,7 +150,7 @@ where
         list.source,
         list.reading,
         Arc::clone(&wiring.store),
-        wiring.recogniser.clone(),
+        wiring.recognizer.clone(),
         wiring.wakes.clone(),
         list.say,
     ));

@@ -14,7 +14,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
 use benshi_core::policy::Policy;
-use benshi_core::recognise::parse::{Episode, Parsed};
+use benshi_core::recognize::parse::{Episode, Parsed};
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
@@ -23,7 +23,7 @@ use humantime::format_rfc3339_seconds;
 /// What is shown for a source that cannot name what it opened.
 ///
 /// A source that publishes no location gives recognition nothing but what the
-/// page or window calls itself. That is a different problem from recognising a
+/// page or window calls itself. That is a different problem from recognizing a
 /// filename, and a user deciding whether to allow such a source has to be told
 /// which one they are getting.
 const TITLE_ONLY: &str = "title only";
@@ -189,16 +189,16 @@ pub fn explanation(of: &Explanation) -> String {
 
 /// What recognition answered, as the lines below the parse.
 ///
-/// Each line ends in a newline, and a match takes two: what it was recognised
+/// Each line ends in a newline, and a match takes two: what it was recognized
 /// as, and the stage that decided.
 fn answer(of: &Outcome) -> String {
     match of {
-        Outcome::Recognised {
+        Outcome::Recognized {
             title,
             episode,
             stage,
         } => format!(
-            "recognised: \"{title}\", {}\nstage: {}\n",
+            "recognized: \"{title}\", {}\nstage: {}\n",
             episode_words(*episode),
             decided_by(stage)
         ),
@@ -209,11 +209,11 @@ fn answer(of: &Outcome) -> String {
                 .collect();
             format!("ambiguous: {}\n", quoted.join(", "))
         }
-        Outcome::Unrecognised { best: Some(score) } => {
-            format!("unrecognised: closest candidate scored {score:.2}\n")
+        Outcome::Unrecognized { best: Some(score) } => {
+            format!("unrecognized: closest candidate scored {score:.2}\n")
         }
-        Outcome::Unrecognised { best: None } => {
-            "unrecognised: nothing to score against\n".to_owned()
+        Outcome::Unrecognized { best: None } => {
+            "unrecognized: nothing to score against\n".to_owned()
         }
     }
 }
@@ -345,14 +345,14 @@ mod tests {
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
-    use benshi_core::recognise::altname::Assignment;
-    use benshi_core::recognise::parse::Episode;
+    use benshi_core::recognize::altname::Assignment;
+    use benshi_core::recognize::parse::Episode;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_daemon::bus::BusEvent;
     use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
-    use benshi_daemon::recognition::Recogniser;
+    use benshi_daemon::recognition::Recognizer;
     // The reason a failure carries comes from here in the daemon, so the tests
     // that check how one reads take it from here too rather than writing one.
     use benshi_detect::WatchError;
@@ -638,7 +638,7 @@ mod tests {
     /// the daemon would have decided about.
     fn explained(path: &[u8], outcome: Outcome) -> Explanation {
         let path = RawPath::from_bytes(path.to_vec());
-        let (spelled, _refused) = Recogniser::empty().decide(&path);
+        let (spelled, _refused) = Recognizer::empty().decide(&path);
 
         Explanation {
             player: PlayerId("mpv".to_owned()),
@@ -650,7 +650,7 @@ mod tests {
 
     /// A match of this title by this stage, at episode three.
     fn found(title: &str, stage: DecidedBy) -> Outcome {
-        Outcome::Recognised {
+        Outcome::Recognized {
             title: title.to_owned(),
             episode: Episode::Only(3),
             stage,
@@ -678,7 +678,7 @@ mod tests {
     fn an_explanation_names_the_player_and_the_file_first() {
         let shown = explanation(&explained(
             b"/anime/[Group] Show Title - 03.mkv",
-            Outcome::Unrecognised { best: None },
+            Outcome::Unrecognized { best: None },
         ));
 
         let first = shown.lines().next().expect("a first line");
@@ -696,7 +696,7 @@ mod tests {
         // the parser cut out of the title.
         let shown = explanation(&explained(
             b"[Group] Show Title S02E03 [1080p].mkv",
-            Outcome::Unrecognised { best: None },
+            Outcome::Unrecognized { best: None },
         ));
 
         let spelled = line_of(&shown, "spelled:");
@@ -710,7 +710,7 @@ mod tests {
     fn a_name_that_spelled_no_title_says_so() {
         let shown = explanation(&explained(
             b"/anime/ep 03.mkv",
-            Outcome::Unrecognised { best: None },
+            Outcome::Unrecognized { best: None },
         ));
 
         let spelled = line_of(&shown, "spelled:");
@@ -726,7 +726,7 @@ mod tests {
         // whether the guess was right.
         let shown = explanation(&explained(
             SHIFT_JIS_NAME,
-            Outcome::Unrecognised { best: None },
+            Outcome::Unrecognized { best: None },
         ));
 
         assert!(shown.contains("ソレッタ"), "the name was not read: {shown}");
@@ -757,7 +757,7 @@ mod tests {
         ));
 
         assert!(
-            line_of(&shown, "recognised:").contains("Kaguya-sama: Love is War -Ultra Romantic-"),
+            line_of(&shown, "recognized:").contains("Kaguya-sama: Love is War -Ultra Romantic-"),
             "{shown}"
         );
         let stage = line_of(&shown, "stage:");
@@ -835,22 +835,22 @@ mod tests {
         // absence says the list is.
         let close = explanation(&explained(
             b"Some Other Show - 03.mkv",
-            Outcome::Unrecognised { best: Some(0.4) },
+            Outcome::Unrecognized { best: Some(0.4) },
         ));
         let nothing = explanation(&explained(
             b"Some Other Show - 03.mkv",
-            Outcome::Unrecognised { best: None },
+            Outcome::Unrecognized { best: None },
         ));
 
         assert_eq!(
-            line_of(&close, "unrecognised:"),
-            "unrecognised: closest candidate scored 0.40"
+            line_of(&close, "unrecognized:"),
+            "unrecognized: closest candidate scored 0.40"
         );
-        let unscored = line_of(&nothing, "unrecognised:");
+        let unscored = line_of(&nothing, "unrecognized:");
         assert!(unscored.contains("nothing"), "{unscored}");
         assert!(
             !unscored.contains("0.00"),
-            "an absence rendered as a score of nought: {unscored}"
+            "an absence rendered as a score of zero: {unscored}"
         );
     }
 
@@ -867,18 +867,18 @@ mod tests {
         for (episode, words) in cases {
             let shown = explanation(&explained(
                 b"[Group] Show Title - 03.mkv",
-                Outcome::Recognised {
+                Outcome::Recognized {
                     title: "Show Title".to_owned(),
                     episode,
                     stage: DecidedBy::Key,
                 },
             ));
 
-            let recognised = line_of(&shown, "recognised:");
-            assert!(recognised.contains(words), "{recognised}");
+            let recognized = line_of(&shown, "recognized:");
+            assert!(recognized.contains(words), "{recognized}");
             assert!(
-                !recognised.contains("episode 0"),
-                "an absence rendered as a number: {recognised}"
+                !recognized.contains("episode 0"),
+                "an absence rendered as a number: {recognized}"
             );
         }
     }

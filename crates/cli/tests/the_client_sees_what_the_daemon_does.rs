@@ -31,7 +31,7 @@ use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
 use benshi_daemon::listing::Wakes;
-use benshi_daemon::recognition::{Current, Decided, Recogniser};
+use benshi_daemon::recognition::{Current, Decided, Recognizer};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use tempfile::TempDir;
@@ -154,7 +154,7 @@ impl Daemon {
                 bus: Arc::clone(&bus),
                 policy: Arc::clone(&policy),
                 seen: seen.clone(),
-                recogniser: Current::new(Recogniser::empty()),
+                recognizer: Current::new(Recognizer::empty()),
                 wakes: Wakes::new(),
                 decided: decided.clone(),
                 store: Arc::new(Mutex::new(store)),
@@ -240,7 +240,7 @@ async fn why_explains_the_reading_a_round_decided() {
     assert!(shown.contains(PLAYER), "{shown}");
     assert!(shown.contains("/anime/ep 03.mkv"), "{shown}");
     assert!(shown.contains("episode 3"), "{shown}");
-    assert!(shown.contains("unrecognised"), "{shown}");
+    assert!(shown.contains("unrecognized"), "{shown}");
 }
 
 #[tokio::test]

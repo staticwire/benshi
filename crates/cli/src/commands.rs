@@ -262,7 +262,7 @@ async fn login(
     // Nothing typed was shown, the end of the line included.
     writeln!(err).context("prompt could not be printed")?;
     let token = match typed.context("token could not be read")? {
-        Typed::Cancelled => bail!("login cancelled"),
+        Typed::Canceled => bail!("login canceled"),
         Typed::Line(line) => line.secret().trim().to_owned(),
     };
     if token.is_empty() {
@@ -531,7 +531,7 @@ mod tests {
     use benshi_daemon::ipc::{Server, bind};
     use benshi_daemon::listing::Wakes;
     use benshi_daemon::protocol::{Request, Response};
-    use benshi_daemon::recognition::{Decided, Decision, Recogniser};
+    use benshi_daemon::recognition::{Decided, Decision, Recognizer};
     use benshi_daemon::secrets;
     use benshi_daemon::supervisor::TaskError;
     use socket2::{Domain, SockAddr, Socket, Type};
@@ -834,7 +834,7 @@ mod tests {
         /// round would.
         fn has_decided(&self, name: &str) {
             let path = RawPath::from_bytes(name.as_bytes().to_vec());
-            let (parsed, answer) = Recogniser::empty().decide(&path);
+            let (parsed, answer) = Recognizer::empty().decide(&path);
 
             self.decided.record(Decision {
                 player: PlayerId(PLAYER.to_owned()),
@@ -1028,7 +1028,7 @@ mod tests {
 
     /// One answer as the daemon writes it: a line, newline included.
     fn line_of(answer: &Response) -> Vec<u8> {
-        let mut line = serde_json::to_vec(answer).expect("serialise");
+        let mut line = serde_json::to_vec(answer).expect("serialize");
         line.push(b'\n');
 
         line
@@ -1306,7 +1306,7 @@ mod tests {
         assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
         assert!(shown.contains(PLAYER), "{shown}");
         assert!(shown.contains("\"Show Title\""), "{shown}");
-        assert!(shown.contains("unrecognised"), "{shown}");
+        assert!(shown.contains("unrecognized"), "{shown}");
         assert!(complained.is_empty(), "{complained}");
     }
 
@@ -2124,7 +2124,7 @@ mod tests {
         // nothing on the one it was written for.
         assert!(
             !shown.contains("more than it can replay"),
-            "a recording of a declared source apologised for an undeclared one: {shown:?}"
+            "a recording of a declared source apologized for an undeclared one: {shown:?}"
         );
         assert_eq!(caught.snapshots, vec![a_reading(0)]);
         let text = std::fs::read_to_string(&output).expect("a trace was written");
@@ -2173,7 +2173,7 @@ mod tests {
         // carry the caveat, or the caveat says nothing when it does appear.
         assert!(
             !shown.contains(ENDED_EARLY),
-            "a complete recording apologised for ending early: {shown:?}"
+            "a complete recording apologized for ending early: {shown:?}"
         );
         assert!(
             shown.contains(&output.display().to_string()),
@@ -2451,19 +2451,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_login_cancelled_at_the_prompt_is_no_login() {
+    async fn a_login_canceled_at_the_prompt_is_no_login() {
         let daemon = Daemon::logging_in(Logins::default());
 
         let (outcome, shown, complained) = timeout(
             PATIENCE,
-            go_typing(Command::Login, &daemon.socket, Typed::Cancelled),
+            go_typing(Command::Login, &daemon.socket, Typed::Canceled),
         )
         .await
         .expect("the client ended");
 
         assert_eq!(outcome, ExitCode::FAILURE);
         assert!(shown.is_empty(), "{shown}");
-        assert_eq!(complained, format!("{ASKED}benshi: login cancelled\n"));
+        assert_eq!(complained, format!("{ASKED}benshi: login canceled\n"));
         assert!(daemon.accounts.asked().is_empty());
     }
 

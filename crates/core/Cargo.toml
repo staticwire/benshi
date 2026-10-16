@@ -16,7 +16,7 @@ workspace = true
 # direct runtime dependency, `regex` without its Unicode tables, which brings
 # `aho-corasick`, `memchr`, `regex-automata` and `regex-syntax` with it. All of
 # them are Rust, so nothing C arrives and this crate stays free of platform
-# code. MPL-2.0, the only non-permissive licence in the graph; section 3.3
+# code. MPL-2.0, the only non-permissive license in the graph; section 3.3
 # permits a Larger Work under other terms, so benshi stays MIT.
 anitomy-ng = "1.0.10"
 chardetng = "1.0.0"

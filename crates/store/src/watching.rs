@@ -97,7 +97,7 @@ impl Store {
     /// [`Error::Busy`] when the database cannot be read because another
     /// connection has it, which in WAL a connection that writes to it does
     /// not cause. [`Error::Write`] when the row cannot be read for any other
-    /// reason, a total below nought included. [`Error::Media`] for a row
+    /// reason, a total below zero included. [`Error::Media`] for a row
     /// whose media is not a path as this store writes one.
     pub fn resume(&self, show: ShowId, episode: Option<u32>) -> Result<Option<Kept>, Error> {
         let row = self
@@ -740,8 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn a_total_below_nought_is_refused() {
-        // Only a hand writes one, and neither nought nor its size is a
+    fn a_total_below_zero_is_refused() {
+        // Only a hand writes one, and neither zero nor its size is a
         // total anybody watched.
         let (_home, mut store) = a_store();
         store

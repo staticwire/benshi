@@ -1,7 +1,7 @@
 //! Reading the list, and what a round decides against.
 //!
 //! The list's task reads the account's list from AniList, files it in the
-//! store, and puts a recogniser of it in place of the one the rounds decide
+//! store, and puts a recognizer of it in place of the one the rounds decide
 //! against. It reads at the times `[list]` names: as the daemon starts, every
 //! `refresh`, and where a round decided that a name spelling a title is not
 //! on the list, at most once in `on_miss`. A login wakes it at once.
@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use benshi_core::ShowId;
 use benshi_core::list::Entry;
-use benshi_core::recognise::altname::Altnames;
-use benshi_core::recognise::corpus::Corpus;
+use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::corpus::Corpus;
 use benshi_core::token::Token;
 use benshi_store::Store;
 #[cfg(target_os = "linux")]
@@ -35,7 +35,7 @@ use tokio::time::Instant;
 
 use crate::config::{Period, Reading};
 use crate::detection::POISONED_STORE;
-use crate::recognition::{Current, Recogniser};
+use crate::recognition::{Current, Recognizer};
 use crate::secrets::{self, ANILIST};
 #[cfg(target_os = "linux")]
 use crate::secrets::{Asking, SecretService, Secrets};
@@ -148,24 +148,24 @@ pub struct Listing<S> {
     pub say: Say,
 }
 
-/// A recogniser of these shows of a list and their entries.
+/// A recognizer of these shows of a list and their entries.
 #[must_use]
-pub fn recogniser_of(listed: &[(ShowId, Entry)]) -> Recogniser {
+pub fn recognizer_of(listed: &[(ShowId, Entry)]) -> Recognizer {
     let mut corpus = Corpus::new();
     for (show, entry) in listed {
         corpus.file(*show, &entry.title, &entry.spellings);
     }
 
-    Recogniser::of(corpus, Altnames::new())
+    Recognizer::of(corpus, Altnames::new())
 }
 
-/// A recogniser of the list the store holds.
+/// A recognizer of the list the store holds.
 ///
 /// # Errors
 ///
 /// What [`Store::listed`] fails with.
-pub fn kept(store: &Store) -> Result<Recogniser, benshi_store::Error> {
-    store.listed(BACKEND).map(|listed| recogniser_of(&listed))
+pub fn kept(store: &Store) -> Result<Recognizer, benshi_store::Error> {
+    store.listed(BACKEND).map(|listed| recognizer_of(&listed))
 }
 
 /// The list's task: what it reads from, when, and where it puts what it read.
@@ -264,7 +264,7 @@ impl<S: Source + Sync> Reader<S> {
         }
     }
 
-    /// Read the token and the list, file the list and put a recogniser of
+    /// Read the token and the list, file the list and put a recognizer of
     /// it in place, and say what came of it. `wait` is how long a failure
     /// waits before the reading is tried again.
     async fn read(&self, said: &mut Option<String>, wait: Duration) -> Outcome {
@@ -285,8 +285,8 @@ impl<S: Source + Sync> Reader<S> {
             Ok(entries) => {
                 let count = entries.len();
                 match self.filed(entries).await {
-                    Ok(recogniser) => {
-                        self.current.replace(recogniser);
+                    Ok(recognizer) => {
+                        self.current.replace(recognizer);
                         *said = None;
                         let entries = if count == 1 { "entry" } else { "entries" };
                         (self.say)(&format!("AniList list read: {count} {entries}"));
@@ -319,9 +319,9 @@ impl<S: Source + Sync> Reader<S> {
         }
     }
 
-    /// File `entries` as the list, and answer with a recogniser of what the
+    /// File `entries` as the list, and answer with a recognizer of what the
     /// store then holds, or with why it could not be kept.
-    async fn filed(&self, entries: Vec<Entry>) -> Result<Recogniser, String> {
+    async fn filed(&self, entries: Vec<Entry>) -> Result<Recognizer, String> {
         let store = Arc::clone(&self.store);
         let filing = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().expect(POISONED_STORE);
@@ -331,7 +331,7 @@ impl<S: Source + Sync> Reader<S> {
 
         match filing.await {
             Ok(listed) => listed
-                .map(|listed| recogniser_of(&listed))
+                .map(|listed| recognizer_of(&listed))
                 .map_err(|unkept| unkept.to_string()),
             // Handed on as it was raised.
             Err(panicked) if panicked.is_panic() => {
@@ -385,16 +385,16 @@ mod tests {
 
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
-    use benshi_core::recognise::Recognition;
+    use benshi_core::recognize::Recognition;
     use benshi_core::token::Token;
     use benshi_store::Store;
     use tempfile::TempDir;
     use tokio::task::JoinHandle;
     use tokio::time::Instant;
 
-    use super::{BACKEND, FIRST_RETRY, LAST_RETRY, Reader, Source, Wakes, kept, recogniser_of};
+    use super::{BACKEND, FIRST_RETRY, LAST_RETRY, Reader, Source, Wakes, kept, recognizer_of};
     use crate::config::{Period, Reading};
-    use crate::recognition::{Current, Recogniser};
+    use crate::recognition::{Current, Recognizer};
     use crate::secrets;
     use crate::supervisor::TaskError;
 
@@ -427,12 +427,12 @@ mod tests {
         ]
     }
 
-    /// Whether `recogniser` recognises a file of this title as it.
-    fn recognises(recogniser: &Recogniser, title: &str) -> bool {
+    /// Whether `recognizer` recognizes a file of this title as it.
+    fn recognizes(recognizer: &Recognizer, title: &str) -> bool {
         let path = RawPath::from_bytes(format!("[Group] {title} - 03.mkv").into_bytes());
         matches!(
-            recogniser.decide(&path).1,
-            Recognition::Recognised(found) if found.title == title
+            recognizer.decide(&path).1,
+            Recognition::Recognized(found) if found.title == title
         )
     }
 
@@ -565,7 +565,7 @@ mod tests {
 
     fn running(home: TempDir, store: Store, reading: Reading, source: Scripted) -> Running {
         let store = Arc::new(Mutex::new(store));
-        let current = Current::new(Recogniser::empty());
+        let current = Current::new(Recognizer::empty());
         let wakes = Wakes::new();
         let said = Arc::new(Mutex::new(Vec::new()));
         let source = Arc::new(source);
@@ -610,7 +610,7 @@ mod tests {
     const NOW: Duration = Duration::from_millis(1);
 
     #[test]
-    fn a_recogniser_of_a_list_recognises_each_entry_under_each_spelling() {
+    fn a_recognizer_of_a_list_recognizes_each_entry_under_each_spelling() {
         let listed: Vec<_> = the_list()
             .into_iter()
             .enumerate()
@@ -626,29 +626,29 @@ mod tests {
         // the entry only where its spellings are filed.
         spelled[0].1.spellings = vec!["Kotonaru Namae".to_owned()];
 
-        let recogniser = recogniser_of(&listed);
-        let spelled = recogniser_of(&spelled);
+        let recognizer = recognizer_of(&listed);
+        let spelled = recognizer_of(&spelled);
 
-        assert!(recognises(&recogniser, "Show Title"));
-        assert!(recognises(&recogniser, "Another Show"));
+        assert!(recognizes(&recognizer, "Show Title"));
+        assert!(recognizes(&recognizer, "Another Show"));
         let (_parsed, answer) = spelled.decide(&RawPath::from_bytes(
             b"[Group] Kotonaru Namae - 03.mkv".to_vec(),
         ));
         assert!(
-            matches!(&answer, Recognition::Recognised(found) if found.title == "Show Title"),
+            matches!(&answer, Recognition::Recognized(found) if found.title == "Show Title"),
             "{answer:?}"
         );
     }
 
     #[test]
-    fn a_recogniser_of_the_store_holds_the_list_filed_there() {
+    fn a_recognizer_of_the_store_holds_the_list_filed_there() {
         let home = tempfile::tempdir().expect("a directory of our own");
         let mut store = Store::open(&home.path().join("benshi.db")).expect("the database opens");
         store.file(BACKEND, &the_list()).expect("the list is filed");
 
-        let recogniser = kept(&store).expect("the list reads");
+        let recognizer = kept(&store).expect("the list reads");
 
-        assert!(recognises(&recogniser, "Show Title"));
+        assert!(recognizes(&recognizer, "Show Title"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(running.reads(), [Duration::ZERO]);
         assert_eq!(running.filed(), ["Show Title", "Another Show"]);
         assert_eq!(running.said(), ["AniList list read: 2 entries"]);
-        assert!(recognises(&running.current.now(), "Show Title"));
+        assert!(recognizes(&running.current.now(), "Show Title"));
     }
 
     #[tokio::test(start_paused = true)]
