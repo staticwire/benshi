@@ -6,11 +6,11 @@
 //! never counts on a socket of its own being gone the moment it lets go of it.
 
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
@@ -45,6 +45,9 @@ const STARTED: &str = "benshi: recording in ";
 #[allow(dead_code)]
 pub const NO_SETTINGS: &str = "benshi: default settings: no configuration directory: no absolute \
                                path in `XDG_CONFIG_HOME` or `HOME`";
+
+/// Settings that read the list at no time.
+const READING_NOTHING: &str = "[list]\nrefresh = \"off\"\nat_start = false\non_miss = \"off\"\n";
 
 /// The flag that asks for a daemon without a tray icon.
 pub const NO_TRAY: &str = "--no-tray";
@@ -264,6 +267,24 @@ impl Directory {
     pub fn path(&self) -> &Path {
         self.0.path()
     }
+}
+
+/// A configuration directory in `temporary`, for `XDG_CONFIG_HOME`, whose
+/// settings read the list at no time.
+///
+/// On the defaults the list's task reads the list as the daemon starts and
+/// says what came of it. That line comes from a task of its own, in no set
+/// order with what is said of detection, so a test that reads the lines after
+/// the start by their place cannot count on any of them.
+// Dead in a test binary that keeps no daemon from reading the list.
+#[allow(dead_code)]
+pub fn reading_nothing(temporary: &Path) -> PathBuf {
+    let config = temporary.join("config");
+    fs::create_dir_all(config.join("benshi")).expect("a configuration directory");
+    fs::write(config.join("benshi").join("config.toml"), READING_NOTHING)
+        .expect("a file of settings");
+
+    config
 }
 
 /// A stream that is full, and the end of it that nobody reads.

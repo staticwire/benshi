@@ -10,7 +10,8 @@
 //! the other end and does not read it. A service of systemd has a stream
 //! socket for its stderr. The session bus is a socket of the test's that lets
 //! a connection in and lets go of it, so an attempt of detection is a
-//! connection the test counts.
+//! connection the test counts. The settings of that daemon read the list at
+//! no time, so the list's task makes no connection of its own.
 
 #![cfg(target_os = "linux")]
 
@@ -25,7 +26,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    Daemon, Directory, NO_SOURCE, NO_TRAY, PATIENCE, SUCCEEDED, nobody_reads, sources_of,
+    Daemon, Directory, NO_SOURCE, NO_TRAY, PATIENCE, SUCCEEDED, nobody_reads, reading_nothing,
+    sources_of,
 };
 
 /// How many times detection has reached for the session bus once it has been
@@ -163,6 +165,7 @@ fn a_daemon_on_the_fallback_that_nobody_reads_answers_a_client() {
 fn a_daemon_nobody_reads_starts_detection_again() {
     let temporary = Directory::of("u-again");
     let runtime = temporary.path().join("run");
+    let config = reading_nothing(temporary.path());
     let data = temporary.path().join("data");
     let bus = Bus::at(&temporary.path().join("bus"));
     let (_unread, stderr) = nobody_reads();
@@ -170,6 +173,7 @@ fn a_daemon_nobody_reads_starts_detection_again() {
         &[OsStr::new(NO_TRAY)],
         &[
             ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+            ("XDG_CONFIG_HOME", config.as_os_str()),
             ("BENSHI_DATA_DIR", data.as_os_str()),
             ("DBUS_SESSION_BUS_ADDRESS", bus.address.as_os_str()),
         ],
