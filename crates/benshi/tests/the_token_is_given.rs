@@ -11,21 +11,14 @@
 mod common;
 
 use std::ffi::OsStr;
-use std::fs;
 use std::path::Path;
 
-use common::{Daemon, Directory};
-
-/// The settings of a daemon that reads the list at no time.
-const READING_NOTHING: &str = "[list]\nrefresh = \"off\"\nat_start = false\non_miss = \"off\"\n";
+use common::{Daemon, Directory, reading_nothing};
 
 /// A session of its own in `temporary`, with settings that read the list at
 /// no time.
 fn a_session(temporary: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
-    let config = temporary.join("config");
-    fs::create_dir_all(config.join("benshi")).expect("a configuration directory");
-    fs::write(config.join("benshi").join("config.toml"), READING_NOTHING)
-        .expect("a file of settings");
+    let config = reading_nothing(temporary);
 
     vec![
         ("XDG_RUNTIME_DIR", temporary.join("run").into_os_string()),

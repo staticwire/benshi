@@ -5,7 +5,9 @@
 //! happens.
 //!
 //! The binary itself is run, in a session the test chose. No session bus is
-//! there, so the first attempt of detection fails in a way that passes.
+//! there, so the first attempt of detection fails in a way that passes. The
+//! settings read the list at no time, so every line said after the start is
+//! said of detection.
 
 #![cfg(target_os = "linux")]
 
@@ -13,7 +15,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Daemon, Directory};
+use common::{Daemon, Directory, reading_nothing};
 
 /// What the daemon says of the first attempt of detection in a session with
 /// no session bus, up to the reason.
@@ -27,9 +29,11 @@ const SAID_TWICE: Duration = Duration::from_secs(2);
 fn the_daemon_says_that_detection_is_started_again() {
     let temporary = Directory::of("t-again");
     let runtime = temporary.path().join("run");
+    let config = reading_nothing(temporary.path());
     let data = temporary.path().join("data");
     let daemon = Daemon::start(&[
         ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+        ("XDG_CONFIG_HOME", config.as_os_str()),
         ("BENSHI_DATA_DIR", data.as_os_str()),
     ]);
     let started = daemon.says();
@@ -50,10 +54,12 @@ fn a_daemon_that_cannot_say_it_goes_on_running() {
     // one it cannot write.
     let temporary = Directory::of("t-unheard");
     let runtime = temporary.path().join("run");
+    let config = reading_nothing(temporary.path());
     let data = temporary.path().join("data");
     let mut daemon = Daemon::heard_for(
         &[
             ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+            ("XDG_CONFIG_HOME", config.as_os_str()),
             ("BENSHI_DATA_DIR", data.as_os_str()),
         ],
         4,
