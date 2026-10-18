@@ -17,6 +17,9 @@ benshi-sinks = { path = "../sinks" }
 benshi-store = { path = "../store" }
 benshi-sync = { path = "../sync" }
 humantime = "2.4.0"
+# The day of a viewing in a time zone, by the rules that zone had on that
+# date.
+jiff = "0.2.38"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 socket2 = "0.6.5"
