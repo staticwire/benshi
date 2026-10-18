@@ -1,7 +1,8 @@
 //! The recording, from the file to what a store is asked to do.
 //!
 //! Through the public API alone: parse a trace, decide each reading's file
-//! against a list, hand both to a session, and read what it answers.
+//! against a list, settle it by the list's facts, hand both to a session, and
+//! read what it answers.
 //!
 //! The recording is sixty readings of one mpv playing one episode, with a
 //! pause of twenty seconds in it. It holds thirty-nine seconds of playback
@@ -11,13 +12,13 @@
 
 use std::time::Duration;
 
-use benshi_core::path::RawPath;
 use benshi_core::recognize::altname::Altnames;
 use benshi_core::recognize::corpus::Corpus;
 use benshi_core::recognize::index::Index;
-use benshi_core::recognize::parse::{Episode, parse};
-use benshi_core::recognize::{Match, Recognition, Stage, decide};
+use benshi_core::recognize::parse::Episode;
+use benshi_core::recognize::{Match, Recognition, Stage, read_file};
 use benshi_core::session::{Effect, Session};
+use benshi_core::settle::{Facts, Settled, settle};
 use benshi_core::timeline::{WATCHED_MINIMUM, WATCHED_PERCENT_MIN, WatchedPolicy};
 use benshi_core::trace::Trace;
 use benshi_core::{MediaRef, PlayerSnapshot, ShowId};
@@ -43,16 +44,28 @@ fn recording() -> Vec<PlayerSnapshot> {
 }
 
 /// What recognition answers for the file a reading names, against a list
-/// holding the title.
-fn decided(reading: &PlayerSnapshot) -> Recognition {
+/// holding the title as a series of episodes as long as the file, and what
+/// the list's facts settle of it.
+fn decided(reading: &PlayerSnapshot) -> (Recognition, Settled) {
     let MediaRef::LocalFile(path) = &reading.media else {
         panic!("the recording plays a file")
     };
     let mut list = Corpus::new();
     list.file(SHOW, TITLE, Vec::<&str>::new());
-    let name = RawPath::from_bytes(path.file_name().to_vec());
+    list.file_facts(
+        SHOW,
+        Facts {
+            episodes: Some(12),
+            episode_length: Some(Duration::from_secs(600)),
+            year: None,
+            released: true,
+            format: None,
+        },
+    );
+    let (spelled, answer) = read_file(path, &Altnames::new(), &list, &Index::of(&list));
+    let settled = settle(&answer, &spelled, reading, &list);
 
-    decide(&parse(&name), &Altnames::new(), &list, &Index::of(&list))
+    (answer, settled)
 }
 
 #[test]
@@ -67,12 +80,18 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
     let readings = recording();
     assert_eq!(
         decided(&readings[0]),
-        Recognition::Recognized(Match {
-            show: SHOW,
-            title: TITLE.to_owned(),
-            episode: Episode::Only(3),
-            stage: Stage::Key,
-        })
+        (
+            Recognition::Recognized(Match {
+                show: SHOW,
+                title: TITLE.to_owned(),
+                episode: Episode::Only(3),
+                stage: Stage::Key,
+            }),
+            Settled::Stands {
+                show: SHOW,
+                episode: Episode::Only(3),
+            }
+        )
     );
     let loosest = WatchedPolicy::new(WATCHED_PERCENT_MIN, WATCHED_MINIMUM)
         .expect("the smallest percentage and the smallest fallback are in range");
@@ -81,7 +100,8 @@ fn the_recording_is_kept_interval_by_interval_and_never_recorded() {
     let mut kept = Vec::new();
     let mut recorded = 0;
     for reading in &readings {
-        for effect in session.advance(reading, Some(&decided(reading))) {
+        let (_, settled) = decided(reading);
+        for effect in session.advance(reading, Some(&settled)) {
             match effect {
                 Effect::Resume { question, .. } => session.resumed(question, None),
                 Effect::Keep { watched, .. } => kept.push(watched),

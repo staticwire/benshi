@@ -19,6 +19,7 @@
 
 mod list;
 mod migrate;
+mod names;
 pub mod queue;
 mod record;
 pub mod watching;
@@ -138,6 +139,16 @@ pub enum Error {
         backend: String,
         /// The entry the row is of.
         entry: EntryId,
+    },
+    /// A row of `names` whose letters or marks
+    /// [`Key::from_parts`](benshi_core::recognize::normalize::Key::from_parts)
+    /// refuses: no letters, or a character it does not take in one of them.
+    ///
+    /// The crate writes a key's own parts, so one is left by `sqlite3` alone.
+    #[error("name kept for show {} holds no key", .show.0)]
+    Name {
+        /// The show the row is kept for.
+        show: ShowId,
     },
     /// A row of `watching` whose media is not a path as this crate writes
     /// one: a per-cent sign with no two hexadecimal digits after it.

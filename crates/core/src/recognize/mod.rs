@@ -3,8 +3,10 @@
 //! The pipeline has four stages: a mapping the user made by hand, an exact match
 //! on a normalized key, a token index that narrows the corpus to a handful, and
 //! a score over what is left. **Only three of them can answer.** The index
-//! decides nothing - it hands candidates to the scorer - so [`Stage`] has three
-//! variants and not four. Why they run in that order is written on [`Stage`].
+//! decides nothing: it hands candidates to the scorer. So three variants of
+//! [`Stage`] are stages of the pipeline, and the fourth, [`Stage::Unlisted`],
+//! is what the daemon answers for a name the pipeline refused. Why they run in
+//! that order is written on [`Stage`].
 //!
 //! The answer is defined for every stage, so that each one is written against a
 //! shape that already has to explain itself. [`by_key`] is the only stage here
@@ -22,11 +24,12 @@ pub mod parse;
 pub mod score;
 
 use crate::ShowId;
+use crate::path::RawPath;
 use crate::recognize::altname::{Altnames, Assignment};
 use crate::recognize::corpus::Corpus;
 use crate::recognize::index::Index;
-use crate::recognize::normalize::Key;
-use crate::recognize::parse::{Episode, Parsed};
+use crate::recognize::normalize::{Key, without_type_words};
+use crate::recognize::parse::{Episode, Kind, Parsed, kind_of, parse};
 use crate::recognize::score::by_score;
 
 /// What the stages answer, in the order they are asked.
@@ -52,6 +55,189 @@ pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Ind
                 .map_or_else(Vec::new, |title| index.candidates(title));
             by_score(parsed, &candidates, corpus)
         })
+}
+
+/// Decide a name, and read it another way where neither an assignment nor
+/// the key answers the title as parsed.
+///
+/// `Show Title 13.mkv` reads as the title `Show Title` and episode 13. Where
+/// neither an assignment nor the key answers that title, and an assignment
+/// or the list holds `Show Title 13`, the name is that work with no episode.
+/// The words after the number then belong to the title too, so
+/// `Show Title 13 - The Subtitle` reaches only the entry that spells all of
+/// it. Only spaces and underscores may part the title from the number, so
+/// `Show Title - 13` stays the thirteenth episode whatever the list holds.
+/// In the same way `01 Show Title.mkv` is episode one of `Show Title` where
+/// the list answers that and not `01 Show Title`.
+///
+/// Where no other reading is answered either, the name is decided as the
+/// parser read it. The other readings are asked of the assignments and the
+/// key, and before the scorer is asked of the title as parsed: against a
+/// list holding `Show Title 13` alone, the scorer answers `Show Title` as
+/// its thirteenth episode.
+///
+/// Answers with the parse the answer was decided by.
+#[must_use]
+pub fn read(
+    parsed: Parsed,
+    altnames: &Altnames,
+    corpus: &Corpus,
+    index: &Index,
+) -> (Parsed, Recognition) {
+    if by_altname(&parsed, altnames).is_none() && by_key(&parsed, corpus).is_none() {
+        for other in other_readings(&parsed) {
+            let answer = by_altname(&other, altnames)
+                .map(Recognition::Recognized)
+                .or_else(|| by_key(&other, corpus));
+            if let Some(answer) = answer {
+                return (other, answer);
+            }
+        }
+    }
+    let answer = decide(&parsed, altnames, corpus, index);
+    (parsed, answer)
+}
+
+/// The readings a parse keeps beside its own: its title read on through its
+/// number, and the episode it begins with as an episode of the show the
+/// words after it name.
+fn other_readings(parsed: &Parsed) -> impl Iterator<Item = Parsed> {
+    let reading = |title: String, episode: Episode| Parsed {
+        title: Some(title),
+        episode,
+        title_with_number: None,
+        episode_first: None,
+        ..parsed.clone()
+    };
+    let read_on = parsed
+        .title_with_number
+        .clone()
+        .map(|title| reading(title, Episode::Absent));
+    let first = parsed
+        .episode_first
+        .clone()
+        .map(|(episode, title)| reading(title, Episode::Only(episode)));
+
+    read_on.into_iter().chain(first)
+}
+
+/// Decide a file by its name, and by the directories above it where the name
+/// reaches nothing and may not spell its show: it spells an episode but no
+/// title, or begins with its episode as [`Parsed::episode_first`] reads one.
+///
+/// [`read`] decides the name alone. A directory is not part of what a
+/// release spells, and one named after another show would carry that show's
+/// words into the name, so a name that spells a title and an episode, as
+/// `Show Title - 03.mkv`, is never read against its directory. A name that
+/// begins with its episode may not spell its show at all:
+/// `01 Quiet Harbor.mkv` and `01 - Quiet Harbor.mkv` are episode one, and
+/// the show is in the directory, as `Show Title/01 Quiet Harbor.mkv`.
+///
+/// The directories are read from the file up. A directory is a part of the
+/// show above it where it spells no title, as `Season 2`, a type word alone,
+/// as `Specials`, or a number the parser reads as an episode, as `Disc 1`.
+/// Such a directory gives the reading the season, the part and the type it
+/// spells, where the name and the directories below it spell none. The first
+/// directory that names a show is decided with the file's episode, and the
+/// walk ends there. A directory the parser reads as a title and a number, as
+/// `Show Title 13`, is a show where the list answers it and a part of one
+/// where it does not. A path through `..` ends the walk there, because the
+/// name of the directory it leads to is not in the path.
+///
+/// Where that show reaches nothing either, the directory's reading is
+/// answered, with its refusal, only where the directory names a release: it
+/// spells a season, a year, a release group or a type. A directory of a
+/// title alone, as `video`, can hold many shows, so the name is then
+/// answered as it spells itself.
+#[must_use]
+pub fn read_file(
+    path: &RawPath,
+    altnames: &Altnames,
+    corpus: &Corpus,
+    index: &Index,
+) -> (Parsed, Recognition) {
+    let name = parse(&RawPath::from_bytes(path.file_name().to_vec()));
+    let episode = match &name.episode_first {
+        Some((episode, _)) => Episode::Only(*episode),
+        None if name.title.is_none() && name.episode != Episode::Absent => name.episode,
+        None => return read(name, altnames, corpus, index),
+    };
+
+    let (parsed, answer) = read(name, altnames, corpus, index);
+    if !matches!(answer, Recognition::Unrecognized(_)) {
+        return (parsed, answer);
+    }
+    by_directory(path, &parsed, episode, altnames, corpus, index).unwrap_or((parsed, answer))
+}
+
+/// The show a directory above the file names, decided with the file's
+/// episode, as [`read_file`] says.
+fn by_directory(
+    path: &RawPath,
+    name: &Parsed,
+    episode: Episode,
+    altnames: &Altnames,
+    corpus: &Corpus,
+    index: &Index,
+) -> Option<(Parsed, Recognition)> {
+    let mut season = name.season;
+    let mut part = name.part;
+    let mut kind = name.kind;
+    let mut directory = path.parent();
+
+    while let Some(here) = directory {
+        directory = here.parent();
+        match here.file_name() {
+            b".." => return None,
+            b"." => continue,
+            _ => {}
+        }
+        let spelled = parse(&RawPath::from_bytes(here.file_name().to_vec()));
+        let type_alone = spelled
+            .title
+            .as_deref()
+            .is_some_and(|title| title.split_whitespace().all(|word| kind_of(word).is_some()));
+
+        if !type_alone && let Some(title) = spelled.title.clone() {
+            let as_show = |title: String| Parsed {
+                title: Some(title),
+                episode,
+                season: season.or(spelled.season),
+                part: part.or(spelled.part),
+                year: name.year.or(spelled.year),
+                kind: kind.or(spelled.kind),
+                title_with_number: None,
+                episode_first: None,
+                from_directory: true,
+                release_group: name.release_group.clone(),
+                confidence: spelled.confidence,
+                text: spelled.text.clone(),
+            };
+            if spelled.episode == Episode::Absent {
+                let show = as_show(title);
+                let answer = decide(&show, altnames, corpus, index);
+                let names_a_release = spelled.season.is_some()
+                    || spelled.year.is_some()
+                    || spelled.release_group.is_some()
+                    || spelled.kind.is_some();
+                return (names_a_release || !matches!(answer, Recognition::Unrecognized(_)))
+                    .then_some((show, answer));
+            }
+            if let Some(numbered) = spelled.title_with_number.clone() {
+                let show = as_show(numbered);
+                let answer = decide(&show, altnames, corpus, index);
+                if !matches!(answer, Recognition::Unrecognized(_)) {
+                    return Some((show, answer));
+                }
+            }
+        }
+
+        season = season.or(spelled.season);
+        part = part.or(spelled.part);
+        kind = kind.or(spelled.kind);
+    }
+
+    None
 }
 
 /// The entry the user named this file's spelling, where they named one.
@@ -90,8 +276,21 @@ pub fn by_altname(parsed: &Parsed, altnames: &Altnames) -> Option<Match> {
 #[must_use]
 pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
     let spelled = parsed.title.as_deref()?;
-    let candidates: Vec<Candidate> = corpus
-        .candidates(&Key::from_parsed(parsed)?)
+    let key = Key::from_parsed(parsed)?;
+    let mut shows = reached_by(&key, parsed.kind, corpus);
+    if shows.is_empty()
+        && parsed.kind.is_some()
+        && let Some((title, _)) = without_type_words(spelled)
+        && let Some(untyped) = Key::from_parsed(&Parsed {
+            title: Some(title),
+            ..parsed.clone()
+        })
+    {
+        // The parser leaves a type word in a title that no season ends, as
+        // in `Show Title OVA - 01`, where a list spells `Show Title (OVA)`.
+        shows = reached_by(&untyped, parsed.kind, corpus);
+    }
+    let candidates: Vec<Candidate> = shows
         .into_iter()
         .map(|show| Candidate {
             show,
@@ -112,6 +311,21 @@ pub fn by_key(parsed: &Parsed, corpus: &Corpus) -> Option<Recognition> {
             candidates,
         })),
     }
+}
+
+/// The entries a key reaches, in the order they were filed, and after them
+/// those it reaches through a spelling that held a type word of the kind the
+/// name spells, in the order those were filed.
+fn reached_by(key: &Key, kind: Option<Kind>, corpus: &Corpus) -> Vec<ShowId> {
+    let mut shows = corpus.candidates(key);
+    if let Some(kind) = kind {
+        for show in corpus.typed_candidates(kind, key) {
+            if !shows.contains(&show) {
+                shows.push(show);
+            }
+        }
+    }
+    shows
 }
 
 /// How well a candidate title matched, from nothing to exactly.
@@ -171,18 +385,30 @@ pub enum Stage {
     /// would read as the worst possible match and one as a perfect comparison
     /// that never happened; both are false of an exact match.
     Scored(Score),
+    /// A name the list does not hold, kept by its exact key as a show of its
+    /// own. The show is filed the first time the key is seen and found by
+    /// the key every time after.
+    ///
+    /// Asked after every stage of the list has refused the name, by the key
+    /// alone: the scorer never compares a name with one of these, so a name
+    /// that is close to one is a show of its own.
+    Unlisted,
 }
 
 /// A filename that was recognized.
 ///
 /// The show is the corpus entry that matched, rather than the text the filename
 /// spelled. A [`Refusal`] carries that second thing, and confusing the two is how
-/// a near miss gets written down as a title.
+/// a near miss gets written down as a title. Under [`Stage::Unlisted`] the show
+/// is one kept for a name the list does not hold, and the title is the name's
+/// own spelling.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
-    /// The show the corpus filed the entry as.
+    /// The show the corpus filed the entry as, or the show kept for a name the
+    /// list does not hold.
     pub show: ShowId,
-    /// The title as the corpus spells it.
+    /// The title as the corpus spells it, or as the name spelled it under
+    /// [`Stage::Unlisted`].
     pub title: String,
     /// The episode in the release's numbering, as it was read from the name.
     ///
@@ -240,7 +466,8 @@ pub struct Refusal {
 pub struct Ambiguity {
     /// The title as the filename spelled it.
     pub parsed: String,
-    /// The entries it reaches, in the order the corpus filed them.
+    /// The entries it reaches: those its key reaches in the order the corpus
+    /// filed them, then those it reaches through a type word.
     ///
     /// More than one wherever [`by_key`] built it: one candidate is a [`Match`]
     /// and none is no ambiguity at all. Reserved rather than enforced, as
@@ -281,13 +508,17 @@ pub enum Recognition {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage, by_key, decide};
+    use super::{
+        Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage, by_key, decide, read,
+        read_file,
+    };
     use crate::ShowId;
+    use crate::encoding::Confidence;
     use crate::path::RawPath;
     use crate::recognize::altname::{Altnames, Assignment};
     use crate::recognize::corpus::Corpus;
     use crate::recognize::index::Index;
-    use crate::recognize::parse::{Episode, Parsed, parse};
+    use crate::recognize::parse::{Episode, Kind, Parsed, parse};
 
     /// A score the tests use where the exact value is not the point.
     fn a_score(value: f64) -> Score {
@@ -321,6 +552,678 @@ mod tests {
             show: ShowId(show),
             title: title.to_owned(),
         }
+    }
+
+    /// What a file of this name is read as against this corpus, with no
+    /// assignments.
+    fn read_as(name: &str, corpus: &Corpus) -> (Parsed, Recognition) {
+        read(named(name), &Altnames::new(), corpus, &Index::of(corpus))
+    }
+
+    #[test]
+    fn a_title_that_ends_in_a_number_is_read_on_where_its_key_reaches_nothing() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title 13.mkv", &corpus);
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title 13"));
+        assert_eq!(parsed.episode, Episode::Absent);
+        assert_eq!(parsed.title_with_number, None);
+        assert_eq!(answer, recognized(1, "Show Title 13", Episode::Absent));
+    }
+
+    #[test]
+    fn a_title_read_on_keeps_the_words_after_its_number() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title 13 - The Subtitle",
+            Vec::<&str>::new(),
+        );
+
+        let (parsed, answer) = read_as("Show Title 13 - The Subtitle.mkv", &corpus);
+
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("Show Title 13 - The Subtitle")
+        );
+        assert_eq!(
+            answer,
+            recognized(2, "Show Title 13 - The Subtitle", Episode::Absent)
+        );
+    }
+
+    /// What a file at this path is read as against this corpus, with no
+    /// assignments.
+    fn read_at(path: &str, corpus: &Corpus) -> (Parsed, Recognition) {
+        read_file(
+            &RawPath::from_bytes(path.as_bytes().to_vec()),
+            &Altnames::new(),
+            corpus,
+            &Index::of(corpus),
+        )
+    }
+
+    /// A corpus of these titles, each spelled one way, filed as shows
+    /// numbered from one in the order given.
+    fn a_list_of(titles: &[&str]) -> Corpus {
+        let mut corpus = Corpus::new();
+        for (show, title) in (1..).zip(titles) {
+            corpus.file(ShowId(show), title, Vec::<&str>::new());
+        }
+        corpus
+    }
+
+    #[test]
+    fn a_name_that_begins_with_its_episode_reaches_the_show_named_after_it() {
+        let (parsed, answer) = read_as("01 Show Title.mkv", &a_list_of(&["Show Title"]));
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.episode_first, None);
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_title_that_begins_with_a_number_reaches_its_entry_whole() {
+        let (parsed, answer) = read_as(
+            "12 Quiet Lanterns.mkv",
+            &a_list_of(&["12 Quiet Lanterns", "Quiet Lanterns"]),
+        );
+
+        assert_eq!(parsed.episode, Episode::Absent);
+        assert_eq!(answer, recognized(1, "12 Quiet Lanterns", Episode::Absent));
+    }
+
+    #[test]
+    fn a_name_that_begins_with_its_episode_is_of_the_show_its_directory_names() {
+        let (parsed, answer) = read_at(
+            "/anime/Show Title/01 Quiet Harbor.mkv",
+            &a_list_of(&["Show Title"]),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert!(parsed.from_directory);
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_name_with_no_title_is_of_the_show_its_directory_names() {
+        let (parsed, answer) = read_at(
+            "/anime/Show Title/01 - Quiet Harbor.mkv",
+            &a_list_of(&["Show Title"]),
+        );
+
+        assert!(parsed.from_directory);
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+
+        let (_, answer) = read_at("/anime/Show Title/01.mkv", &a_list_of(&["Show Title"]));
+
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_name_with_a_title_of_its_own_never_asks_its_directory() {
+        let (parsed, answer) = read_at(
+            "/anime/Other Show/[Group] Show Title - 03.mkv",
+            &a_list_of(&["Other Show"]),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert!(!parsed.from_directory);
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_season_or_a_disc_directory_is_part_of_the_show_above_it() {
+        let list = a_list_of(&["Show Title", "Show Title Season 2"]);
+
+        let (parsed, answer) = read_at("/anime/Show Title/Season 2/01 - Quiet Harbor.mkv", &list);
+
+        assert_eq!(parsed.season, Some(2));
+        assert_eq!(
+            answer,
+            recognized(2, "Show Title Season 2", Episode::Only(1))
+        );
+
+        let (_, answer) = read_at("/anime/Show Title/Disc 1/01 Quiet Harbor.mkv", &list);
+
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_directory_gives_what_the_name_does_not_spell_and_the_name_keeps_its_own() {
+        let list = a_list_of(&["Show Title Season 3 Part 2"]);
+
+        let (_, answer) = read_at(
+            "/anime/Show Title Season 3 Part 2/01 - Quiet Harbor.mkv",
+            &list,
+        );
+        assert_eq!(
+            answer,
+            recognized(1, "Show Title Season 3 Part 2", Episode::Only(1))
+        );
+
+        let (parsed, _) = read_at(
+            "/anime/Show Title Season 2/S03E01 - Quiet Harbor.mkv",
+            &list,
+        );
+        assert_eq!(parsed.season, Some(3));
+
+        let (parsed, _) = read_at("/anime/Show Title (1999)/01 - Quiet Harbor.mkv", &list);
+        assert_eq!(parsed.year, Some(1999));
+        let (parsed, _) = read_at(
+            "/anime/Show Title (1999)/01 - Quiet Harbor (2001).mkv",
+            &list,
+        );
+        assert_eq!(parsed.year, Some(2001));
+    }
+
+    #[test]
+    fn a_directory_the_key_misses_is_scored_on_its_own_words() {
+        let (_, answer) = read_at(
+            "/anime/Show Title Cour 2 - The Subtitle/01 - Quiet Harbor.mkv",
+            &a_list_of(&["Show Title", "Show Title Cour 2 The Subtitle"]),
+        );
+
+        assert!(
+            matches!(
+                &answer,
+                Recognition::Recognized(Match {
+                    show: ShowId(2),
+                    episode: Episode::Only(1),
+                    stage: Stage::Scored(_),
+                    ..
+                })
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_with_neither_a_title_nor_an_episode_never_asks_its_directory() {
+        let (parsed, answer) =
+            read_at("/anime/Show Title/[1080p].mkv", &a_list_of(&["Show Title"]));
+
+        assert!(!parsed.from_directory);
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_title_read_from_a_directory_carries_how_the_directory_was_decoded() {
+        let path = RawPath::from_bytes(
+            b"/anime/\x83\x5c\x83\x8c\x83\x62\x83\x5e [Group]/01 - Quiet Harbor.mkv".to_vec(),
+        );
+
+        let (parsed, _) = read_file(
+            &path,
+            &Altnames::new(),
+            &Corpus::new(),
+            &Index::of(&Corpus::new()),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("ソレッタ"));
+        assert_eq!(parsed.confidence, Confidence::Detected);
+    }
+
+    #[test]
+    fn a_directory_of_specials_reads_its_files_as_extras_of_the_show_above_it() {
+        let (parsed, _) = read_at(
+            "/anime/Show Title/Specials/01 - Quiet Harbor.mkv",
+            &a_list_of(&["Show Title"]),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.kind, Some(Kind::Extra));
+        assert_eq!(parsed.episode, Episode::Only(1));
+    }
+
+    #[test]
+    fn a_directory_whose_number_is_its_own_reaches_its_entry() {
+        let (_, answer) = read_at(
+            "/anime/Show Title 13/01 - Quiet Harbor.mkv",
+            &a_list_of(&["Show Title 13"]),
+        );
+
+        assert_eq!(answer, recognized(1, "Show Title 13", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_directory_that_names_a_release_is_kept_as_the_show() {
+        let (parsed, answer) = read_at(
+            "/video/Show.Title.Season.1.1999.DVDRip-Group/01 Quiet Harbor.mkv",
+            &Corpus::new(),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.episode, Episode::Only(1));
+        assert!(parsed.from_directory);
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+
+        for directory in [
+            "Show Title Season 2",
+            "Show Title (1999)",
+            "[Group] Show Title",
+            "Show Title OVA",
+        ] {
+            let (parsed, _) = read_at(
+                &format!("/video/{directory}/01 Quiet Harbor.mkv"),
+                &Corpus::new(),
+            );
+
+            assert!(parsed.from_directory, "{directory}");
+            assert_eq!(
+                parsed.kind.is_some(),
+                directory.ends_with("OVA"),
+                "{directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_directory_that_reaches_nothing_leaves_the_name_as_it_spells_itself() {
+        for (path, title) in [
+            (
+                "/video/7 Lanterns per Night.mkv",
+                Some("7 Lanterns per Night"),
+            ),
+            ("/video/01 - Quiet Harbor.mkv", None),
+        ] {
+            let (parsed, _) = read_at(path, &Corpus::new());
+
+            assert_eq!(parsed.title.as_deref(), title, "{path}");
+            assert!(!parsed.from_directory, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_walk_ends_at_the_first_directory_that_names_a_show() {
+        // A show kept inside another's directory is not that other show.
+        let (_, answer) = read_at(
+            "/anime/Show Title/Other Title/01 Quiet Harbor.mkv",
+            &a_list_of(&["Show Title"]),
+        );
+
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_the_list_answers_never_asks_its_directory() {
+        let (parsed, answer) = read_at(
+            "/anime/Other Show/01 Show Title.mkv",
+            &a_list_of(&["Show Title", "Other Show"]),
+        );
+
+        assert!(!parsed.from_directory);
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+
+        let (parsed, answer) = read_at(
+            "/anime/Show Title/01 Quiet Harbor.mkv",
+            &a_list_of(&["Show Title", "Quiet Harbor"]),
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Quiet Harbor"));
+        assert_eq!(answer, recognized(2, "Quiet Harbor", Episode::Only(1)));
+    }
+
+    #[test]
+    fn a_title_beginning_with_one_digit_is_no_episode_of_its_directory() {
+        let (parsed, answer) = read_at(
+            "/anime/Other Show/7 Lanterns per Night.mkv",
+            &a_list_of(&["Other Show"]),
+        );
+
+        assert!(!parsed.from_directory);
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_part_of_the_show_gives_its_season_its_part_and_its_type() {
+        let list = Corpus::new();
+        for (path, season, part, kind) in [
+            (
+                "/anime/[Group] Show Title/Season 2 OVA/01 - Quiet Harbor.mkv",
+                Some(2),
+                None,
+                Some(Kind::Extra),
+            ),
+            (
+                "/anime/[Group] Show Title/[OVA]/01.mkv",
+                None,
+                None,
+                Some(Kind::Extra),
+            ),
+            (
+                "/anime/[Group] Show Title/Disc 1 - Season 2/01.mkv",
+                Some(2),
+                None,
+                None,
+            ),
+            (
+                "/anime/[Group] Show Title/Cour 2/01.mkv",
+                None,
+                Some(2),
+                None,
+            ),
+        ] {
+            let (parsed, _) = read_at(path, &list);
+
+            assert!(parsed.from_directory, "{path}");
+            assert_eq!(
+                (parsed.season, parsed.part, parsed.kind),
+                (season, part, kind),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_season_of_the_name_and_then_of_the_nearest_directory_holds() {
+        let list = Corpus::new();
+        for (path, season) in [
+            (
+                "/anime/[Group] Show Title/Season 2/S03E01 - Quiet Harbor.mkv",
+                Some(3),
+            ),
+            ("/anime/Show Title Season 3/Season 2/01.mkv", Some(2)),
+        ] {
+            let (parsed, _) = read_at(path, &list);
+
+            assert!(parsed.from_directory, "{path}");
+            assert_eq!(parsed.season, season, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_directory_never_gives_the_file_its_release_group() {
+        let (parsed, _) = read_at(
+            "/video/[Group] Show Title/01 Quiet Harbor.mkv",
+            &Corpus::new(),
+        );
+
+        assert!(parsed.from_directory);
+        assert_eq!(parsed.release_group, None);
+    }
+
+    #[test]
+    fn a_name_of_a_season_and_an_episode_alone_reads_its_directory() {
+        let (_, answer) = read_at(
+            "/anime/Show Title/Season 2 - 03.mkv",
+            &a_list_of(&["Show Title", "Show Title Season 2"]),
+        );
+
+        assert_eq!(
+            answer,
+            recognized(2, "Show Title Season 2", Episode::Only(3))
+        );
+    }
+
+    #[test]
+    fn a_walk_through_a_parent_reference_ends_there() {
+        let list = a_list_of(&["Show Title"]);
+
+        let (_, answer) = read_at("/anime/Show Title/../01 Quiet Harbor.mkv", &list);
+        assert!(
+            matches!(answer, Recognition::Unrecognized(_)),
+            "got {answer:?}"
+        );
+
+        let (_, answer) = read_at("/anime/Show Title/./01 Quiet Harbor.mkv", &list);
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(1)));
+    }
+
+    #[test]
+    fn an_assignment_answers_a_name_read_episode_first_and_a_directory() {
+        let list = a_list_of(&["Show Title", "Show Title (2019)"]);
+        let mut altnames = Altnames::new();
+        altnames
+            .name("Show Title", ShowId(2), &list)
+            .expect("the name is assigned");
+        let index = Index::of(&list);
+
+        for path in ["01 Show Title.mkv", "/anime/Show Title/01 Quiet Harbor.mkv"] {
+            let (_, answer) = read_file(
+                &RawPath::from_bytes(path.as_bytes().to_vec()),
+                &altnames,
+                &list,
+                &index,
+            );
+
+            assert!(
+                matches!(
+                    answer,
+                    Recognition::Recognized(Match {
+                        show: ShowId(2),
+                        stage: Stage::Altname(_),
+                        ..
+                    })
+                ),
+                "{path}: {answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_read_on_that_reaches_nothing_is_decided_as_the_name_spells_it() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title 13 - The Subtitle.mkv", &corpus);
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.episode, Episode::Only(13));
+        assert_eq!(
+            answer,
+            decide(
+                &named("Show Title 13 - The Subtitle.mkv"),
+                &Altnames::new(),
+                &corpus,
+                &Index::of(&corpus)
+            )
+        );
+    }
+
+    #[test]
+    fn a_title_read_on_is_asked_before_the_scorer_would_answer_the_title_as_parsed() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+
+        let scored = decide(
+            &named("Show Title 13.mkv"),
+            &Altnames::new(),
+            &corpus,
+            &Index::of(&corpus),
+        );
+
+        assert!(
+            matches!(
+                scored,
+                Recognition::Recognized(Match {
+                    show: ShowId(1),
+                    episode: Episode::Only(13),
+                    stage: Stage::Scored(_),
+                    ..
+                })
+            ),
+            "got {scored:?}"
+        );
+        assert_eq!(
+            read_as("Show Title 13.mkv", &corpus).1,
+            recognized(1, "Show Title 13", Episode::Absent)
+        );
+    }
+
+    #[test]
+    fn an_assignment_of_the_title_read_on_answers_before_the_key() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title 13 (2019)", Vec::<&str>::new());
+        let mut altnames = Altnames::new();
+        altnames
+            .name("Show Title 13", ShowId(2), &corpus)
+            .expect("the name is assigned");
+
+        let (_, answer) = read(
+            named("Show Title 13.mkv"),
+            &altnames,
+            &corpus,
+            &Index::of(&corpus),
+        );
+
+        assert!(
+            matches!(
+                answer,
+                Recognition::Recognized(Match {
+                    show: ShowId(2),
+                    stage: Stage::Altname(_),
+                    ..
+                })
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_title_that_reaches_an_entry_keeps_its_number_as_the_episode() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title 13", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title 13.mkv", &corpus);
+
+        assert_eq!(parsed.episode, Episode::Only(13));
+        assert_eq!(answer, recognized(1, "Show Title", Episode::Only(13)));
+    }
+
+    #[test]
+    fn a_number_after_a_dash_is_never_read_into_the_title() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 13", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title - 13.mkv", &corpus);
+
+        assert_eq!(parsed.episode, Episode::Only(13));
+        assert_ne!(answer, recognized(1, "Show Title 13", Episode::Absent));
+    }
+
+    #[test]
+    fn a_name_the_user_assigned_is_not_read_on() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Assigned Show", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title 13", Vec::<&str>::new());
+        let mut altnames = Altnames::new();
+        altnames
+            .name("Show Title", ShowId(1), &corpus)
+            .expect("the name is assigned");
+
+        let (parsed, _) = read(
+            named("Show Title 13.mkv"),
+            &altnames,
+            &corpus,
+            &Index::of(&corpus),
+        );
+
+        assert_eq!(parsed.episode, Episode::Only(13));
+    }
+
+    #[test]
+    fn a_name_that_spells_a_type_also_reaches_the_entry_whose_title_spells_one() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title Season 3 OVA", Vec::<&str>::new());
+
+        assert_eq!(
+            found("[Group] Show Title Season 3 OVA - 01 [1080p].mkv", &corpus),
+            Some(Recognition::Ambiguous(Ambiguity {
+                parsed: "Show Title".to_owned(),
+                candidates: vec![
+                    candidate(1, "Show Title Season 3"),
+                    candidate(2, "Show Title Season 3 OVA"),
+                ],
+            }))
+        );
+        assert_eq!(
+            found("[Group] Show Title Season 3 - 01 [1080p].mkv", &corpus),
+            Some(recognized(1, "Show Title Season 3", Episode::Only(1))),
+            "a name of no type word never reaches the entry through its type"
+        );
+    }
+
+    #[test]
+    fn a_name_of_an_ova_reaches_the_entry_its_title_spells_and_no_film() {
+        // The title as read reaches an entry, so it is not asked again
+        // without its type word, and a film's spelling is no OVA's.
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title OVA", Vec::<&str>::new());
+        corpus.file(ShowId(3), "Show Title Movie", Vec::<&str>::new());
+
+        assert_eq!(
+            found("[Group] Show Title OVA - 01 [1080p].mkv", &corpus),
+            Some(recognized(2, "Show Title OVA", Episode::Only(1)))
+        );
+        assert_eq!(
+            found("[Group] Show Title Movie [1080p].mkv", &corpus),
+            Some(recognized(3, "Show Title Movie", Episode::Absent))
+        );
+    }
+
+    #[test]
+    fn a_name_reaches_the_spellings_filed_under_its_own_kind_alone() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3 Movie", Vec::<&str>::new());
+
+        assert_eq!(
+            found("[Group] Show Title Season 3 Movie [1080p].mkv", &corpus),
+            Some(recognized(1, "Show Title Season 3 Movie", Episode::Absent))
+        );
+        assert_eq!(
+            found("[Group] Show Title Season 3 OVA - 01 [1080p].mkv", &corpus),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_reaches_the_entries_of_its_key_before_those_of_a_type_word() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3 OVA", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title Season 3", Vec::<&str>::new());
+
+        let Some(Recognition::Ambiguous(several)) =
+            found("[Group] Show Title Season 3 OVA - 01 [1080p].mkv", &corpus)
+        else {
+            panic!("the name reaches both entries");
+        };
+        let shows: Vec<ShowId> = several.candidates.iter().map(|c| c.show).collect();
+        assert_eq!(shows, [ShowId(2), ShowId(1)]);
+    }
+
+    #[test]
+    fn a_file_of_a_special_named_in_japanese_title_quotes_reaches_the_special() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Series Title", ["作品名"]);
+        corpus.file(ShowId(2), "Series Title: The Subtitle", ["作品名『副題』"]);
+
+        assert_eq!(
+            found("作品名『副題』.mkv", &corpus),
+            Some(recognized(2, "Series Title: The Subtitle", Episode::Absent))
+        );
     }
 
     #[test]

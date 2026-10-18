@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Written by hand rather than computed, so that adding a migration is a
 /// change in two places that a test holds together.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Every migration, in order, each a script of statements.
 ///
@@ -100,6 +100,19 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (backend, entry),
         FOREIGN KEY (backend, entry) REFERENCES backend_ids(backend, entry)
     );",
+    // `names` holds a name the list does not hold, by the key of the name in
+    // its parts, and the show it is kept as. A key is one name: its season
+    // and its part are NULL where it holds none, and the index reads NULL as
+    // -1, which no key holds, so a second row of a key with none is refused.
+    // A plain UNIQUE counts two NULLs as distinct and would take it.
+    "CREATE TABLE names (
+        show INTEGER NOT NULL REFERENCES shows(id),
+        letters TEXT NOT NULL,
+        marks TEXT NOT NULL,
+        season INTEGER,
+        part INTEGER
+    );
+    CREATE UNIQUE INDEX names_by_key ON names (letters, marks, IFNULL(season, -1), IFNULL(part, -1));",
 ];
 
 /// Apply every migration the database has not seen, in order.
@@ -329,6 +342,39 @@ mod tests {
             })
             .expect("the check runs");
         assert_eq!(broken, 0, "every row points at a show that is there");
+    }
+
+    #[test]
+    fn migration_four_creates_the_names_the_list_does_not_hold() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+
+        apply(&mut connection, &MIGRATIONS[..4]).expect("the fourth migration applies");
+
+        assert_eq!(
+            columns(&connection, "names"),
+            ["show", "letters", "marks", "season", "part"]
+        );
+    }
+
+    #[test]
+    fn migration_four_holds_one_row_for_a_key_with_no_season_and_no_part() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+        apply(&mut connection, &MIGRATIONS[..4]).expect("the fourth migration applies");
+        let a_row = "INSERT INTO names (show, letters, marks, season, part) \
+                     VALUES (1, 'someothershow', '', NULL, NULL)";
+        connection
+            .execute_batch("INSERT INTO shows (title) VALUES ('Some Other Show');")
+            .expect("the show is filed");
+        connection
+            .execute(a_row, [])
+            .expect("the first row of the key goes in");
+
+        let again = connection.execute(a_row, []);
+
+        assert!(
+            refused_by(&again, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            "{again:?}"
+        );
     }
 
     #[test]

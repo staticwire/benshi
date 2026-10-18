@@ -3,8 +3,8 @@
 //! Recognition is pure logic in `benshi-core` and decides against a corpus the
 //! caller supplies. A [`Recognizer`] holds one, with its index and the names
 //! the user gave. Against [`Recognizer::empty`] every name reaches the end of
-//! the sequence and is refused. A round decides, the decision is left here,
-//! and a client reads it.
+//! the sequence and is refused. A round decides, the facts the list holds
+//! settle what was decided, the decision is left here, and a client reads it.
 //!
 //! One decision is kept, the most recent, the way
 //! [`Seen`](crate::detection::Seen) keeps the most recent listing and for the
@@ -17,9 +17,10 @@ use benshi_core::path::RawPath;
 use benshi_core::recognize::altname::Altnames;
 use benshi_core::recognize::corpus::Corpus;
 use benshi_core::recognize::index::Index;
-use benshi_core::recognize::parse::{Parsed, parse};
-use benshi_core::recognize::{Recognition, decide};
-use benshi_core::{MediaRef, PlayerId};
+use benshi_core::recognize::parse::Parsed;
+use benshi_core::recognize::{Recognition, read_file};
+use benshi_core::settle::{Settled, settle};
+use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
 
 /// What is said when the record of the last decision cannot be trusted.
 const POISONED: &str = "last decision was poisoned by a panic in another task";
@@ -54,17 +55,30 @@ impl Recognizer {
         }
     }
 
-    /// What a file's name spells, and what recognition made of it.
+    /// What a file's name spells, or the directory above it that names its
+    /// show, and what recognition made of it.
     ///
-    /// The name alone. A directory is not part of what a release spells, and a
-    /// folder named after another show would otherwise carry that show's words
-    /// into the name the stages read.
+    /// The spelling is the one the answer was decided by: a number
+    /// [`read`](benshi_core::recognize::read) took into the title is in the
+    /// title, and a show [`read_file`] read from a directory is the show. A
+    /// directory is read only for a name that spells an episode but no title,
+    /// or begins with its episode, since a folder named after another show
+    /// would otherwise carry that show's words into the name the stages read.
     #[must_use]
     pub fn decide(&self, path: &RawPath) -> (Parsed, Recognition) {
-        let parsed = parse(&RawPath::from_bytes(path.file_name().to_vec()));
-        let answer = decide(&parsed, &self.altnames, &self.corpus, &self.index);
+        read_file(path, &self.altnames, &self.corpus, &self.index)
+    }
 
-        (parsed, answer)
+    /// What the facts the list holds settle of an answer [`Recognizer::decide`]
+    /// gave, for the reading of that file.
+    #[must_use]
+    pub fn settle(
+        &self,
+        answer: &Recognition,
+        parsed: &Parsed,
+        reading: &PlayerSnapshot,
+    ) -> Settled {
+        settle(answer, parsed, reading, &self.corpus)
     }
 }
 
@@ -100,17 +114,21 @@ impl Current {
     }
 }
 
-/// One decision: whose file, which file, what its name spelled, and the answer.
+/// One decision: whose file, which file, what its name spelled, the answer,
+/// and what the list's facts settled of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// The source whose reading was decided.
     pub player: PlayerId,
     /// What that source had open.
     pub media: MediaRef,
-    /// What the name spelled, before anything was matched.
+    /// What the name spelled, in the reading the answer was decided by.
     pub parsed: Parsed,
-    /// What recognition answered.
+    /// What recognition answered, or the show kept for a name it refused that
+    /// spells a title.
     pub answer: Recognition,
+    /// What the facts the list holds settled of the answer.
+    pub settled: Settled,
 }
 
 /// The most recent decision, for a client asking why.
@@ -157,7 +175,8 @@ mod tests {
     use benshi_core::recognize::corpus::Corpus;
     use benshi_core::recognize::parse::Episode;
     use benshi_core::recognize::{Match, Recognition, Refusal, Stage};
-    use benshi_core::{MediaRef, PlayerId, ShowId};
+    use benshi_core::settle::{Fact, Facts, Settled};
+    use benshi_core::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
 
     fn a_path(name: &str) -> RawPath {
         RawPath::from_bytes(name.as_bytes().to_vec())
@@ -190,6 +209,7 @@ mod tests {
                 media: MediaRef::LocalFile(path.clone()),
                 parsed,
                 answer,
+                settled: Settled::Unnamed,
             });
         }
 
@@ -223,6 +243,42 @@ mod tests {
                 show: ShowId(1),
                 title: "Show Title".to_owned(),
                 episode: Episode::Only(3),
+                stage: Stage::Key,
+            })
+        );
+    }
+
+    #[test]
+    fn a_number_that_is_the_titles_own_is_read_into_it() {
+        let recognizer = Recognizer::of(a_list_of(&["A Film 13", "Show Title"]), Altnames::new());
+
+        let (parsed, answer) = recognizer.decide(&a_path("/anime/A Film 13.mkv"));
+
+        assert_eq!(parsed.title.as_deref(), Some("A Film 13"));
+        assert_eq!(
+            answer,
+            Recognition::Recognized(Match {
+                show: ShowId(1),
+                title: "A Film 13".to_owned(),
+                episode: Episode::Absent,
+                stage: Stage::Key,
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_that_begins_with_its_episode_is_of_the_show_its_directory_names() {
+        let recognizer =
+            Recognizer::of(a_list_of(&["Show Title", "Another Show"]), Altnames::new());
+
+        let (_parsed, answer) = recognizer.decide(&a_path("/anime/Show Title/01 Quiet Harbor.mkv"));
+
+        assert_eq!(
+            answer,
+            Recognition::Recognized(Match {
+                show: ShowId(1),
+                title: "Show Title".to_owned(),
+                episode: Episode::Only(1),
                 stage: Stage::Key,
             })
         );
@@ -276,6 +332,43 @@ mod tests {
                 }) if title == "Show Title Cour 2 The Subtitle"
             ),
             "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn what_was_recognized_is_settled_by_the_facts_the_list_holds() {
+        // The list files the series as not yet released, and no file is of a
+        // work that has not been released.
+        let mut list = a_list_of(&["Show Title"]);
+        list.file_facts(
+            ShowId(1),
+            Facts {
+                episodes: None,
+                episode_length: None,
+                year: None,
+                released: false,
+                format: None,
+            },
+        );
+        let recognizer = Recognizer::of(list, Altnames::new());
+        let path = a_path("/anime/[Group] Show Title - 03.mkv");
+        let reading = PlayerSnapshot {
+            player: PlayerId("mpv".to_owned()),
+            media: MediaRef::LocalFile(path.clone()),
+            state: PlayState::Playing,
+            position: Known::NotReported,
+            duration: Known::NotReported,
+            observed_at: benshi_core::clock::Timestamp::epoch(),
+        };
+
+        let (parsed, answer) = recognizer.decide(&path);
+
+        assert_eq!(
+            recognizer.settle(&answer, &parsed, &reading),
+            Settled::Refused {
+                show: ShowId(1),
+                fact: Fact::NotReleased,
+            }
         );
     }
 

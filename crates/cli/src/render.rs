@@ -14,7 +14,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
 use benshi_core::policy::Policy;
-use benshi_core::recognize::parse::{Episode, Parsed};
+use benshi_core::recognize::parse::{Episode, Kind, Parsed};
+use benshi_core::settle::Fact;
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
@@ -187,27 +188,51 @@ pub fn explanation(of: &Explanation) -> String {
     )
 }
 
-/// What recognition answered, as the lines below the parse.
+/// What recognition answered, or the show kept in its place, as the lines
+/// below the parse.
 ///
-/// Each line ends in a newline, and a match takes two: what it was recognized
-/// as, and the stage that decided.
+/// Each line ends in a newline. A match takes two, what it was recognized as
+/// and the stage that decided, and a third where a fact of its entry refused
+/// the file. An ambiguity takes one, and a line for each entry a fact
+/// refused and one for the entry the facts chose.
 fn answer(of: &Outcome) -> String {
     match of {
         Outcome::Recognized {
             title,
             episode,
             stage,
-        } => format!(
-            "recognized: \"{title}\", {}\nstage: {}\n",
-            episode_words(*episode),
-            decided_by(stage)
-        ),
-        Outcome::Ambiguous { candidates } => {
+            refused,
+        } => {
+            let mut shown = format!(
+                "recognized: \"{title}\", {}\nstage: {}\n",
+                episode_words(*episode),
+                decided_by(stage)
+            );
+            if let Some(fact) = refused {
+                writeln!(shown, "refused: {}", refusal(fact))
+                    .expect("a String accepts every write");
+            }
+            shown
+        }
+        Outcome::Ambiguous {
+            candidates,
+            refused,
+            chosen,
+        } => {
             let quoted: Vec<String> = candidates
                 .iter()
                 .map(|candidate| format!("\"{candidate}\""))
                 .collect();
-            format!("ambiguous: {}\n", quoted.join(", "))
+            let mut shown = format!("ambiguous: {}\n", quoted.join(", "));
+            for (title, fact) in refused {
+                writeln!(shown, "refused: \"{title}\", {}", refusal(fact))
+                    .expect("a String accepts every write");
+            }
+            if let Some((title, episode)) = chosen {
+                writeln!(shown, "chosen: \"{title}\", {}", episode_words(*episode))
+                    .expect("a String accepts every write");
+            }
+            shown
         }
         Outcome::Unrecognized { best: Some(score) } => {
             format!("unrecognized: closest candidate scored {score:.2}\n")
@@ -227,7 +252,13 @@ fn answer(of: &Outcome) -> String {
 fn spelled(of: &Parsed) -> String {
     let mut parts = vec![of.title.as_ref().map_or_else(
         || "no title".to_owned(),
-        |title| format!("title \"{title}\""),
+        |title| {
+            if of.from_directory {
+                format!("title \"{title}\" from directory")
+            } else {
+                format!("title \"{title}\"")
+            }
+        },
     )];
     if let Some(season) = of.season {
         parts.push(format!("season {season}"));
@@ -263,6 +294,35 @@ fn episode_words(of: Episode) -> String {
     }
 }
 
+/// The fact of an entry that refused a file, with what the name or the file
+/// says beside what the entry holds where the fact compares the two.
+///
+/// A length is said as `watch` says one, in minutes and seconds.
+fn refusal(of: &Fact) -> String {
+    match of {
+        Fact::NotReleased => "entry not released yet".to_owned(),
+        Fact::Year { spelled, began } => {
+            format!("name spells year {spelled}, entry began in {began}")
+        }
+        Fact::Kind(Kind::Extra) => "name spells OVA or special, entry is TV series".to_owned(),
+        Fact::Kind(Kind::Film) => "name spells film, entry is TV series".to_owned(),
+        Fact::Episodes(count) => format!("name spells no episode, entry has {count} episodes"),
+        Fact::PastCount { episode, episodes } => {
+            let unit = if *episodes == 1 {
+                "episode"
+            } else {
+                "episodes"
+            };
+            format!("name spells episode {episode}, entry has {episodes} {unit}")
+        }
+        Fact::Length { file, episode } => format!(
+            "file is {} long, under half of entry's {} episode",
+            moment(Known::Value(*file)),
+            moment(Known::Value(*episode))
+        ),
+    }
+}
+
 /// The stage that decided, by its name, and what it decided by.
 fn decided_by(of: &DecidedBy) -> String {
     match of {
@@ -278,6 +338,7 @@ fn decided_by(of: &DecidedBy) -> String {
         }
         DecidedBy::Key => "key".to_owned(),
         DecidedBy::Scored(score) => format!("score {score:.2}"),
+        DecidedBy::Unlisted => "not on list, kept as show of its own".to_owned(),
     }
 }
 
@@ -346,7 +407,8 @@ mod tests {
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
     use benshi_core::recognize::altname::Assignment;
-    use benshi_core::recognize::parse::Episode;
+    use benshi_core::recognize::parse::{Episode, Kind};
+    use benshi_core::settle::Fact;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
@@ -654,6 +716,7 @@ mod tests {
             title: title.to_owned(),
             episode: Episode::Only(3),
             stage,
+            refused: None,
         }
     }
 
@@ -704,6 +767,30 @@ mod tests {
         assert!(spelled.contains("season 2"), "{spelled}");
         assert!(spelled.contains("episode 3"), "{spelled}");
         assert!(spelled.contains("\"Group\""), "{spelled}");
+    }
+
+    #[test]
+    fn a_title_read_from_a_directory_says_so() {
+        let shown = explanation(&explained(
+            b"/video/Show.Title.Season.1.1999.DVDRip-Group/01 Quiet Harbor.mkv",
+            Outcome::Unrecognized { best: None },
+        ));
+
+        let spelled = line_of(&shown, "spelled:");
+        assert!(
+            spelled.starts_with("spelled: title \"Show Title\" from directory, "),
+            "{spelled}"
+        );
+
+        let shown = explanation(&explained(
+            b"/anime/[Group] Show Title - 03.mkv",
+            Outcome::Unrecognized { best: None },
+        ));
+
+        assert!(
+            !line_of(&shown, "spelled:").contains("directory"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -799,6 +886,19 @@ mod tests {
     }
 
     #[test]
+    fn a_name_the_list_does_not_hold_says_so_in_place_of_a_stage() {
+        let shown = explanation(&explained(
+            b"[Group] Some Other Show - 03.mkv",
+            found("Some Other Show", DecidedBy::Unlisted),
+        ));
+
+        assert_eq!(
+            line_of(&shown, "stage:"),
+            "stage: not on list, kept as show of its own"
+        );
+    }
+
+    #[test]
     fn a_match_by_score_shows_the_score_it_won_with() {
         let shown = explanation(&explained(
             b"[Group] Show Title - 03.mkv",
@@ -806,6 +906,84 @@ mod tests {
         ));
 
         assert!(line_of(&shown, "stage:").contains("0.83"), "{shown}");
+    }
+
+    #[test]
+    fn a_file_a_fact_refused_names_the_fact_after_the_stage() {
+        // The line after the stage, one for each fact, with what the name or
+        // the file says beside what the entry holds where the fact compares
+        // the two.
+        let cases = [
+            (Fact::NotReleased, "refused: entry not released yet"),
+            (
+                Fact::Year {
+                    spelled: 2019,
+                    began: 2021,
+                },
+                "refused: name spells year 2019, entry began in 2021",
+            ),
+            (
+                Fact::Episodes(2),
+                "refused: name spells no episode, entry has 2 episodes",
+            ),
+            (
+                Fact::Length {
+                    file: Duration::from_secs(114),
+                    episode: Duration::from_mins(40),
+                },
+                "refused: file is 01:54 long, under half of entry's 40:00 episode",
+            ),
+            (
+                Fact::PastCount {
+                    episode: 5,
+                    episodes: 1,
+                },
+                "refused: name spells episode 5, entry has 1 episode",
+            ),
+            (
+                Fact::Kind(Kind::Extra),
+                "refused: name spells OVA or special, entry is TV series",
+            ),
+            (
+                Fact::Kind(Kind::Film),
+                "refused: name spells film, entry is TV series",
+            ),
+            (
+                Fact::PastCount {
+                    episode: 13,
+                    episodes: 12,
+                },
+                "refused: name spells episode 13, entry has 12 episodes",
+            ),
+        ];
+
+        for (fact, line) in cases {
+            let shown = explanation(&explained(
+                b"[Group] Show Title [1080p].mkv",
+                Outcome::Recognized {
+                    title: "Show Title".to_owned(),
+                    episode: Episode::Absent,
+                    stage: DecidedBy::Key,
+                    refused: Some(fact),
+                },
+            ));
+
+            let lines: Vec<&str> = shown.lines().collect();
+            assert_eq!(lines.len(), 5, "{shown:?}");
+            assert_eq!(lines[3], "stage: key", "{shown:?}");
+            assert_eq!(lines[4], line, "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_the_facts_let_stand_has_no_line_of_them() {
+        let shown = explanation(&explained(
+            b"[Group] Show Title - 03.mkv",
+            found("Show Title", DecidedBy::Key),
+        ));
+
+        assert_eq!(shown.lines().count(), 4, "{shown:?}");
+        assert!(!shown.contains("refused"), "{shown:?}");
     }
 
     #[test]
@@ -817,6 +995,8 @@ mod tests {
                     "Fruits Basket".to_owned(),
                     "Fruits Basket (2019)".to_owned(),
                 ],
+                refused: Vec::new(),
+                chosen: None,
             },
         ));
 
@@ -825,6 +1005,65 @@ mod tests {
         assert!(
             ambiguous.contains("\"Fruits Basket (2019)\""),
             "{ambiguous}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguity_the_facts_settled_names_each_refusal_and_what_they_chose() {
+        let shown = explanation(&explained(
+            b"Show Title (1988).mkv",
+            Outcome::Ambiguous {
+                candidates: vec!["Show Title".to_owned(), "Show Title".to_owned()],
+                refused: vec![("Show Title".to_owned(), Fact::NotReleased)],
+                chosen: Some(("Show Title".to_owned(), Episode::Absent)),
+            },
+        ));
+
+        let lines: Vec<&str> = shown.lines().skip(2).collect();
+        assert_eq!(
+            lines,
+            [
+                "ambiguous: \"Show Title\", \"Show Title\"",
+                "refused: \"Show Title\", entry not released yet",
+                "chosen: \"Show Title\", no episode",
+            ],
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguity_the_facts_left_undecided_names_each_refusal_and_nothing_chosen() {
+        let shown = explanation(&explained(
+            b"[Group] Show Title - 05.mkv",
+            Outcome::Ambiguous {
+                candidates: vec![
+                    "Show Title".to_owned(),
+                    "Show Title (2019)".to_owned(),
+                    "Show Title (2027)".to_owned(),
+                ],
+                refused: vec![
+                    (
+                        "Show Title".to_owned(),
+                        Fact::Year {
+                            spelled: 2019,
+                            began: 2001,
+                        },
+                    ),
+                    ("Show Title (2027)".to_owned(), Fact::Episodes(2)),
+                ],
+                chosen: None,
+            },
+        ));
+
+        let lines: Vec<&str> = shown.lines().skip(2).collect();
+        assert_eq!(
+            lines,
+            [
+                "ambiguous: \"Show Title\", \"Show Title (2019)\", \"Show Title (2027)\"",
+                "refused: \"Show Title\", name spells year 2019, entry began in 2001",
+                "refused: \"Show Title (2027)\", name spells no episode, entry has 2 episodes",
+            ],
+            "{shown:?}"
         );
     }
 
@@ -871,6 +1110,7 @@ mod tests {
                     title: "Show Title".to_owned(),
                     episode,
                     stage: DecidedBy::Key,
+                    refused: None,
                 },
             ));
 

@@ -19,7 +19,7 @@
 
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,7 @@ use benshi_daemon::bus::BusEvent;
 use benshi_daemon::config::{Period, Reading};
 use benshi_daemon::ipc::bind;
 use benshi_daemon::listing::{Listing, Source};
-use benshi_daemon::protocol::{Request, Response, SourceListing};
+use benshi_daemon::protocol::{DecidedBy, Outcome, Request, Response, SourceListing};
 use benshi_daemon::recognition::Recognizer;
 use benshi_daemon::secrets;
 use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, TaskRecord};
@@ -87,11 +87,26 @@ struct Platform {
     built: Arc<AtomicUsize>,
     fell_over: Arc<AtomicUsize>,
     clock: Arc<TestClock>,
+    /// While set, the file plays and the clock stands, so no time is watched.
+    held: Arc<AtomicBool>,
     fails: bool,
     panics: bool,
 }
 
 impl Platform {
+    /// A platform whose clock stands until [`release`](Platform::release).
+    fn held() -> Self {
+        Self {
+            held: Arc::new(AtomicBool::new(true)),
+            ..Self::default()
+        }
+    }
+
+    /// Let the clock of a [`held`](Platform::held) platform move again.
+    fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+    }
+
     fn source() -> SourceInfo {
         SourceInfo {
             player: PlayerId(PLAYER.to_owned()),
@@ -166,6 +181,7 @@ impl Platform {
         let built = Arc::clone(&self.built);
         let fell_over = Arc::clone(&self.fell_over);
         let clock = Arc::clone(&self.clock);
+        let held = Arc::clone(&self.held);
         let fails = self.fails;
         let panics = self.panics;
 
@@ -173,10 +189,12 @@ impl Platform {
             built.fetch_add(1, Ordering::SeqCst);
             let fell_over = Arc::clone(&fell_over);
             let clock = Arc::clone(&clock);
+            let held = Arc::clone(&held);
 
             std::future::ready(Ok(Watcher {
                 fell_over,
                 clock,
+                held,
                 fails,
                 panics,
             }))
@@ -191,6 +209,7 @@ impl Platform {
 struct Watcher {
     fell_over: Arc<AtomicUsize>,
     clock: Arc<TestClock>,
+    held: Arc<AtomicBool>,
     fails: bool,
     panics: bool,
 }
@@ -227,7 +246,9 @@ impl PlayerWatcher for Watcher {
             return Err(Self::refuse());
         }
 
-        self.clock.advance(STEP);
+        if !self.held.load(Ordering::SeqCst) {
+            self.clock.advance(STEP);
+        }
 
         Ok(PollOutcome {
             sources: vec![Platform::source()],
@@ -589,14 +610,52 @@ fn an_empty_store(home: &TempDir) -> Arc<Mutex<Store>> {
 }
 
 /// The one operation a daemon queues once it has recorded the platform's
-/// file as an episode of [`the_entry`].
-fn the_episode_queued() -> [Operation; 1] {
+/// file as an episode of the show the store filed [`the_entry`] as.
+fn the_episode_queued(store: &Arc<Mutex<Store>>) -> [Operation; 1] {
+    let listed = store
+        .lock()
+        .expect("the store")
+        .listed("anilist")
+        .expect("the list reads");
+    let show = listed
+        .iter()
+        .find(|(_, entry)| entry.id == the_entry().id)
+        .map(|&(show, _)| show)
+        .expect("the store filed the entry");
+
     [Operation {
         id: 1,
-        show: THE_SHOW,
+        show,
         title: "Show".to_owned(),
         kind: Kind::Progress { episode: Some(3) },
     }]
+}
+
+/// Wait until detection decides the platform's file by the list, then let
+/// the platform's clock move.
+///
+/// The file plays from the first round, before the list is read, and a name
+/// no list holds is kept as a show of its own. A held clock lets no time be
+/// watched under that show, so the episode is recorded under the list's show
+/// whichever task ran first.
+async fn once_decided_by_its_list(platform: &Platform, socket: &Path, what: &str) {
+    timeout(PATIENCE, async {
+        loop {
+            if let Response::Why(Some(explained)) = ask(socket, &Request::Why).await
+                && let Outcome::Recognized {
+                    stage: DecidedBy::Key,
+                    ..
+                } = explained.outcome
+            {
+                return;
+            }
+            tokio::time::sleep(PERIOD).await;
+        }
+    })
+    .await
+    .expect(what);
+
+    platform.release();
 }
 
 #[tokio::test]
@@ -606,14 +665,15 @@ async fn a_running_daemon_records_what_the_list_it_read_holds() {
     // task read, filed and put in place for detection.
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
-    let platform = Platform::default();
+    let platform = Platform::held();
 
     let running = a_daemon_reading(&platform, &store, &socket, Reading::default());
 
+    once_decided_by_its_list(&platform, &socket, "the list read at the start").await;
     let queued = once_queued(&store, "the daemon recorded an episode of its list").await;
     running.abort();
 
-    assert_eq!(queued, the_episode_queued());
+    assert_eq!(queued, the_episode_queued(&store));
 }
 
 #[tokio::test]
@@ -623,7 +683,7 @@ async fn a_running_daemon_reads_its_list_where_a_name_misses_it() {
     // recognizes the file.
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
-    let platform = Platform::default();
+    let platform = Platform::held();
     let reading = Reading {
         refresh: Period::Off,
         at_start: false,
@@ -632,17 +692,18 @@ async fn a_running_daemon_reads_its_list_where_a_name_misses_it() {
 
     let running = a_daemon_reading(&platform, &store, &socket, reading);
 
-    let queued = once_queued(&store, "a miss brought a reading of the list").await;
+    once_decided_by_its_list(&platform, &socket, "a miss brought a reading of the list").await;
+    let queued = once_queued(&store, "the daemon recorded an episode of its list").await;
     running.abort();
 
-    assert_eq!(queued, the_episode_queued());
+    assert_eq!(queued, the_episode_queued(&store));
 }
 
 #[tokio::test]
 async fn a_running_daemon_reads_its_list_once_a_login_goes_through() {
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
-    let platform = Platform::default();
+    let platform = Platform::held();
     let reading = Reading {
         refresh: Period::Off,
         at_start: false,
@@ -658,10 +719,11 @@ async fn a_running_daemon_reads_its_list_once_a_login_goes_through() {
     )
     .await;
     assert_eq!(taken, Response::Ok);
-    let queued = once_queued(&store, "a login brought a reading of the list").await;
+    once_decided_by_its_list(&platform, &socket, "a login brought a reading of the list").await;
+    let queued = once_queued(&store, "the daemon recorded an episode of its list").await;
     running.abort();
 
-    assert_eq!(queued, the_episode_queued());
+    assert_eq!(queued, the_episode_queued(&store));
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ use benshi_core::ShowId;
 use benshi_core::list::Entry;
 use benshi_core::recognize::altname::Altnames;
 use benshi_core::recognize::corpus::Corpus;
+use benshi_core::settle::Facts;
 use benshi_core::token::Token;
 use benshi_store::Store;
 #[cfg(target_os = "linux")]
@@ -148,12 +149,14 @@ pub struct Listing<S> {
     pub say: Say,
 }
 
-/// A recognizer of these shows of a list and their entries.
+/// A recognizer of these shows of a list and their entries, each filed with
+/// the facts that settle what is recognized as it.
 #[must_use]
 pub fn recognizer_of(listed: &[(ShowId, Entry)]) -> Recognizer {
     let mut corpus = Corpus::new();
     for (show, entry) in listed {
         corpus.file(*show, &entry.title, &entry.spellings);
+        corpus.file_facts(*show, Facts::from(entry));
     }
 
     Recognizer::of(corpus, Altnames::new())
@@ -386,7 +389,9 @@ mod tests {
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::recognize::Recognition;
+    use benshi_core::settle::{Fact, Settled};
     use benshi_core::token::Token;
+    use benshi_core::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
     use benshi_store::Store;
     use tempfile::TempDir;
     use tokio::task::JoinHandle;
@@ -637,6 +642,34 @@ mod tests {
         assert!(
             matches!(&answer, Recognition::Recognized(found) if found.title == "Show Title"),
             "{answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_recognizer_of_a_list_settles_by_the_facts_of_each_entry() {
+        // The service lists the entry as not yet released, and no file is of
+        // a work that has not been released.
+        let mut announced = an_entry(900_001, "Show Title");
+        announced.released = false;
+        let recognizer = recognizer_of(&[(ShowId(1), announced)]);
+        let path = RawPath::from_bytes(b"[Group] Show Title - 03.mkv".to_vec());
+        let reading = PlayerSnapshot {
+            player: PlayerId("mpv".to_owned()),
+            media: MediaRef::LocalFile(path.clone()),
+            state: PlayState::Playing,
+            position: Known::NotReported,
+            duration: Known::NotReported,
+            observed_at: benshi_core::clock::Timestamp::epoch(),
+        };
+
+        let (parsed, answer) = recognizer.decide(&path);
+
+        assert_eq!(
+            recognizer.settle(&answer, &parsed, &reading),
+            Settled::Refused {
+                show: ShowId(1),
+                fact: Fact::NotReleased,
+            }
         );
     }
 

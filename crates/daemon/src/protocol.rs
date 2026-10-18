@@ -14,8 +14,9 @@ use benshi_core::policy::Policy;
 use benshi_core::recognize::altname::Assignment;
 use benshi_core::recognize::parse::{Episode, Parsed};
 use benshi_core::recognize::{Recognition, Score, Stage};
+use benshi_core::settle::{Fact, Settled};
 use benshi_core::token::Token;
-use benshi_core::{AppName, Capabilities, MediaRef, PlayState, PlayerId};
+use benshi_core::{AppName, Capabilities, MediaRef, PlayState, PlayerId, ShowId};
 use benshi_detect::SourceInfo;
 use serde::{Deserialize, Serialize};
 
@@ -143,7 +144,7 @@ pub enum Response {
 
     /// The most recent decision, in answer to [`Request::Why`], and nothing
     /// where no reading has been decided yet.
-    Why(Option<Explanation>),
+    Why(Option<Box<Explanation>>),
 
     /// Whose the token is, in answer to [`Request::Login`], once it is kept.
     LoggedIn {
@@ -160,19 +161,22 @@ pub enum Response {
 
 /// The most recent decision, as a client is told it.
 ///
-/// Whose file, which file, what its name spelled and what recognition
-/// answered. The parse travels whole rather than as a title, because the
-/// season and the part are what the parser cut out of the title, and they are
-/// what an explanation of an assignment has to show.
+/// Whose file, which file, what its name spelled, what recognition answered
+/// or the show kept in its place, and what the facts made of it: the fact
+/// that refused the file, or the entries refused and the one chosen of
+/// several. The parse travels whole rather than as a title, because the
+/// season and the part are what the parser cut out of the title, and they
+/// are what an explanation of an assignment has to show.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
     /// The source whose reading was decided.
     pub player: PlayerId,
     /// What it had open.
     pub media: MediaRef,
-    /// What the name spelled, before anything was matched.
+    /// What the name spelled, in the reading the answer was decided by.
     pub spelled: Parsed,
-    /// What recognition answered.
+    /// What recognition answered, or the show kept for a name it refused that
+    /// spells a title.
     pub outcome: Outcome,
 }
 
@@ -184,12 +188,12 @@ impl Explanation {
             player: decision.player.clone(),
             media: decision.media.clone(),
             spelled: decision.parsed.clone(),
-            outcome: Outcome::of(&decision.answer),
+            outcome: Outcome::of(&decision.answer, &decision.settled),
         }
     }
 }
 
-/// What recognition answered, on the wire.
+/// What recognition answered, or the show kept in its place, on the wire.
 ///
 /// A form of its own rather than the domain's, because a score is a checked
 /// proportion that deliberately does not deserialize: a message carrying a
@@ -197,20 +201,32 @@ impl Explanation {
 /// a consumer that needs the checked kind converts through the check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
-    /// A title, an episode and the stage that decided.
+    /// A title, an episode, the stage that decided, and the fact of the
+    /// entry that refused the file, where one did.
     Recognized {
-        /// The title as the corpus spells it.
+        /// The title as the corpus spells it, or as the name spelled it where
+        /// the stage is [`DecidedBy::Unlisted`].
         title: String,
         /// The episode in the release's numbering, as it was read from the name.
         episode: Episode,
         /// Which stage decided, and what it decided by.
         stage: DecidedBy,
+        /// The fact of the entry that refused the file, and none where the
+        /// facts let it stand.
+        refused: Option<Fact>,
     },
-    /// Several entries the name reaches, and nothing in it to choose between.
+    /// Several entries the name reaches, the ones the facts of their
+    /// entries refused, and the one they chose.
     Ambiguous {
         /// The title of each entry it reaches, as the corpus spells it. Two
         /// entries can share one.
         candidates: Vec<String>,
+        /// The title of each entry a fact refused, with the fact, in the
+        /// order of the candidates.
+        refused: Vec<(String, Fact)>,
+        /// The title of the entry the facts left alone, with the episode the
+        /// name spells, and none where they left none or several.
+        chosen: Option<(String, Episode)>,
     },
     /// Nothing matched.
     Unrecognized {
@@ -220,20 +236,54 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    fn of(answer: &Recognition) -> Self {
+    fn of(answer: &Recognition, settled: &Settled) -> Self {
         match answer {
             Recognition::Recognized(found) => Self::Recognized {
                 title: found.title.clone(),
                 episode: found.episode,
                 stage: DecidedBy::of(&found.stage),
+                refused: match settled {
+                    Settled::Refused { fact, .. } => Some(*fact),
+                    Settled::Stands { .. }
+                    | Settled::Chosen { .. }
+                    | Settled::Undecided { .. }
+                    | Settled::Unnamed => None,
+                },
             },
-            Recognition::Ambiguous(ambiguity) => Self::Ambiguous {
-                candidates: ambiguity
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.title.clone())
-                    .collect(),
-            },
+            Recognition::Ambiguous(ambiguity) => {
+                let title_of = |show: ShowId| {
+                    ambiguity
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.show == show)
+                        .map(|candidate| candidate.title.clone())
+                        .unwrap_or_default()
+                };
+                let (refused, chosen) = match settled {
+                    Settled::Chosen {
+                        show,
+                        episode,
+                        refused,
+                    } => (refused.as_slice(), Some((title_of(*show), *episode))),
+                    Settled::Undecided { refused } => (refused.as_slice(), None),
+                    Settled::Stands { .. } | Settled::Refused { .. } | Settled::Unnamed => {
+                        (&[][..], None)
+                    }
+                };
+
+                Self::Ambiguous {
+                    candidates: ambiguity
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.title.clone())
+                        .collect(),
+                    refused: refused
+                        .iter()
+                        .map(|&(show, fact)| (title_of(show), fact))
+                        .collect(),
+                    chosen,
+                }
+            }
             Recognition::Unrecognized(refusal) => Self::Unrecognized {
                 best: refusal.best.map(Score::value),
             },
@@ -250,6 +300,8 @@ pub enum DecidedBy {
     Key,
     /// The best candidate the scorer found, and how well it scored.
     Scored(f64),
+    /// A name the list does not hold, kept as a show of its own.
+    Unlisted,
 }
 
 impl DecidedBy {
@@ -258,6 +310,7 @@ impl DecidedBy {
             Stage::Altname(assignment) => Self::Altname(assignment.clone()),
             Stage::Key => Self::Key,
             Stage::Scored(score) => Self::Scored(score.value()),
+            Stage::Unlisted => Self::Unlisted,
         }
     }
 }
@@ -271,8 +324,9 @@ mod tests {
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
     use benshi_core::recognize::altname::Assignment;
-    use benshi_core::recognize::parse::Episode;
+    use benshi_core::recognize::parse::{Episode, Kind};
     use benshi_core::recognize::{Ambiguity, Candidate, Match, Recognition, Refusal, Score, Stage};
+    use benshi_core::settle::{Fact, Settled};
     use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
@@ -311,11 +365,25 @@ mod tests {
         }
     }
 
-    /// A decision about the file [`a_snapshot`] has open, answered this way.
+    /// A decision about the file [`a_snapshot`] has open, answered this way
+    /// and refused by no fact.
     ///
     /// Parsed the way a round parses it, so that what the tests explain is
     /// what the daemon would.
     fn a_decision(answer: Recognition) -> Decision {
+        let settled = match &answer {
+            Recognition::Recognized(found) => Settled::Stands {
+                show: found.show,
+                episode: found.episode,
+            },
+            Recognition::Ambiguous(_) | Recognition::Unrecognized(_) => Settled::Unnamed,
+        };
+        decided_as(answer, settled)
+    }
+
+    /// A decision about the file [`a_snapshot`] has open, answered this way
+    /// and settled this way.
+    fn decided_as(answer: Recognition, settled: Settled) -> Decision {
         let snapshot = a_snapshot();
         let MediaRef::LocalFile(path) = &snapshot.media else {
             panic!("the snapshot has a file open");
@@ -327,7 +395,29 @@ mod tests {
             media: snapshot.media.clone(),
             parsed,
             answer,
+            settled,
         }
+    }
+
+    /// One of each fact that refuses a file.
+    fn every_fact() -> [Fact; 6] {
+        [
+            Fact::NotReleased,
+            Fact::Year {
+                spelled: 2001,
+                began: 2019,
+            },
+            Fact::Episodes(2),
+            Fact::Length {
+                file: Duration::from_secs(114),
+                episode: Duration::from_mins(40),
+            },
+            Fact::PastCount {
+                episode: 5,
+                episodes: 1,
+            },
+            Fact::Kind(Kind::Extra),
+        ]
     }
 
     fn an_assignment() -> Assignment {
@@ -357,6 +447,7 @@ mod tests {
             found_by(Stage::Altname(an_assignment())),
             found_by(Stage::Key),
             found_by(Stage::Scored(Score::new(0.83).expect("a proportion"))),
+            found_by(Stage::Unlisted),
             Recognition::Ambiguous(Ambiguity {
                 parsed: "Fruits Basket".to_owned(),
                 candidates: vec![
@@ -409,8 +500,39 @@ mod tests {
         responses.extend(
             every_recognition()
                 .into_iter()
-                .map(|answer| Response::Why(Some(Explanation::of(&a_decision(answer))))),
+                .map(|answer| Response::Why(Some(Box::new(Explanation::of(&a_decision(answer)))))),
         );
+        responses.extend(every_fact().into_iter().map(|fact| {
+            let refused = decided_as(
+                found_by(Stage::Key),
+                Settled::Refused {
+                    show: ShowId(1),
+                    fact,
+                },
+            );
+            Response::Why(Some(Box::new(Explanation::of(&refused))))
+        }));
+        let chosen = decided_as(
+            Recognition::Ambiguous(Ambiguity {
+                parsed: "Show Title".to_owned(),
+                candidates: vec![
+                    Candidate {
+                        show: ShowId(1),
+                        title: "Show Title".to_owned(),
+                    },
+                    Candidate {
+                        show: ShowId(2),
+                        title: "Show Title (2019)".to_owned(),
+                    },
+                ],
+            }),
+            Settled::Chosen {
+                show: ShowId(2),
+                episode: Episode::Only(3),
+                refused: vec![(ShowId(1), Fact::NotReleased)],
+            },
+        );
+        responses.push(Response::Why(Some(Box::new(Explanation::of(&chosen)))));
 
         responses
     }
@@ -553,6 +675,7 @@ mod tests {
                 title: "Shingeki no Kyojin".to_owned(),
                 episode: Episode::Only(3),
                 stage: DecidedBy::Altname(an_assignment()),
+                refused: None,
             }
         );
     }
@@ -569,6 +692,47 @@ mod tests {
                 title: "Shingeki no Kyojin".to_owned(),
                 episode: Episode::Only(3),
                 stage: DecidedBy::Scored(0.83),
+                refused: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_explanation_of_a_file_a_fact_refused_carries_the_fact() {
+        // What `benshi why` names a refusal by: the match recognition made,
+        // and the fact of its entry that refused the file.
+        for fact in every_fact() {
+            let explained = Explanation::of(&decided_as(
+                found_by(Stage::Key),
+                Settled::Refused {
+                    show: ShowId(1),
+                    fact,
+                },
+            ));
+
+            assert_eq!(
+                explained.outcome,
+                Outcome::Recognized {
+                    title: "Shingeki no Kyojin".to_owned(),
+                    episode: Episode::Only(3),
+                    stage: DecidedBy::Key,
+                    refused: Some(fact),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_explanation_of_a_name_the_list_does_not_hold_says_so() {
+        let explained = Explanation::of(&a_decision(found_by(Stage::Unlisted)));
+
+        assert_eq!(
+            explained.outcome,
+            Outcome::Recognized {
+                title: "Shingeki no Kyojin".to_owned(),
+                episode: Episode::Only(3),
+                stage: DecidedBy::Unlisted,
+                refused: None,
             }
         );
     }
@@ -596,6 +760,78 @@ mod tests {
                     "Fruits Basket".to_owned(),
                     "Fruits Basket (2019)".to_owned(),
                 ],
+                refused: Vec::new(),
+                chosen: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_explanation_of_an_ambiguity_the_facts_settled_names_what_they_refused_and_chose() {
+        let several = || {
+            Recognition::Ambiguous(Ambiguity {
+                parsed: "Show Title".to_owned(),
+                candidates: vec![
+                    Candidate {
+                        show: ShowId(1),
+                        title: "Show Title".to_owned(),
+                    },
+                    Candidate {
+                        show: ShowId(2),
+                        title: "Show Title (2019)".to_owned(),
+                    },
+                    Candidate {
+                        show: ShowId(3),
+                        title: "Show Title".to_owned(),
+                    },
+                ],
+            })
+        };
+        let year = Fact::Year {
+            spelled: 2019,
+            began: 2001,
+        };
+
+        let chosen = Explanation::of(&decided_as(
+            several(),
+            Settled::Chosen {
+                show: ShowId(2),
+                episode: Episode::Only(5),
+                refused: vec![(ShowId(1), year), (ShowId(3), Fact::NotReleased)],
+            },
+        ));
+        let undecided = Explanation::of(&decided_as(
+            several(),
+            Settled::Undecided {
+                refused: vec![(ShowId(3), Fact::NotReleased)],
+            },
+        ));
+
+        assert_eq!(
+            chosen.outcome,
+            Outcome::Ambiguous {
+                candidates: vec![
+                    "Show Title".to_owned(),
+                    "Show Title (2019)".to_owned(),
+                    "Show Title".to_owned(),
+                ],
+                refused: vec![
+                    ("Show Title".to_owned(), year),
+                    ("Show Title".to_owned(), Fact::NotReleased),
+                ],
+                chosen: Some(("Show Title (2019)".to_owned(), Episode::Only(5))),
+            }
+        );
+        assert_eq!(
+            undecided.outcome,
+            Outcome::Ambiguous {
+                candidates: vec![
+                    "Show Title".to_owned(),
+                    "Show Title (2019)".to_owned(),
+                    "Show Title".to_owned(),
+                ],
+                refused: vec![("Show Title".to_owned(), Fact::NotReleased)],
+                chosen: None,
             }
         );
     }

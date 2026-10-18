@@ -1,9 +1,9 @@
 //! What is open in the players, and what a store is to do about it.
 //!
-//! A [`Session`] takes a reading together with what recognition decided
-//! about it, and answers with [`Effect`]s: a question for a store, a total
-//! to keep, an episode to record, a sitting to close. It carries out none of
-//! them, so this crate stays free of I/O and a test reads the whole answer.
+//! A [`Session`] takes a reading together with what was settled about it,
+//! and answers with [`Effect`]s: a question for a store, a total to keep, an
+//! episode to record, a sitting to close. It carries out none of them, so
+//! this crate stays free of I/O and a test reads the whole answer.
 //! The caller carries each one out, in the order given, and brings the
 //! answer to a question back through [`Session::resumed`].
 //!
@@ -54,25 +54,27 @@
 //! store that the episode registered already records nothing at all.
 //!
 //! **What names no episode begins no sitting.** That is a reading that names
-//! no file, a reading recognition was not asked about, a name it refused or
-//! found under several entries, a file of several episodes, and a half
-//! episode. Nothing is kept or recorded for any of them, and such a reading
-//! answers with no effect: its player leaves the sitting it was in.
+//! no file, a reading nothing was settled about, a name recognition refused,
+//! or found under several entries the facts chose none of, a file a fact of
+//! its entry refused, a file of several episodes, and a half episode. Nothing
+//! is kept or recorded for any of them, and such a reading answers with no
+//! effect: its player leaves the sitting it was in.
 
 use std::mem;
 use std::time::Duration;
 
 use crate::clock::Timestamp;
 use crate::path::RawPath;
-use crate::recognize::Recognition;
 use crate::recognize::parse::Episode;
+use crate::settle::Settled;
 use crate::timeline::{Progress, Timeline, WatchedPolicy};
 use crate::{Known, MediaRef, PlayerId, PlayerSnapshot, ShowId};
 
 /// What a store is to do, in answer to a reading or to the end of a round.
 ///
-/// A show is the one recognition named, as the store files it. An episode is
-/// in the release's numbering, and a film has none.
+/// A show is the one recognition named, or the one the facts chose of
+/// several, as the store files it. An episode is in the release's numbering,
+/// and a film has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Ask what was kept of an episode, and bring the answer to
@@ -148,7 +150,7 @@ pub struct Resumed {
     pub registered: bool,
 }
 
-/// What a reading names, borrowed from the reading and the decision.
+/// What a reading names, with its file borrowed from the reading.
 ///
 /// Borrowed because every reading is asked what it names and a sitting
 /// begins at few of them.
@@ -156,7 +158,7 @@ pub struct Resumed {
 struct Named<'reading> {
     /// The file that is open.
     media: &'reading RawPath,
-    /// The show recognition named.
+    /// The show recognition named, or the one the facts chose of several.
     show: ShowId,
     /// The episode, and none for a film.
     episode: Option<u32>,
@@ -165,20 +167,19 @@ struct Named<'reading> {
 impl<'reading> Named<'reading> {
     /// What this reading names, and nothing where it names no episode.
     ///
-    /// Both matches are written out, so that an answer recognition gains and
-    /// a case an episode gains each stop the build here.
-    fn by(
-        reading: &'reading PlayerSnapshot,
-        decision: Option<&'reading Recognition>,
-    ) -> Option<Self> {
+    /// Both matches are written out, so that an answer settling gains and a
+    /// case an episode gains each stop the build here.
+    fn by(reading: &'reading PlayerSnapshot, decision: Option<&Settled>) -> Option<Self> {
         let MediaRef::LocalFile(media) = &reading.media else {
             return None;
         };
-        let found = match decision? {
-            Recognition::Recognized(found) => found,
-            Recognition::Ambiguous(_) | Recognition::Unrecognized(_) => return None,
+        let (show, episode) = match decision? {
+            Settled::Stands { show, episode } | Settled::Chosen { show, episode, .. } => {
+                (*show, *episode)
+            }
+            Settled::Refused { .. } | Settled::Undecided { .. } | Settled::Unnamed => return None,
         };
-        let episode = match found.episode {
+        let episode = match episode {
             Episode::Only(number) => Some(number),
             Episode::Absent => None,
             // Neither is an episode to record, and with no episode either
@@ -188,7 +189,7 @@ impl<'reading> Named<'reading> {
 
         Some(Self {
             media,
-            show: found.show,
+            show,
             episode,
         })
     }
@@ -269,7 +270,7 @@ enum Count {
 /// reading its last player left at until the round is over.
 #[derive(Debug)]
 struct Sitting {
-    /// The show recognition named.
+    /// The show recognition named, or the one the facts chose of several.
     show: ShowId,
     /// The episode, and none for a film.
     episode: Option<u32>,
@@ -480,24 +481,20 @@ impl Session {
         }
     }
 
-    /// Take one reading with what was decided about it, and answer with what
+    /// Take one reading with what was settled about it, and answer with what
     /// a store is to do.
     ///
-    /// `decision` is what recognition answered for the file the reading
-    /// names, and nothing where recognition was not asked. The effects are
-    /// in the order they are to be carried out: a total is kept before its
-    /// episode is recorded. No reading closes a sitting: the player of a
-    /// reading that names another episode or none leaves the sitting it was
-    /// in, and [`Session::end_round`] closes a sitting no player is in.
+    /// `decision` is what was settled of the file the reading names, and
+    /// nothing where nothing was asked. The effects are in the order they are
+    /// to be carried out: a total is kept before its episode is recorded. No
+    /// reading closes a sitting: the player of a reading that names another
+    /// episode or none leaves the sitting it was in, and
+    /// [`Session::end_round`] closes a sitting no player is in.
     ///
     /// Every reading is stamped from the clock every other reading of this
     /// session is stamped from.
     #[must_use = "an effect that is dropped is one nobody carries out"]
-    pub fn advance(
-        &mut self,
-        reading: &PlayerSnapshot,
-        decision: Option<&Recognition>,
-    ) -> Vec<Effect> {
+    pub fn advance(&mut self, reading: &PlayerSnapshot, decision: Option<&Settled>) -> Vec<Effect> {
         let named = Named::by(reading, decision);
 
         if let Some(named) = named
@@ -602,7 +599,8 @@ mod tests {
     use crate::recognize::corpus::Corpus;
     use crate::recognize::index::Index;
     use crate::recognize::parse::{Episode, parse};
-    use crate::recognize::{Ambiguity, Candidate, Match, Recognition, Refusal, Stage, decide};
+    use crate::recognize::{Ambiguity, Candidate, Recognition, Refusal, decide};
+    use crate::settle::{Fact, Facts, Settled, settle};
     use crate::timeline::{WATCHED_FALLBACK, WatchedPolicy};
     use crate::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
     use std::cell::Cell;
@@ -765,26 +763,52 @@ mod tests {
         }
     }
 
-    /// What recognition answers for the file a reading names, against a list
-    /// of two series and one film, and nothing where it names no file.
-    ///
-    /// The name and never the directory, which is how the daemon asks.
-    fn decided(reading: &PlayerSnapshot) -> Option<Recognition> {
-        let MediaRef::LocalFile(path) = &reading.media else {
-            return None;
-        };
+    /// A list of two series and one film, filed with no facts.
+    fn the_list() -> Corpus {
         let mut list = Corpus::new();
         for show in [SERIES, SECOND_SERIES, FILM] {
             list.file(show, title_of(show), Vec::<&str>::new());
         }
-        let name = RawPath::from_bytes(path.file_name().to_vec());
+        list
+    }
 
-        Some(decide(
-            &parse(&name),
-            &Altnames::new(),
-            &list,
-            &Index::of(&list),
-        ))
+    /// What recognition answers for the file a reading names, against
+    /// `list`, and what the list's facts settle of it, and nothing where the
+    /// reading names no file.
+    ///
+    /// The name alone, by [`decide`]. The daemon asks
+    /// [`read_file`](crate::recognize::read_file), which answers these names
+    /// the same: none has another reading, and none begins with its episode.
+    fn decided_against(list: &Corpus, reading: &PlayerSnapshot) -> Option<(Recognition, Settled)> {
+        let MediaRef::LocalFile(path) = &reading.media else {
+            return None;
+        };
+        let spelled = parse(&RawPath::from_bytes(path.file_name().to_vec()));
+        let answer = decide(&spelled, &Altnames::new(), list, &Index::of(list));
+        let settled = settle(&answer, &spelled, reading, list);
+
+        Some((answer, settled))
+    }
+
+    /// What is settled of the file a reading names, against [`the_list`].
+    fn decided(reading: &PlayerSnapshot) -> Option<Settled> {
+        decided_against(&the_list(), reading).map(|(_, settled)| settled)
+    }
+
+    /// What recognition answers for the file a reading names, against
+    /// [`the_list`].
+    fn recognized_as(reading: &PlayerSnapshot) -> Option<Recognition> {
+        decided_against(&the_list(), reading).map(|(answer, _)| answer)
+    }
+
+    /// What the facts of [`the_list`] settle of an answer written out by
+    /// hand, for the file a reading names.
+    fn settled(answer: &Recognition, reading: &PlayerSnapshot) -> Settled {
+        let MediaRef::LocalFile(path) = &reading.media else {
+            panic!("the reading names a file")
+        };
+        let spelled = parse(&RawPath::from_bytes(path.file_name().to_vec()));
+        settle(answer, &spelled, reading, &the_list())
     }
 
     /// The title of a show of the list, and that of the series for any other
@@ -797,14 +821,20 @@ mod tests {
         }
     }
 
+    /// The facts of a work the list holds as not yet released.
+    fn unreleased() -> Facts {
+        Facts {
+            episodes: None,
+            episode_length: None,
+            year: None,
+            released: false,
+            format: None,
+        }
+    }
+
     /// A decision written out by hand, for a test that is about the decision.
-    fn recognized(show: ShowId, episode: Episode) -> Recognition {
-        Recognition::Recognized(Match {
-            show,
-            title: title_of(show).to_owned(),
-            episode,
-            stage: Stage::Key,
-        })
+    fn recognized(show: ShowId, episode: Episode) -> Settled {
+        Settled::Stands { show, episode }
     }
 
     /// What the session answers to one reading, with no answer given back.
@@ -2126,9 +2156,10 @@ mod tests {
         let mut session = Session::new(half());
         let player = Player::named("mpv");
         assert!(matches!(
-            decided(&player.playing(NOT_LISTED)),
+            recognized_as(&player.playing(NOT_LISTED)),
             Some(Recognition::Unrecognized(_))
         ));
+        assert_eq!(decided(&player.playing(NOT_LISTED)), Some(Settled::Unnamed));
 
         let answers = watch(&mut session, &player, NOT_LISTED, 150, None);
 
@@ -2136,26 +2167,123 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_reaches_several_entries_is_not_recorded() {
+    fn a_name_several_entries_share_is_not_recorded_where_the_facts_choose_none() {
         // Neither candidate is taken, the first included.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
-        let either = Recognition::Ambiguous(Ambiguity {
-            parsed: "Show Title".to_owned(),
-            candidates: vec![
-                Candidate {
-                    show: SERIES,
-                    title: "Show Title".to_owned(),
-                },
-                Candidate {
-                    show: ShowId(4),
-                    title: "Show Title (2019)".to_owned(),
-                },
-            ],
-        });
+        let either = settled(
+            &Recognition::Ambiguous(Ambiguity {
+                parsed: "Show Title".to_owned(),
+                candidates: vec![
+                    Candidate {
+                        show: SERIES,
+                        title: "Show Title".to_owned(),
+                    },
+                    Candidate {
+                        show: ShowId(4),
+                        title: "Show Title (2019)".to_owned(),
+                    },
+                ],
+            }),
+            &player.playing(THIRD),
+        );
 
         let effects: Vec<Effect> = (0..150)
             .flat_map(|_| session.advance(&player.playing(THIRD), Some(&either)))
+            .collect();
+
+        assert_eq!(effects, NOTHING);
+    }
+
+    #[test]
+    fn a_file_a_fact_of_its_entry_refused_is_not_recorded() {
+        // The series runs an hour an episode, and a file of two hundred
+        // seconds is no episode of it, however long it plays.
+        let mut list = the_list();
+        list.file_facts(
+            SERIES,
+            Facts {
+                episodes: Some(12),
+                episode_length: Some(Duration::from_hours(1)),
+                year: None,
+                released: true,
+                format: None,
+            },
+        );
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        assert_eq!(
+            decided_against(&list, &player.playing(THIRD)).map(|(_, settled)| settled),
+            Some(Settled::Refused {
+                show: SERIES,
+                fact: Fact::Length {
+                    file: LENGTH,
+                    episode: Duration::from_hours(1),
+                },
+            })
+        );
+
+        let effects: Vec<Effect> = (0..150)
+            .flat_map(|_| {
+                let reading = player.playing(THIRD);
+                let refused = decided_against(&list, &reading).map(|(_, settled)| settled);
+                session.advance(&reading, refused.as_ref())
+            })
+            .collect();
+
+        assert_eq!(effects, NOTHING);
+    }
+
+    #[test]
+    fn a_show_the_facts_chose_of_several_is_recorded_as_any_other() {
+        // Two entries share the title, and the list holds the second as not
+        // yet released, so the file is of the first.
+        let mut list = the_list();
+        list.file(ShowId(4), "Show Title", Vec::<&str>::new());
+        list.file_facts(ShowId(4), unreleased());
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let reading = player.playing(THIRD);
+        let (answer, chosen) = decided_against(&list, &reading).expect("the reading names a file");
+        assert!(matches!(answer, Recognition::Ambiguous(_)), "{answer:?}");
+        assert_eq!(
+            chosen,
+            Settled::Chosen {
+                show: SERIES,
+                episode: Episode::Only(3),
+                refused: vec![(ShowId(4), Fact::NotReleased)],
+            }
+        );
+
+        assert_eq!(
+            session.advance(&reading, Some(&chosen)),
+            [resume(1, SERIES, Some(3))]
+        );
+    }
+
+    #[test]
+    fn a_name_the_facts_leave_several_entries_of_is_not_recorded() {
+        // Three entries share the title and the list holds one as not yet
+        // released: two are left, and neither is taken.
+        let mut list = the_list();
+        list.file(ShowId(4), "Show Title", Vec::<&str>::new());
+        list.file(ShowId(5), "Show Title", Vec::<&str>::new());
+        list.file_facts(ShowId(5), unreleased());
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        assert_eq!(
+            decided_against(&list, &player.playing(THIRD)).map(|(_, settled)| settled),
+            Some(Settled::Undecided {
+                refused: vec![(ShowId(5), Fact::NotReleased)],
+            })
+        );
+
+        let effects: Vec<Effect> = (0..150)
+            .flat_map(|_| {
+                let reading = player.playing(THIRD);
+                let left = decided_against(&list, &reading).map(|(_, settled)| settled);
+                session.advance(&reading, left.as_ref())
+            })
             .collect();
 
         assert_eq!(effects, NOTHING);
@@ -2210,10 +2338,13 @@ mod tests {
         let the_third = recognized(SERIES, Episode::Only(3));
         let the_fourth = recognized(SERIES, Episode::Only(4));
         let of_the_second = recognized(SECOND_SERIES, Episode::Only(4));
-        let nothing = Recognition::Unrecognized(Refusal {
-            parsed: "Show Title".to_owned(),
-            best: None,
-        });
+        let nothing = settled(
+            &Recognition::Unrecognized(Refusal {
+                parsed: "Show Title".to_owned(),
+                best: None,
+            }),
+            &player.playing(THIRD),
+        );
 
         // A round each: what the reading answered, and what the end of the
         // round did.
@@ -2260,7 +2391,7 @@ mod tests {
         let stamps = Stamps::new();
         let the_third = recognized(SERIES, Episode::Only(3));
         let the_fourth = recognized(SERIES, Episode::Only(4));
-        let mut round = |at: u64, decision: &Recognition| {
+        let mut round = |at: u64, decision: &Settled| {
             let first = session.advance(&stamps.playing("mpv", THIRD, at), Some(decision));
             let second = session.advance(&stamps.playing("vlc", THIRD, at + 200), Some(decision));
             [first, second, session.end_round(&[])]

@@ -17,15 +17,24 @@
 //! shows what the daemon is acting on, and a second look at the platform would
 //! be free to disagree with it.
 //!
-//! And a round decides what each admitted reading has open, leaving the last
-//! decision in [`Decided`] for a client asking why. Recognition itself is pure
-//! logic in `benshi-core`; what is here is the moment it is asked.
+//! And a round decides what each admitted reading has open and settles it by
+//! the facts the list holds, leaving the last decision in [`Decided`] for a
+//! client asking why. Recognition and settling are pure logic in
+//! `benshi-core`; what is here is the moment they are asked.
 //!
-//! **What was decided is what gets recorded.** Every admitted reading goes to
-//! a [`Session`] with the decision about it, and what the session answers is
+//! **What was settled is what gets recorded.** Every admitted reading goes to
+//! a [`Session`] with what was settled of it, and what the session answers is
 //! carried out in the store: what was watched of an episode is kept, an
 //! episode watched far enough is recorded, and an episode is closed at the
 //! end of a round that leaves it open in no player.
+//!
+//! **A name the list does not hold is kept.** Where recognition refuses a
+//! name that spells a title, the store files a show of its own for the name
+//! the first time its key is seen, and the same show every time after, so the
+//! name is settled and recorded as any other. The show is linked to no entry
+//! of a list. A list not read yet holds no name, so a name played before the
+//! first reading of the list is kept this way too. A name that spells no
+//! title stays refused.
 //!
 //! **A player has left what it had open when a round hears nothing of it
 //! that says otherwise.** A reading that policy admitted says otherwise. So
@@ -56,8 +65,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use benshi_core::policy::PolicyTable;
-use benshi_core::recognize::Recognition;
+use benshi_core::recognize::normalize::Key;
+use benshi_core::recognize::parse::Parsed;
+use benshi_core::recognize::{Match, Recognition, Stage};
 use benshi_core::session::{Effect, Resumed, Session};
+use benshi_core::settle::Settled;
 use benshi_core::timeline::WatchedPolicy;
 use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
@@ -173,6 +185,7 @@ fn refused(error: benshi_store::Error) -> TaskError {
         | Error::Orphan { .. }
         | Error::Entry { .. }
         | Error::Showless { .. }
+        | Error::Name { .. }
         | Error::Media { .. }
         | Error::Instant { .. } => TaskError::Permanent(error.into()),
     }
@@ -247,6 +260,33 @@ where
             "store could not be asked: {given_up}"
         ))),
     }
+}
+
+/// A name recognition refused, as the show it is kept as where it spells a
+/// title, and as it was answered where it spells none.
+///
+/// The store files the show the first time the name's key is seen, and finds
+/// it by that key alone after.
+async fn unlisted(
+    store: Arc<Mutex<Store>>,
+    answer: Recognition,
+    parsed: &Parsed,
+) -> Result<Recognition, TaskError> {
+    let Recognition::Unrecognized(_) = &answer else {
+        return Ok(answer);
+    };
+    let (Some(title), Some(key)) = (parsed.title.clone(), Key::from_parsed(parsed)) else {
+        return Ok(answer);
+    };
+    let spelled = title.clone();
+    let show = ask(store, move |store| store.unlisted(&key, &spelled)).await?;
+
+    Ok(Recognition::Recognized(Match {
+        show,
+        title,
+        episode: parsed.episode,
+        stage: Stage::Unlisted,
+    }))
 }
 
 /// Readings from a platform, filtered by policy, published to the bus and
@@ -382,7 +422,7 @@ impl<W: PlayerWatcher> Detection<W> {
                 if !self.heard.contains(&snapshot.player) {
                     self.heard.insert(snapshot.player.clone());
                 }
-                let decision = self.decide(&recognizer, &snapshot);
+                let decision = self.decide(&recognizer, &snapshot).await?;
                 let effects = self.session.advance(&snapshot, decision.as_ref());
                 self.carry_out(effects).await?;
                 self.bus.publish(BusEvent::Snapshot(snapshot));
@@ -424,8 +464,9 @@ impl<W: PlayerWatcher> Detection<W> {
         }
     }
 
-    /// Decide what an admitted reading has open, leave the decision where a
-    /// client can read it, and answer with it.
+    /// Decide what an admitted reading has open, settle it by the facts the
+    /// list holds, leave both where a client can read them, and answer with
+    /// what was settled.
     ///
     /// A file and nothing else. An address names no file on this machine, and
     /// a title with nothing underneath it is what a browser publishes;
@@ -433,10 +474,15 @@ impl<W: PlayerWatcher> Detection<W> {
     /// for. Every admitted reading of a file is decided, every round, so that
     /// what a client reads is the decision about the reading the daemon last
     /// acted on. A name that spells a title the list does not hold wakes the
-    /// list's task, which may read the list again.
-    fn decide(&self, recognizer: &Recognizer, snapshot: &PlayerSnapshot) -> Option<Recognition> {
+    /// list's task, which may read the list again, and is kept as a show of
+    /// its own.
+    async fn decide(
+        &mut self,
+        recognizer: &Recognizer,
+        snapshot: &PlayerSnapshot,
+    ) -> Result<Option<Settled>, TaskError> {
         let MediaRef::LocalFile(path) = &snapshot.media else {
-            return None;
+            return Ok(None);
         };
         let (parsed, answer) = recognizer.decide(path);
         if let Recognition::Unrecognized(refusal) = &answer
@@ -444,15 +490,18 @@ impl<W: PlayerWatcher> Detection<W> {
         {
             self.wakes.missed();
         }
+        let answer = unlisted(Arc::clone(&self.store), answer, &parsed).await?;
+        let settled = recognizer.settle(&answer, &parsed, snapshot);
 
         self.decided.record(Decision {
             player: snapshot.player.clone(),
             media: snapshot.media.clone(),
             parsed,
-            answer: answer.clone(),
+            answer,
+            settled: settled.clone(),
         });
 
-        Some(answer)
+        Ok(Some(settled))
     }
 
     /// Carry out what the session answered, in the order it answered, and
@@ -557,10 +606,11 @@ mod tests {
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
-    use benshi_core::recognize::Recognition;
     use benshi_core::recognize::altname::Altnames;
     use benshi_core::recognize::corpus::Corpus;
     use benshi_core::recognize::parse::Episode;
+    use benshi_core::recognize::{Recognition, Stage};
+    use benshi_core::settle::{Fact, Facts, Settled};
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
@@ -822,9 +872,9 @@ mod tests {
     /// Detection over these rounds, against this policy table, leaving what it
     /// saw in `seen`.
     ///
-    /// Nothing to match a name against, so nothing reaches the database it is
-    /// handed back with, and no decision read back: a test that reads one
-    /// takes [`deciding`] instead.
+    /// Nothing to match a name against, so a name that spells a title is kept
+    /// as a show of its own in the database it is handed back with, and no
+    /// decision read back: a test that reads one takes [`deciding`] instead.
     fn detecting(
         watcher: ScriptedWatcher,
         bus: Arc<EventBus>,
@@ -1414,8 +1464,12 @@ mod tests {
         assert_eq!(decision.parsed.title.as_deref(), Some("Show Title"));
         assert_eq!(decision.parsed.episode, Episode::Only(3));
         assert!(
-            matches!(decision.answer, Recognition::Unrecognized(_)),
-            "nothing to match against, got {:?}",
+            matches!(
+                &decision.answer,
+                Recognition::Recognized(found)
+                    if found.stage == Stage::Unlisted && found.title == "Show Title"
+            ),
+            "nothing to match against, so a show of its own, got {:?}",
             decision.answer
         );
     }
@@ -1689,6 +1743,105 @@ mod tests {
                 title: SERIES.to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_a_fact_of_its_entry_refuses_is_neither_kept_nor_recorded() {
+        // The list holds the series as running an hour an episode, and a
+        // file of four minutes is no episode of it however long it plays.
+        // The decision a client reads says which fact refused it.
+        let database = Database::new();
+        let decided = Decided::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT + 1));
+        let mut list = Corpus::new();
+        for (show, title) in LIST {
+            list.file(show, title, Vec::<&str>::new());
+        }
+        let an_hour = Duration::from_hours(1);
+        list.file_facts(
+            show_of(SERIES),
+            Facts {
+                episodes: Some(12),
+                episode_length: Some(an_hour),
+                year: None,
+                released: true,
+                format: None,
+            },
+        );
+        let wiring = Wiring {
+            recognizer: Current::new(Recognizer::of(list, Altnames::new())),
+            decided: decided.clone(),
+            ..wired_to(&database)
+        };
+        let mut detection = Detection::new(watcher, wiring);
+
+        rounds(&mut detection, HALF_AT + 2).await;
+
+        assert_eq!(database.seen(), NOTHING_SEEN);
+        assert_eq!(database.count_of("watching"), [0]);
+        assert!(database.queued().is_empty(), "{:?}", database.queued());
+        assert_eq!(
+            decided.latest().expect("the reading was decided").settled,
+            Settled::Refused {
+                show: show_of(SERIES),
+                fact: Fact::Length {
+                    file: LENGTH,
+                    episode: an_hour,
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_two_entries_share_is_recorded_under_the_one_the_facts_chose() {
+        // A second entry of the series' title, which the list holds as not
+        // yet released: the name reaches both, and the file is of the first.
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let mut list = Corpus::new();
+        for (show, title) in LIST {
+            list.file(show, title, Vec::<&str>::new());
+        }
+        list.file(ShowId(4), SERIES, Vec::<&str>::new());
+        list.file_facts(
+            ShowId(4),
+            Facts {
+                episodes: None,
+                episode_length: None,
+                year: None,
+                released: false,
+                format: None,
+            },
+        );
+        let wiring = Wiring {
+            recognizer: Current::new(Recognizer::of(list, Altnames::new())),
+            ..wired_to(&database)
+        };
+        let mut detection = Detection::new(watcher, wiring);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        assert_eq!(
+            database.seen(),
+            [Viewed {
+                title: SERIES.to_owned(),
+                episode: Some(3),
+                media: THIRD.to_owned(),
+                at: THE_TIME.to_owned(),
+            }]
+        );
+        // The show of the list, where a show kept for the name would carry
+        // its title too.
+        assert_eq!(
+            database
+                .queued()
+                .iter()
+                .map(|operation| operation.show)
+                .collect::<Vec<_>>(),
+            [show_of(SERIES)]
         );
     }
 
@@ -1987,7 +2140,7 @@ mod tests {
     async fn a_player_that_opens_a_file_nobody_recognized_closes_its_episode() {
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
-        let moved_on = a_round_of(&[&mpv], vec![playing(&mpv, NOT_LISTED, HALF_AT + 1)]);
+        let moved_on = a_round_of(&[&mpv], vec![playing(&mpv, "/anime/03.mkv", HALF_AT + 1)]);
         let mut detection = registered(&database, &mpv, moved_on).await;
 
         rounds(&mut detection, 1).await;
@@ -2087,10 +2240,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_nobody_recognized_reaches_no_table() {
+    async fn a_name_that_spells_no_title_reaches_no_table() {
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
-        let watcher = ScriptedWatcher::of(watching(&mpv, NOT_LISTED, 0..=HALF_AT));
+        let watcher = ScriptedWatcher::of(watching(&mpv, "/anime/03.mkv", 0..=HALF_AT));
         let mut detection = recording(watcher, &database);
 
         rounds(&mut detection, HALF_AT + 1).await;
@@ -2100,9 +2253,92 @@ mod tests {
             [3],
             "the shows of the list alone"
         );
-        for table in ["watching", "episodes_seen", "sync_queue"] {
+        for table in ["names", "watching", "episodes_seen", "sync_queue"] {
             assert_eq!(database.count_of(table), [0], "{table}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_name_the_list_does_not_hold_is_recorded_as_a_show_of_its_own() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(&mpv, NOT_LISTED, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        assert_eq!(
+            database.seen(),
+            [Viewed {
+                title: "Some Other Show".to_owned(),
+                episode: Some(3),
+                media: NOT_LISTED.to_owned(),
+                at: THE_TIME.to_owned(),
+            }]
+        );
+        assert_eq!(
+            database.queued(),
+            [Operation {
+                id: 1,
+                show: ShowId(4),
+                title: "Some Other Show".to_owned(),
+                kind: Kind::Progress { episode: Some(3) },
+            }]
+        );
+        assert_eq!(database.count_of("names"), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_name_kept_once_is_the_same_show_after_a_restart() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let fourth = "/anime/[Group] Some Other Show - 04 [1080p].mkv";
+        let first = ScriptedWatcher::of(watching(&mpv, NOT_LISTED, 0..=HALF_AT));
+        rounds(&mut recording(first, &database), HALF_AT + 1).await;
+
+        let again = ScriptedWatcher::of(watching(&mpv, fourth, 0..=HALF_AT));
+        rounds(&mut recording(again, &database), HALF_AT + 1).await;
+
+        let shows = database.rows(
+            "SELECT DISTINCT show FROM episodes_seen ORDER BY show",
+            |row| row.get::<_, i64>(0),
+        );
+        assert_eq!(shows, [4], "{:?}", database.seen());
+        assert_eq!(database.seen().len(), 2, "{:?}", database.seen());
+        assert_eq!(database.count_of("shows"), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_name_near_one_kept_is_a_show_of_its_own() {
+        // The scorer takes the near name for the kept one where the list
+        // holds that title, and a kept name is reached by its key alone.
+        let near = "/anime/[Group] Some Other Show Again - 03 [1080p].mkv";
+        let mut holding = Corpus::new();
+        holding.file(ShowId(1), "Some Other Show", Vec::<&str>::new());
+        let (_, against_a_list) = Recognizer::of(holding, Altnames::new()).decide(&a_path(near));
+        assert!(
+            matches!(
+                &against_a_list,
+                Recognition::Recognized(found) if matches!(found.stage, Stage::Scored(_))
+            ),
+            "{against_a_list:?}"
+        );
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let mut rounds_of = watching(&mpv, NOT_LISTED, 0..=HALF_AT);
+        rounds_of.extend(watching(&mpv, near, HALF_AT + 1..=2 * HALF_AT + 1));
+        let mut detection = recording(ScriptedWatcher::of(rounds_of), &database);
+
+        rounds(&mut detection, 2 * HALF_AT + 2).await;
+
+        let titles = database.rows("SELECT title FROM shows ORDER BY id", |row| {
+            row.get::<_, String>(0)
+        });
+        assert_eq!(
+            titles[LIST.len()..],
+            ["Some Other Show", "Some Other Show Again"]
+        );
+        assert_eq!(database.count_of("names"), [2]);
     }
 
     #[tokio::test]
@@ -2368,9 +2604,14 @@ mod tests {
 
         detection.round().await.expect("a round");
 
+        // The empty list before keeps the name as a show of its own, where the
+        // one put in place would have answered the series by its key.
         let decision = decided.latest().expect("the reading was decided");
         assert!(
-            matches!(decision.answer, Recognition::Unrecognized(_)),
+            matches!(
+                &decision.answer,
+                Recognition::Recognized(found) if found.stage == Stage::Unlisted
+            ),
             "got {:?}",
             decision.answer
         );
@@ -2391,9 +2632,13 @@ mod tests {
         current.replace(a_list());
         detection.round().await.expect("a round");
 
+        // By its key: a name kept as a show of its own carries the title too.
         let decision = decided.latest().expect("the reading was decided");
         assert!(
-            matches!(&decision.answer, Recognition::Recognized(found) if found.title == SERIES),
+            matches!(
+                &decision.answer,
+                Recognition::Recognized(found) if found.title == SERIES && found.stage == Stage::Key
+            ),
             "got {:?}",
             decision.answer
         );
