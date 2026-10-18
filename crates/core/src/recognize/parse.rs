@@ -16,6 +16,13 @@
 //! title ends at the season marker, so in `Show Title Season 3 Part 2 - 03`
 //! the part belongs to no element at all. [`parse`] reads it back from that
 //! one place and no other.
+//!
+//! **Japanese title quotes are read as spaces.** `「」` and `『』` set off a
+//! title or a subtitle in Japanese, and the parser counts them among its
+//! brackets: `作品名『副題』` would arrive as the title `作品名` with
+//! the subtitle reported as a group, and a file of a special would reach the
+//! series it belongs to. Read as spaces, the subtitle stays in the title, and
+//! the title meets the entry that spells it.
 
 use std::ops::Range;
 
@@ -60,14 +67,51 @@ pub enum Episode {
     Absent,
 }
 
+/// What a name says the release is, where it spells a type word.
+///
+/// The word stays out of the title where the title ends before it, so
+/// `Show Title Season 3 OVA - 01` reports the title and the season of the
+/// series it extends. Without the word kept here, an episode of an OVA reads
+/// as an episode of the series. `TV` says nothing a name without it does not,
+/// and is not kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Kind {
+    /// A film: `Movie`, `Gekijouban`.
+    Film,
+    /// A release apart from the broadcast: `OVA`, `OAD`, `OAV`, `ONA`, `SP`,
+    /// `Special`, `Specials`. One kind, because a service lists such a
+    /// release as an OVA where another lists it as a special.
+    Extra,
+}
+
+/// The kind a type word names, and none for `TV` and for a word of no type.
+pub(crate) fn kind_of(word: &str) -> Option<Kind> {
+    const FILMS: [&str; 2] = ["Movie", "Gekijouban"];
+    const EXTRAS: [&str; 7] = ["OVA", "OAD", "OAV", "ONA", "SP", "Special", "Specials"];
+
+    let named = |words: &[&str]| words.iter().any(|w| w.eq_ignore_ascii_case(word));
+    if named(&FILMS) {
+        Some(Kind::Film)
+    } else if named(&EXTRAS) {
+        Some(Kind::Extra)
+    } else {
+        None
+    }
+}
+
 /// What a filename spells.
 ///
 /// What [`parse`] reads from a name for the stages below, and nothing is
-/// matched yet. Every field is read from the **name**, never from what a
-/// corpus holds.
+/// matched yet. Every field [`parse`] fills is read from the **name**, never
+/// from what a corpus holds. [`read`](super::read) answers with another
+/// reading where an assignment or the list holds it, and
+/// [`read_file`](super::read_file) with one read from a directory above the
+/// file, where [`from_directory`](Parsed::from_directory) says so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parsed {
-    /// The title as the name spelled it, where the parser found one.
+    /// The title as the name spelled it, where the parser found one, or as a
+    /// directory above the file spelled it where
+    /// [`from_directory`](Parsed::from_directory) says so.
     pub title: Option<String>,
     /// The episode, or the reason there is not exactly one.
     pub episode: Episode,
@@ -89,6 +133,51 @@ pub struct Parsed {
     pub part: Option<u32>,
     /// The year, which is what tells a remake from its original.
     pub year: Option<u32>,
+    /// What the name says the release is, where it spells a type word other
+    /// than `TV`.
+    pub kind: Option<Kind>,
+    /// The title read on through the episode number and the words after it.
+    ///
+    /// The parser reads `Show Title 13.mkv` as the title `Show Title` and
+    /// episode 13, and the words after such a number as the episode's title.
+    /// Where the number belongs to the title, this is the title the name
+    /// spells: `Show Title 13`, or `Show Title 13 - The Subtitle` of `Show
+    /// Title 13 - The Subtitle [1080p].mkv`. The list decides which reading
+    /// holds, so this one is kept beside the first.
+    ///
+    /// Nothing where anything but spaces and underscores parts the title from
+    /// the number, or where the name spells anything but one episode in digits
+    /// alone. Nothing either where the parser left a letter or a digit after
+    /// the number unread, as the `v` of `Show Title 13v2` or the subtitle of
+    /// `Show Title 13 (1983) - The Subtitle`. A version mark and a subtitle
+    /// are refused alike, and a title read on without the subtitle would drop
+    /// what tells one work from another.
+    pub title_with_number: Option<String>,
+    /// The episode a name begins with and the words after it, as
+    /// `(1, "Quiet Harbor")` of `01 Quiet Harbor.mkv` and of
+    /// `01 - Quiet Harbor.mkv`.
+    ///
+    /// The words are the show's title in `01 Show Title.mkv` and an episode's
+    /// in `01 Quiet Harbor.mkv`, and a number beginning a title is the title's
+    /// own in `12 Quiet Lanterns.mkv`. The parser cannot tell these apart, so
+    /// this reading is kept beside its own, and the list decides. A year the
+    /// parser reads as one, as in `2001 Quiet Harbor.mkv`, is no episode.
+    ///
+    /// Where the parser took the number into the title, a number of one digit
+    /// is not read as an episode. A title begins with one, as in
+    /// `7 Lanterns per Night.mkv`, and a name read episode first can be read
+    /// against its directory, where such a film would be taken for an episode
+    /// of the show it is kept beside. Nothing either where the parser left a
+    /// letter or a digit after the title or the episode unread, as
+    /// [`title_with_number`](Parsed::title_with_number) says.
+    pub episode_first: Option<(u32, String)>,
+    /// The title was read from a directory above the file.
+    ///
+    /// The episode and the release group are what the file's name spells,
+    /// and so are the season, the part, the year and the type wherever it
+    /// spells one. The confidence and the text are the directory's. Set only
+    /// by [`read_file`](super::read_file); [`parse`] reads the name alone.
+    pub from_directory: bool,
     /// The release group, which the parser reports apart from the title.
     ///
     /// Taken off here and nowhere later. Brackets in a list entry are part of
@@ -116,9 +205,14 @@ pub struct Parsed {
     /// release's own vocabulary.
     ///
     /// A space is left wherever something was struck out, so that the words on
-    /// either side of it stay two words.
+    /// either side of it stay two words. The directory's text where
+    /// [`from_directory`](Parsed::from_directory) says so.
     pub text: String,
 }
+
+/// The quotes Japanese sets a title or a subtitle off with, which are read as
+/// spaces.
+const TITLE_QUOTES: [char; 4] = ['「', '」', '『', '』'];
 
 /// Read a filename for what it says about the media.
 ///
@@ -134,15 +228,23 @@ pub fn parse(name: &RawPath) -> Parsed {
         season: None,
         part: None,
         year: None,
+        kind: None,
+        title_with_number: None,
+        episode_first: None,
+        from_directory: false,
         release_group: None,
         confidence: decoded.confidence,
         text: String::new(),
     };
     let mut episodes = Vec::new();
-    let elements = anitomy_ng::parse(&decoded.text, Options::default());
-    let lost_part = part_lost_after_season(&decoded.text, &elements);
-    let cut_marks = marks_cut_off_the_title(&decoded.text, &elements);
-    parsed.text = without_the_release(&decoded.text, &elements);
+    let text = decoded.text.replace(TITLE_QUOTES, " ");
+    let elements = anitomy_ng::parse(&text, Options::default());
+    let lost_part = part_lost_after_season(&text, &elements);
+    let cut_marks = marks_cut_off_the_title(&text, &elements);
+    parsed.text = without_the_release(&text, &elements);
+    parsed.title_with_number = title_read_on(&text, &elements);
+    parsed.episode_first = episode_first(&text, &elements);
+    parsed.kind = release_kind(&text, &elements);
 
     for element in elements {
         // The first of a kind wins. The parser sorts what it reports by
@@ -167,6 +269,9 @@ pub fn parse(name: &RawPath) -> Parsed {
             | ElementKind::Year
             | ElementKind::ReleaseGroup
 
+            // Read by `release_kind` above, where it stands.
+            | ElementKind::Type
+
             // Dropped, and listed rather than caught by a wildcard: a kind
             // added upstream then stops the build and has to be answered for.
             | ElementKind::AudioTerm
@@ -180,7 +285,6 @@ pub fn parse(name: &RawPath) -> Parsed {
             | ElementKind::ReleaseVersion
             | ElementKind::Source
             | ElementKind::Subtitles
-            | ElementKind::Type
             | ElementKind::VideoResolution
             | ElementKind::VideoTerm
             | ElementKind::Volume => {}
@@ -205,6 +309,154 @@ pub fn parse(name: &RawPath) -> Parsed {
         title.push_str(&cut_marks);
     }
     parsed
+}
+
+/// The title read on through the episode number and the words after it, as
+/// [`Parsed::title_with_number`] says.
+fn title_read_on(text: &str, elements: &[Element]) -> Option<String> {
+    let title = elements
+        .iter()
+        .find(|element| element.kind == ElementKind::Title)?;
+    let mut episodes = elements
+        .iter()
+        .filter(|element| element.kind == ElementKind::Episode);
+    let episode = episodes.next()?;
+    if episodes.next().is_some() || !episode.value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if !chars
+        .get(span(title).end..episode.position)?
+        .iter()
+        .all(|&c| c == ' ' || c == '_')
+    {
+        return None;
+    }
+    if unread_after(&chars, elements, span(episode).end)? {
+        return None;
+    }
+
+    // The parser reports in order of position, so the first element after the
+    // number is the one that follows it.
+    let upto = elements
+        .iter()
+        .find(|element| element.position > episode.position)
+        .filter(|element| element.kind == ElementKind::EpisodeTitle)
+        .map_or(span(episode).end, |subtitle| span(subtitle).end);
+    Some(
+        chars
+            .get(title.position..upto)?
+            .iter()
+            .map(|&c| if c == '_' { ' ' } else { c })
+            .collect(),
+    )
+}
+
+/// The episode a name begins with and the words after it, as
+/// [`Parsed::episode_first`] says.
+fn episode_first(text: &str, elements: &[Element]) -> Option<(u32, String)> {
+    let mut titles = elements
+        .iter()
+        .filter(|element| element.kind == ElementKind::Title);
+    let mut episodes = elements
+        .iter()
+        .filter(|element| element.kind == ElementKind::Episode);
+
+    let chars: Vec<char> = text.chars().collect();
+
+    match (titles.next(), episodes.next(), episodes.next()) {
+        // `01 Quiet Harbor`: the parser took the number into the title.
+        (Some(title), None, None) => {
+            let (number, words) = title.value.split_once(' ')?;
+            if number.len() < 2 || unread_after(&chars, elements, span(title).end)? {
+                return None;
+            }
+            Some((number.parse().ok()?, words.trim().to_owned()))
+        }
+        // `01 - Quiet Harbor`: the parser read the number, and the words
+        // after it as the episode's title.
+        (None, Some(episode), None) => {
+            let number = episode.value.parse().ok()?;
+            let words = elements
+                .iter()
+                .find(|element| element.kind == ElementKind::EpisodeTitle)?;
+            if unread_after(&chars, elements, span(episode).end)? {
+                return None;
+            }
+            Some((number, words.value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Where in the text an element stands, in characters.
+fn span(element: &Element) -> Range<usize> {
+    element.position..element.position + element.value.chars().count()
+}
+
+/// Whether a letter or a digit after this place in the text is one no
+/// element reports, or nothing where an element does not fit the text.
+///
+/// The parser drops what it cannot place: in `Show Title 13 (1983) - The
+/// Subtitle` it reports the year and nothing after it.
+fn unread_after(chars: &[char], elements: &[Element], from: usize) -> Option<bool> {
+    let mut reported = vec![false; chars.len()];
+    for element in elements {
+        reported.get_mut(span(element))?.fill(true);
+    }
+
+    Some(
+        chars
+            .iter()
+            .zip(&reported)
+            .skip(from)
+            .any(|(c, &reported)| c.is_alphanumeric() && !reported),
+    )
+}
+
+/// The kind of the release, from the first type word the parser reports
+/// where it names the release rather than standing as a word of a title.
+///
+/// A type word names the release in brackets, as in `Show Title (OVA) - 01`
+/// and `Show Title - 01 [OVA]`, and before the episode where it ends the
+/// title or stands after it, as in `Show Title OVA - 01` and `Show Title
+/// Season 3 OVA - 01`. `Gekijouban` names a film from in front of its title,
+/// as in `Gekijouban Show Title`. Anywhere else the word is a title's: the
+/// show's own, as in `Special Title - 03`, or an episode's, as in `Show
+/// Title - 07 - Special Training`. The parser reports a type there all the
+/// same.
+fn release_kind(text: &str, elements: &[Element]) -> Option<Kind> {
+    let chars: Vec<char> = text.chars().collect();
+    let title = elements
+        .iter()
+        .find(|element| element.kind == ElementKind::Title)
+        .map(span);
+    let episode = elements
+        .iter()
+        .find(|element| element.kind == ElementKind::Episode)
+        .map(|element| element.position);
+
+    elements
+        .iter()
+        .filter(|element| element.kind == ElementKind::Type)
+        .filter(|element| {
+            let word = span(element);
+            let bracketed = word
+                .start
+                .checked_sub(1)
+                .and_then(|before| chars.get(before))
+                .is_some_and(|c| "([{【".contains(*c));
+            let before_episode = episode.is_none_or(|episode| word.start < episode);
+            let placed = title.as_ref().is_none_or(|title| {
+                word.start >= title.end
+                    || word.end == title.end
+                    || (word.start == title.start
+                        && element.value.eq_ignore_ascii_case("Gekijouban"))
+            });
+            bracketed || (before_episode && placed)
+        })
+        .find_map(|element| kind_of(&element.value))
 }
 
 /// The marks the parser cut off the end of the title, read back from the name.
@@ -422,7 +674,7 @@ fn is_delimiter(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Episode, Parsed, parse};
+    use super::{Episode, Kind, Parsed, parse};
     use crate::encoding::Confidence;
     use crate::path::RawPath;
 
@@ -668,6 +920,151 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Show Title"));
         assert_eq!(parsed.episode, Episode::Only(3));
         assert_eq!(parsed.release_group.as_deref(), Some("SubsPlease"));
+    }
+
+    #[test]
+    fn a_subtitle_in_japanese_title_quotes_stays_in_the_title() {
+        // 「」 and 『』 mark a title in Japanese. Read as the brackets of a
+        // release group, they would leave the title of the series alone, and a
+        // file of a special would reach the series.
+        for (name, episode) in [
+            ("作品名『副題』.mkv", Episode::Absent),
+            ("作品名「副題」 - 03.mkv", Episode::Only(3)),
+        ] {
+            let parsed = spelled(name);
+            let title = parsed.title.clone().unwrap_or_default();
+
+            assert!(
+                title.starts_with("作品名") && title.contains("副題"),
+                "{name}: {title:?}"
+            );
+            assert_eq!(parsed.release_group, None, "{name}");
+            assert_eq!(parsed.episode, episode, "{name}");
+            assert_eq!(words_left(name), ["作品名", "副題"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_type_word_the_name_spells_is_kept_as_its_kind() {
+        for (name, kind) in [
+            (
+                "[Group] Show Title Season 3 OVA - 01 [1080p].mkv",
+                Some(Kind::Extra),
+            ),
+            ("[Group] Show Title OAD - 02 [1080p].mkv", Some(Kind::Extra)),
+            ("Show Title Specials - 02.mkv", Some(Kind::Extra)),
+            ("[Group] Show Title Movie [1080p].mkv", Some(Kind::Film)),
+            ("[Group] Show Title - 03 [1080p].mkv", None),
+            ("[Group] Show Title (TV) - 03 [1080p].mkv", None),
+            (
+                "[Group] Show Title (OVA) - 01 [1080p].mkv",
+                Some(Kind::Extra),
+            ),
+            ("[Group] Show Title - 01 [OVA].mkv", Some(Kind::Extra)),
+            ("Gekijouban Show Title (2019).mkv", Some(Kind::Film)),
+        ] {
+            assert_eq!(spelled(name).kind, kind, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_type_word_of_a_title_is_no_kind_of_the_release() {
+        for name in [
+            "[Group] Show Title - 05 - Movie Night [1080p].mkv",
+            "Show.Title.S01E05.The.Movie.Night.1080p.WEB.mkv",
+            "[Group] Show Title - 07 - Special Training [1080p].mkv",
+            "[Group] Show Title - 08 - The OVA Club [1080p].mkv",
+            "[Group] Special Title - 03 [1080p].mkv",
+            "[Group] Show Title SP Professional - 03 [1080p].mkv",
+        ] {
+            assert_eq!(spelled(name).kind, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_type_word_after_the_season_is_out_of_the_title_and_the_season_stays() {
+        let parsed = spelled("[Group] Show Title Season 3 OVA - 01 [1080p].mkv");
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.season, Some(3));
+        assert_eq!(parsed.episode, Episode::Only(1));
+    }
+
+    #[test]
+    fn a_name_that_begins_with_a_number_is_also_read_as_that_episode() {
+        for (name, first) in [
+            ("01 Quiet Harbor.mkv", Some((1, "Quiet Harbor"))),
+            (
+                "[Group] 12 Show Title [1080p].mkv",
+                Some((12, "Show Title")),
+            ),
+            ("01 - Show Title.mkv", Some((1, "Show Title"))),
+            ("01. Quiet Harbor.mkv", Some((1, "Quiet Harbor"))),
+            ("S01E01 Quiet Harbor.mkv", Some((1, "Quiet Harbor"))),
+            ("12 Quiet Lanterns.mkv", Some((12, "Quiet Lanterns"))),
+            ("7 Lanterns per Night.mkv", None),
+            ("01 Quiet Harbor (1983) - The Subtitle.mkv", None),
+            ("Show Title - 01.mkv", None),
+            ("01.mkv", None),
+            ("1100 Quiet Harbor.mkv", Some((1100, "Quiet Harbor"))),
+            ("2001 Quiet Harbor.mkv", None),
+            ("01 - The Episode Name.mkv", None),
+            ("01-02 - Quiet Harbor.mkv", None),
+            ("12 Show Title - 05.mkv", None),
+        ] {
+            assert_eq!(
+                spelled(name)
+                    .episode_first
+                    .as_ref()
+                    .map(|(episode, title)| (*episode, title.as_str())),
+                first,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_after_a_space_is_read_on_into_the_title() {
+        for (name, read_on) in [
+            ("Show Title 13.mkv", Some("Show Title 13")),
+            ("[Group] Show Title 13 [1080p].mkv", Some("Show Title 13")),
+            ("Show Title 13 (1983).mkv", Some("Show Title 13")),
+            (
+                "[Group] Show Title 13 - The Subtitle [1080p].mkv",
+                Some("Show Title 13 - The Subtitle"),
+            ),
+            (
+                "Show_Title_13_-_The_Subtitle.mkv",
+                Some("Show Title 13 - The Subtitle"),
+            ),
+            ("Show Title - 13.mkv", None),
+            ("Show Title-13.mkv", None),
+            ("Show Title S01E13.mkv", None),
+            ("Show Title.mkv", None),
+            ("Show Title 01-12.mkv", None),
+            ("Show.Title.13.mkv", None),
+            ("Show Title 13 [1080p] 2.mkv", None),
+            ("Show Title 05.5.mkv", None),
+            ("Show Title 13v2.mkv", None),
+            ("Show Title 13 - The Subtitle v2.mkv", None),
+            ("Show Title 13 (1983) - The Subtitle.mkv", None),
+            ("Show Title 13 - The Episode Name.mkv", None),
+        ] {
+            assert_eq!(
+                spelled(name).title_with_number.as_deref(),
+                read_on,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_group_in_lenticular_brackets_is_still_a_group() {
+        let parsed = spelled("【Group】作品名 - 03.mkv");
+
+        assert_eq!(parsed.release_group.as_deref(), Some("Group"));
+        assert_eq!(parsed.title.as_deref(), Some("作品名"));
+        assert_eq!(parsed.episode, Episode::Only(3));
     }
 
     #[test]

@@ -391,9 +391,13 @@ impl Server {
                     self.policy.write().expect(POISONED).set(&app, policy);
                     Response::Ok
                 }
-                Ok(Request::Why) => {
-                    Response::Why(self.decided.latest().as_ref().map(Explanation::of))
-                }
+                Ok(Request::Why) => Response::Why(
+                    self.decided
+                        .latest()
+                        .as_ref()
+                        .map(Explanation::of)
+                        .map(Box::new),
+                ),
                 // Answered at once and again once done, since what is done
                 // may wait on a person.
                 Ok(Request::Login { token }) => {
@@ -515,6 +519,7 @@ mod tests {
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognize::parse::Episode;
+    use benshi_core::settle::Settled;
     use benshi_core::token::Token;
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
@@ -723,6 +728,7 @@ mod tests {
                 media: snapshot.media.clone(),
                 parsed,
                 answer,
+                settled: Settled::Unnamed,
             });
         }
     }

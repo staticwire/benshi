@@ -57,12 +57,13 @@ use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::recognize::parse::Parsed;
+use crate::recognize::parse::{Kind, Parsed, kind_of};
 
 /// The form a title is compared in.
 ///
 /// Built from a list entry's text by [`Key::from_title`] and from a parsed
-/// filename by [`Key::from_parsed`], so that the two can be compared.
+/// filename by [`Key::from_parsed`], so that the two can be compared, and
+/// from the parts a store kept of one by [`Key::from_parts`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     letters: String,
@@ -102,19 +103,58 @@ impl Key {
         )
     }
 
+    /// A key from the parts [`letters`](Key::letters),
+    /// [`marks`](Key::marks), [`season`](Key::season) and
+    /// [`part`](Key::part) answered, as a store keeps one.
+    ///
+    /// Nothing where the letters are empty, hold a letter in upper case, or
+    /// hold a character that is not a letter, a digit or a combining mark.
+    /// Nothing either where the marks hold a letter, a digit, a combining
+    /// mark, a break between words, a bracket or a dash. The parts are not
+    /// brought to NFKC, so letters in full width pass and build a key that
+    /// no title builds. A first season and a first part are none, as in any
+    /// key.
+    #[must_use]
+    pub fn from_parts(
+        letters: &str,
+        marks: &str,
+        season: Option<u32>,
+        part: Option<u32>,
+    ) -> Option<Self> {
+        let held = letters.chars().all(is_letter)
+            && letters.to_lowercase() == letters
+            && !marks
+                .chars()
+                .any(|c| is_letter(c) || is_word_break(c) || is_bracket(c) || is_dash(c));
+        if !held {
+            return None;
+        }
+        Self::new(letters.to_owned(), marks.to_owned(), season, part)
+    }
+
+    /// The letters and digits of the title, in lower case, with nothing
+    /// between them.
+    #[must_use]
+    pub fn letters(&self) -> &str {
+        &self.letters
+    }
+
     /// The marks the title ended in, which are the one thing a lookup widens
     /// over.
-    pub(super) fn marks(&self) -> &str {
+    #[must_use]
+    pub fn marks(&self) -> &str {
         &self.marks
     }
 
     /// The season the key holds, where the text spelled one past the first.
-    pub(super) fn season(&self) -> Option<u32> {
+    #[must_use]
+    pub fn season(&self) -> Option<u32> {
         self.season
     }
 
     /// The part the key holds, where the text spelled one past the first.
-    pub(super) fn part(&self) -> Option<u32> {
+    #[must_use]
+    pub fn part(&self) -> Option<u32> {
         self.part
     }
 
@@ -390,6 +430,31 @@ fn is_year(word: &str) -> bool {
     word.len() == 4
         && word.bytes().all(|b| b.is_ascii_digit())
         && (word.starts_with("19") || word.starts_with("20"))
+}
+
+/// The spelling with every type word but `TV` taken out where nothing but
+/// whitespace stands beside it, and the kinds the words taken out name. None
+/// where the spelling holds no such word or holds nothing else.
+///
+/// A type in brackets is out of the key already. One standing in the title,
+/// as in `Show Title Season 3 OVA`, stays in the key, while the parser leaves
+/// it out of the title of `Show Title Season 3 OVA - 01`, so a name of that
+/// release would miss.
+pub(crate) fn without_type_words(spelling: &str) -> Option<(String, Vec<Kind>)> {
+    let mut kinds = Vec::new();
+    let mut kept = Vec::new();
+    for word in spelling.split_whitespace() {
+        match kind_of(word) {
+            Some(kind) => {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            None => kept.push(word),
+        }
+    }
+
+    (!kinds.is_empty() && !kept.is_empty()).then(|| (kept.join(" "), kinds))
 }
 
 /// A word the parser reads as the type of a release rather than as a name.
@@ -693,6 +758,74 @@ mod tests {
     fn named(name: &str) -> Key {
         Key::from_parsed(&parse(&RawPath::from_bytes(name.as_bytes().to_vec())))
             .expect("the name spells a title")
+    }
+
+    #[test]
+    fn a_key_built_from_its_parts_is_the_key_they_came_from() {
+        for spelled in [
+            "Show Title",
+            "Nisekoi:",
+            "K-ON!!",
+            "Show Title Season 3",
+            "Show Title Part 2",
+            "Haikyuu!! 2nd Season Cour 2",
+            "ソレッタ",
+        ] {
+            let key = listed(spelled);
+
+            assert_eq!(
+                Key::from_parts(key.letters(), key.marks(), key.season(), key.part()),
+                Some(key),
+                "{spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_key_are_what_it_was_built_of() {
+        let key = listed("Show Title!? Season 3 Part 2");
+
+        assert_eq!(key.letters(), "showtitle");
+        assert_eq!(key.marks(), "!?");
+        assert_eq!(key.season(), Some(3));
+        assert_eq!(key.part(), Some(2));
+    }
+
+    #[test]
+    fn parts_no_key_can_hold_build_none() {
+        for (letters, marks) in [
+            ("", ""),
+            ("Showtitle", ""),
+            ("show title", ""),
+            ("show-title", ""),
+            ("showtitle", "a"),
+            ("showtitle", "! "),
+            ("showtitle", "]"),
+            ("showtitle", "-"),
+            ("showtitle", "2"),
+            ("showtitle", "\u{301}"),
+        ] {
+            assert_eq!(
+                Key::from_parts(letters, marks, None, None),
+                None,
+                "{letters:?} {marks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parts_are_taken_as_they_are_and_not_brought_to_nfkc() {
+        let built = Key::from_parts("ｓｈｏｗ", "", None, None).expect("a letter is a letter");
+
+        assert_ne!(Some(built), Key::from_title("ｓｈｏｗ"));
+    }
+
+    #[test]
+    fn a_first_season_or_part_built_from_parts_is_none() {
+        assert_eq!(
+            Key::from_parts("showtitle", "", Some(1), Some(1)),
+            Some(listed("Show Title"))
+        );
     }
 
     #[test]
@@ -1128,6 +1261,10 @@ mod tests {
             season: Some(2),
             part: None,
             year: None,
+            kind: None,
+            title_with_number: None,
+            episode_first: None,
+            from_directory: false,
             release_group: Some("Group".to_owned()),
             confidence: Confidence::Certain,
             text: String::new(),
@@ -1200,6 +1337,10 @@ mod tests {
             season: Some(3),
             part: None,
             year: None,
+            kind: None,
+            title_with_number: None,
+            episode_first: None,
+            from_directory: false,
             release_group: None,
             confidence: Confidence::Certain,
             text: String::new(),

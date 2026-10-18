@@ -69,6 +69,17 @@ impl RawPath {
             None => &self.0,
         }
     }
+
+    /// Everything before the last `/`, which is the directory the path is in,
+    /// or nothing where the path has no `/` or its last `/` is the first byte.
+    ///
+    /// A path with no `/` is in no directory it names, and a path whose only
+    /// `/` is the first byte is in the root, which has no name to read.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        let last = self.0.iter().rposition(|byte| *byte == b'/')?;
+        (last > 0).then(|| Self(self.0[..last].to_vec()))
+    }
 }
 
 /// Shows the escaped form, which is readable for the cases that are readable
@@ -180,6 +191,37 @@ mod tests {
 
     /// The windows-1251 encoding of a Cyrillic filename. Not valid UTF-8.
     const CP1251: &[u8] = b"/anime/\xcf\xf0\xe8\xe2\xe5\xf2.mkv";
+
+    #[test]
+    fn a_path_is_in_the_directory_before_its_last_slash() {
+        let path = RawPath::from_bytes(b"/anime/Show Title/01.mkv".to_vec());
+
+        let parent = path.parent().expect("a directory");
+        assert_eq!(parent.as_bytes(), b"/anime/Show Title");
+        assert_eq!(parent.file_name(), b"Show Title");
+        let above = parent.parent().expect("a directory above");
+        assert_eq!(above.as_bytes(), b"/anime");
+        assert_eq!(above.parent(), None, "the root has no name");
+        assert_eq!(
+            RawPath::from_bytes(b"Show Title/01.mkv".to_vec())
+                .parent()
+                .map(|parent| parent.as_bytes().to_vec()),
+            Some(b"Show Title".to_vec())
+        );
+        assert_eq!(RawPath::from_bytes(b"01.mkv".to_vec()).parent(), None);
+        assert_eq!(
+            RawPath::from_bytes(b"/anime//01.mkv".to_vec())
+                .parent()
+                .map(|parent| parent.as_bytes().to_vec()),
+            Some(b"/anime/".to_vec())
+        );
+        assert_eq!(
+            RawPath::from_bytes(b"//01.mkv".to_vec())
+                .parent()
+                .map(|parent| parent.as_bytes().to_vec()),
+            Some(b"/".to_vec())
+        );
+    }
 
     #[test]
     fn a_utf8_path_round_trips() {

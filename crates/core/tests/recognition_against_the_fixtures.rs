@@ -13,8 +13,8 @@
 //! says what somebody watches. A line names the rule it holds, the list it is
 //! decided against, and the answer. **Where the answer is a known wrong or
 //! weak one, the line says what is owed and to what**: to the list, for an
-//! entry's format and episode count; to the year, which the list's side does
-//! not carry; to the parser, for text it dropped or placed wrongly. Those lines
+//! entry's format and episode count; to the year, which the lists of the
+//! fixtures do not carry; to the parser, for text it dropped or placed wrongly. Those lines
 //! pin where the answer lands today, so that a change to it is noticed rather
 //! than assumed.
 //!
@@ -28,7 +28,7 @@ use benshi_core::recognize::altname::Altnames;
 use benshi_core::recognize::corpus::Corpus;
 use benshi_core::recognize::index::Index;
 use benshi_core::recognize::parse::{Episode, Parsed, parse};
-use benshi_core::recognize::{Recognition, Stage, decide};
+use benshi_core::recognize::{Recognition, Stage, read_file};
 use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("fixtures/filenames.jsonl");
@@ -157,6 +157,9 @@ impl Shape {
                     Stage::Altname(_) => StageName::Altname,
                     Stage::Key => StageName::Key,
                     Stage::Scored(_) => StageName::Score,
+                    // Kept by the daemon, which files a show for a name the
+                    // list refused; the sequence alone never answers it.
+                    Stage::Unlisted => panic!("recognition answered a name kept as unlisted"),
                 },
             },
             Recognition::Ambiguous(ambiguity) => Self::Ambiguous(
@@ -190,7 +193,7 @@ fn fixtures() -> Vec<Fixture> {
         .collect()
 }
 
-/// A name parsed the way the daemon parses it: the file's name and not its path.
+/// A file's name parsed alone, without the directories above it.
 fn parsed(name: &RawPath) -> Parsed {
     parse(&RawPath::from_bytes(name.file_name().to_vec()))
 }
@@ -245,7 +248,7 @@ fn every_fixture_resolves_to_the_answer_it_expects() {
         let index = Index::of(&corpus);
         let altnames = altnames_of(&fixture.altnames, &fixture.list, &corpus, &fixture.rule);
 
-        let answer = decide(&parsed(&fixture.name), &altnames, &corpus, &index);
+        let (_, answer) = read_file(&fixture.name, &altnames, &corpus, &index);
 
         let got = Shape::of(&answer);
         let wanted = Shape::expected(&fixture.expect, &fixture.rule);

@@ -12,6 +12,7 @@ pub mod path;
 pub mod policy;
 pub mod recognize;
 pub mod session;
+pub mod settle;
 pub mod timeline;
 pub mod token;
 pub mod trace;

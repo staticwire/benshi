@@ -381,7 +381,7 @@ impl WatchedPolicy {
 /// same two values before a reading is ever built. It is repeated here because a
 /// recording is a text file anyone can edit, and because another adapter is not
 /// bound by what this one refuses.
-fn duration_of(reading: &PlayerSnapshot) -> Known<Duration> {
+pub(crate) fn duration_of(reading: &PlayerSnapshot) -> Known<Duration> {
     let Known::Value(duration) = reading.duration else {
         return reading.duration;
     };

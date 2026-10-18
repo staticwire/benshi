@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 
 use crate::ShowId;
-use crate::recognize::normalize::Key;
+use crate::recognize::normalize::{Key, without_type_words};
+use crate::recognize::parse::Kind;
+use crate::settle::Facts;
 
 /// The shows recognition matches against.
 ///
@@ -39,6 +41,17 @@ pub struct Corpus {
     filed: HashMap<Key, Vec<Filed>>,
     /// The title of every show filed, which is what an answer shows a person.
     titles: HashMap<ShowId, String>,
+    /// What the list holds of each show filed with its facts, which settles
+    /// whether a file is of it.
+    facts: HashMap<ShowId, Facts>,
+    /// Each spelling that `without_type_words` takes type words out of, filed
+    /// again without them under each kind they name, for a name that spells
+    /// that kind: where the parser leaves the word out of the title it
+    /// reports, the key would miss.
+    typed: HashMap<Kind, HashMap<Key, Vec<Filed>>>,
+    /// The numbers each show's spellings carry, a spelling of no letters
+    /// among them, which a year a name spells is read against.
+    numbers: HashMap<ShowId, Vec<u32>>,
 }
 
 /// One spelling of one entry.
@@ -75,24 +88,57 @@ impl Corpus {
     ) {
         self.titles.insert(show, title.to_owned());
         self.put(title, show);
+        self.keep_numbers(title, show);
         for spelling in also_spelled {
             self.put(spelling.as_ref(), show);
+            self.keep_numbers(spelling.as_ref(), show);
         }
     }
 
-    /// File one spelling of one entry.
+    /// Keep the numbers one spelling of one entry carries.
+    fn keep_numbers(&mut self, spelling: &str, show: ShowId) {
+        let carried = spelling
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|digits| digits.parse::<u32>().ok());
+        self.numbers.entry(show).or_default().extend(carried);
+    }
+
+    /// File one spelling of one entry, and again without the type words
+    /// `without_type_words` takes out of it.
     fn put(&mut self, spelling: &str, show: ShowId) {
-        let Some(key) = Key::from_title(spelling) else {
-            return;
-        };
-        self.filed
-            .entry(key.without_marks())
-            .or_default()
-            .push(Filed {
-                marks: key.marks().to_owned(),
-                spelled: spelling.to_owned(),
-                show,
-            });
+        file_into(&mut self.filed, spelling, spelling, show);
+        if let Some((untyped, kinds)) = without_type_words(spelling) {
+            for kind in kinds {
+                file_into(
+                    self.typed.entry(kind).or_default(),
+                    &untyped,
+                    spelling,
+                    show,
+                );
+            }
+        }
+    }
+
+    /// File what the list holds of a show, in place of what was filed of it
+    /// before.
+    pub fn file_facts(&mut self, show: ShowId, facts: Facts) {
+        self.facts.insert(show, facts);
+    }
+
+    /// What the list holds of a show, and nothing where it was filed with no
+    /// facts.
+    #[must_use]
+    pub(crate) fn facts_of(&self, show: ShowId) -> Option<&Facts> {
+        self.facts.get(&show)
+    }
+
+    /// Whether a run of digits in a spelling of a show reads as this number,
+    /// as `Show Title 2032` carries 2032 and not 203.
+    #[must_use]
+    pub(crate) fn spells_number(&self, show: ShowId, number: u32) -> bool {
+        self.numbers
+            .get(&show)
+            .is_some_and(|numbers| numbers.contains(&number))
     }
 
     /// The title a show was filed with, and nothing where it was not filed.
@@ -131,6 +177,20 @@ impl Corpus {
             .map(|filed| (filed.spelled.as_str(), filed.show))
     }
 
+    /// The entries a key reaches through a spelling that held a type word of
+    /// this kind, filed with the word taken out, in the order they were
+    /// filed.
+    ///
+    /// For a name that spells that kind, and only for one. Each kind is filed
+    /// apart: a name of an OVA reaches a spelling here only through a type
+    /// word of an extra.
+    #[must_use]
+    pub(crate) fn typed_candidates(&self, kind: Kind, key: &Key) -> Vec<ShowId> {
+        self.typed
+            .get(&kind)
+            .map_or_else(Vec::new, |typed| reached(typed, key))
+    }
+
     /// The entries a key reaches, in the order they were filed.
     ///
     /// Empty where nothing is filed under it, which is not a refusal: an exact
@@ -138,18 +198,37 @@ impl Corpus {
     /// that misses.
     #[must_use]
     pub fn candidates(&self, key: &Key) -> Vec<ShowId> {
-        let mut found: Vec<ShowId> = Vec::new();
-        let Some(bucket) = self.filed.get(&key.without_marks()) else {
-            return found;
-        };
-        for filed in bucket {
-            let reached = key.marks().is_empty() || filed.marks == key.marks();
-            if reached && !found.contains(&filed.show) {
-                found.push(filed.show);
-            }
-        }
-        found
+        reached(&self.filed, key)
     }
+}
+
+/// File `filed_as` under its key, as one spelling of one entry spelled
+/// `spelling`.
+fn file_into(map: &mut HashMap<Key, Vec<Filed>>, filed_as: &str, spelling: &str, show: ShowId) {
+    let Some(key) = Key::from_title(filed_as) else {
+        return;
+    };
+    map.entry(key.without_marks()).or_default().push(Filed {
+        marks: key.marks().to_owned(),
+        spelled: spelling.to_owned(),
+        show,
+    });
+}
+
+/// The entries a key reaches in one map of spellings, in the order they
+/// were filed.
+fn reached(map: &HashMap<Key, Vec<Filed>>, key: &Key) -> Vec<ShowId> {
+    let mut found: Vec<ShowId> = Vec::new();
+    let Some(bucket) = map.get(&key.without_marks()) else {
+        return found;
+    };
+    for filed in bucket {
+        let reached = key.marks().is_empty() || filed.marks == key.marks();
+        if reached && !found.contains(&filed.show) {
+            found.push(filed.show);
+        }
+    }
+    found
 }
 
 impl<S: AsRef<str>> FromIterator<S> for Corpus {
@@ -166,9 +245,13 @@ impl<S: AsRef<str>> FromIterator<S> for Corpus {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::Corpus;
     use crate::ShowId;
     use crate::recognize::normalize::Key;
+    use crate::recognize::parse::Kind;
+    use crate::settle::Facts;
 
     /// The key a list entry spelled this way is filed under.
     fn listed(title: &str) -> Key {
@@ -183,6 +266,57 @@ mod tests {
             .into_iter()
             .map(|show| corpus.title_of(show).expect("a candidate is a show filed"))
             .collect()
+    }
+
+    #[test]
+    fn a_spelling_with_a_type_word_is_reached_without_it_by_a_name_of_a_type() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title Season 3 OVA",
+            ["Show Title Season 3 Specials"],
+        );
+        corpus.file(ShowId(3), "Show Title The Movie", Vec::<&str>::new());
+
+        let season = listed("Show Title Season 3");
+        assert_eq!(corpus.candidates(&season), [ShowId(1)]);
+        assert_eq!(corpus.typed_candidates(Kind::Extra, &season), [ShowId(2)]);
+        assert_eq!(
+            corpus.typed_candidates(Kind::Film, &listed("Show Title The")),
+            [ShowId(3)]
+        );
+        assert_eq!(
+            corpus.typed_candidates(Kind::Extra, &listed("Show Title The")),
+            Vec::<ShowId>::new(),
+            "a film is reached by a name of a film alone"
+        );
+        assert_eq!(
+            corpus.typed_candidates(Kind::Extra, &listed("Show Title Season 3 OVA")),
+            Vec::<ShowId>::new(),
+            "under its kind, a spelling is filed only with its type word taken out"
+        );
+    }
+
+    #[test]
+    fn a_number_a_spelling_carries_is_known_of_its_show_alone() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title 2032", ["Other Title (1987 Release)"]);
+        corpus.file(ShowId(2), "Second Show", Vec::<&str>::new());
+        corpus.file(ShowId(3), "Third Show", ["1999"]);
+
+        assert!(corpus.spells_number(ShowId(1), 2032));
+        assert!(corpus.spells_number(ShowId(1), 1987));
+        assert!(
+            corpus.spells_number(ShowId(3), 1999),
+            "a spelling of no letters"
+        );
+        assert!(!corpus.spells_number(ShowId(1), 203), "part of a number");
+        assert!(!corpus.spells_number(ShowId(1), 2033));
+        assert!(
+            !corpus.spells_number(ShowId(2), 2032),
+            "another show's number"
+        );
     }
 
     #[test]
@@ -302,6 +436,30 @@ mod tests {
             corpus.spellings_of(ShowId(1)),
             ["Alpha Spelling", "Show Title", "Zeta Spelling"]
         );
+    }
+
+    #[test]
+    fn a_show_answers_the_facts_it_was_filed_with() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Another Show", Vec::<&str>::new());
+        let first = Facts {
+            episodes: Some(12),
+            episode_length: Some(Duration::from_mins(24)),
+            year: Some(2019),
+            released: true,
+            format: None,
+        };
+        let again = Facts {
+            episodes: Some(13),
+            ..first
+        };
+
+        corpus.file_facts(ShowId(1), first);
+        assert_eq!(corpus.facts_of(ShowId(1)), Some(&first));
+        corpus.file_facts(ShowId(1), again);
+        assert_eq!(corpus.facts_of(ShowId(1)), Some(&again));
+        assert_eq!(corpus.facts_of(ShowId(2)), None);
     }
 
     #[test]

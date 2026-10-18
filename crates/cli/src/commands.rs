@@ -349,7 +349,7 @@ async fn why(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
     daemon.ask(&Request::Why).await?;
 
     match daemon.expect_answer().await? {
-        Response::Why(explained) => write!(out, "{}", render::why(explained.as_ref()))
+        Response::Why(explained) => write!(out, "{}", render::why(explained.as_deref()))
             .context("explanation could not be printed"),
         Response::Error { message } => bail!("{message}"),
         unexpected => bail!("daemon answered why with {unexpected:?}"),
@@ -519,6 +519,7 @@ mod tests {
     use benshi_core::clock::{Clock, TestClock};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
+    use benshi_core::settle::Settled;
     use benshi_core::token::Token;
     use benshi_core::trace::Trace;
     use benshi_core::{
@@ -841,6 +842,7 @@ mod tests {
                 media: MediaRef::LocalFile(path),
                 parsed,
                 answer,
+                settled: Settled::Unnamed,
             });
         }
 
