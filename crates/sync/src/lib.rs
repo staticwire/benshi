@@ -1,4 +1,5 @@
-//! List backends: the trait, and a list kept in memory.
+//! List backends: the trait, a list kept in memory and AniList's, and the
+//! rules that send an episode of one work to another.
 //!
 //! A backend reads an account's list and writes where the account stands on
 //! one work, named by the number the service gives it. Recognition yields a
@@ -15,6 +16,9 @@
 
 pub mod anilist;
 pub mod memory;
+pub mod plan;
+pub mod relations;
+pub mod resolve;
 
 use std::time::Duration;
 
