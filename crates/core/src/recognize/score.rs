@@ -509,6 +509,7 @@ mod tests {
             kind: None,
             title_with_number: None,
             episode_first: None,
+            whole: None,
             from_directory: false,
             release_group: None,
             confidence: Confidence::Certain,
