@@ -318,8 +318,9 @@ mod tests {
             Altnames::new(),
         );
 
-        let (_parsed, answer) =
-            recognizer.decide(&a_path("/anime/Show Title Cour 2 - The Subtitle - 03.mkv"));
+        let (_parsed, answer) = recognizer.decide(&a_path(
+            "/anime/Show Title Cour 2 - The Subtitle Final - 03.mkv",
+        ));
 
         assert!(
             matches!(

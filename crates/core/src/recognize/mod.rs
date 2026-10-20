@@ -57,8 +57,8 @@ pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Ind
         })
 }
 
-/// Decide a name, and read it another way where neither an assignment nor
-/// the key answers the title as parsed.
+/// Decide a name, and read it another way where no assignment answers the
+/// title as parsed.
 ///
 /// `Show Title 13.mkv` reads as the title `Show Title` and episode 13. Where
 /// neither an assignment nor the key answers that title, and an assignment
@@ -76,7 +76,20 @@ pub fn decide(parsed: &Parsed, altnames: &Altnames, corpus: &Corpus, index: &Ind
 /// list holding `Show Title 13` alone, the scorer answers `Show Title` as
 /// its thirteenth episode.
 ///
-/// Answers with the parse the answer was decided by.
+/// Where no assignment answers the title as parsed, the name read whole, as
+/// [`Parsed::whole`] keeps it, is asked before the key of that title. The
+/// parser reads `Show Title Episode 0: The First Contact [1080p].mkv` as
+/// episode 0 of `Show Title`, and the name is the work an assignment or the
+/// key of its whole spelling answers, where one does. A spelling with its
+/// type words taken out never answers the name read whole. Where the name
+/// read whole is the title read on through its number, it is asked as
+/// above, after the key. Where its key is that of the title as parsed, it
+/// is not asked.
+///
+/// Answers with the parse the answer was decided by. A parse of the name
+/// read whole is asked with no type and answered with the type the name
+/// spells, which [`settle`](crate::settle::settle) holds against the format
+/// of the entry.
 #[must_use]
 pub fn read(
     parsed: Parsed,
@@ -84,7 +97,22 @@ pub fn read(
     corpus: &Corpus,
     index: &Index,
 ) -> (Parsed, Recognition) {
-    if by_altname(&parsed, altnames).is_none() && by_key(&parsed, corpus).is_none() {
+    let assigned = by_altname(&parsed, altnames).is_some();
+    if !assigned
+        && let Some(whole) = whole_reading(&parsed)
+        && let Some(answer) = by_altname(&whole, altnames)
+            .map(Recognition::Recognized)
+            .or_else(|| by_key(&whole, corpus))
+    {
+        return (
+            Parsed {
+                kind: parsed.kind,
+                ..whole
+            },
+            answer,
+        );
+    }
+    if !assigned && by_key(&parsed, corpus).is_none() {
         for other in other_readings(&parsed) {
             let answer = by_altname(&other, altnames)
                 .map(Recognition::Recognized)
@@ -107,6 +135,7 @@ fn other_readings(parsed: &Parsed) -> impl Iterator<Item = Parsed> {
         episode,
         title_with_number: None,
         episode_first: None,
+        whole: None,
         ..parsed.clone()
     };
     let read_on = parsed
@@ -119,6 +148,30 @@ fn other_readings(parsed: &Parsed) -> impl Iterator<Item = Parsed> {
         .map(|(episode, title)| reading(title, Episode::Only(episode)));
 
     read_on.into_iter().chain(first)
+}
+
+/// The name read whole as a parse of its own, where its key is not that of
+/// the title as parsed and it is not the title read on through its number.
+///
+/// It spells no season, no part and no type: they are words of its title.
+fn whole_reading(parsed: &Parsed) -> Option<Parsed> {
+    let (title, episode) = parsed.whole.clone()?;
+    if parsed.title_with_number.as_ref() == Some(&title) {
+        return None;
+    }
+    let whole = Parsed {
+        title: Some(title),
+        episode,
+        season: None,
+        part: None,
+        kind: None,
+        title_with_number: None,
+        episode_first: None,
+        whole: None,
+        ..parsed.clone()
+    };
+
+    (Key::from_parsed(&whole) != Key::from_parsed(parsed)).then_some(whole)
 }
 
 /// Decide a file by its name, and by the directories above it where the name
@@ -208,6 +261,7 @@ fn by_directory(
                 kind: kind.or(spelled.kind),
                 title_with_number: None,
                 episode_first: None,
+                whole: None,
                 from_directory: true,
                 release_group: name.release_group.clone(),
                 confidence: spelled.confidence,
@@ -1140,6 +1194,208 @@ mod tests {
         );
 
         assert_eq!(parsed.episode, Episode::Only(13));
+    }
+
+    #[test]
+    fn a_name_the_list_holds_whole_answers_before_its_title() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title Episode 0: The First Contact",
+            Vec::<&str>::new(),
+        );
+
+        let (parsed, answer) = read_as(
+            "[Group] Show Title Episode 0: The First Contact [1080p].mkv",
+            &corpus,
+        );
+
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("Show Title Episode 0: The First Contact")
+        );
+        assert_eq!(
+            answer,
+            recognized(
+                2,
+                "Show Title Episode 0: The First Contact",
+                Episode::Absent
+            )
+        );
+    }
+
+    #[test]
+    fn a_season_and_an_episode_the_list_spells_whole_belong_to_its_title() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 7", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title Season 7 Episode 13",
+            Vec::<&str>::new(),
+        );
+
+        let (parsed, answer) = read_as("Show Title Season 7 Episode 13.mkv", &corpus);
+
+        assert_eq!(parsed.season, None);
+        assert_eq!(
+            answer,
+            recognized(2, "Show Title Season 7 Episode 13", Episode::Absent)
+        );
+    }
+
+    #[test]
+    fn a_name_read_whole_keeps_the_episode_after_its_dash() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title Episode 0", Vec::<&str>::new());
+
+        assert_eq!(
+            read_as("Show Title Episode 0 - 02.mkv", &corpus).1,
+            recognized(2, "Show Title Episode 0", Episode::Only(2))
+        );
+    }
+
+    #[test]
+    fn a_name_the_list_does_not_hold_whole_is_read_as_parsed() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+
+        assert_eq!(
+            read_as(
+                "[Group] Show Title Episode 0: The First Contact [1080p].mkv",
+                &corpus
+            )
+            .1,
+            recognized(1, "Show Title", Episode::Only(0))
+        );
+    }
+
+    #[test]
+    fn an_assignment_of_the_title_answers_before_the_name_read_whole() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title Episode 0: The First Contact",
+            Vec::<&str>::new(),
+        );
+        let mut altnames = Altnames::new();
+        altnames
+            .name("Show Title", ShowId(1), &corpus)
+            .expect("the name is assigned");
+
+        let (_, answer) = read(
+            named("[Group] Show Title Episode 0: The First Contact [1080p].mkv"),
+            &altnames,
+            &corpus,
+            &Index::of(&corpus),
+        );
+
+        assert!(
+            matches!(
+                answer,
+                Recognition::Recognized(Match {
+                    show: ShowId(1),
+                    stage: Stage::Altname(_),
+                    ..
+                })
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_number_after_a_dash_inside_a_name_is_never_read_whole() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(
+            ShowId(2),
+            "Show Title 13 - The Subtitle",
+            Vec::<&str>::new(),
+        );
+
+        assert_eq!(
+            read_as("Show Title - 13 - The Subtitle.mkv", &corpus).1,
+            recognized(1, "Show Title", Episode::Only(13))
+        );
+    }
+
+    #[test]
+    fn an_assignment_of_the_name_read_whole_answers_it() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Another Show", Vec::<&str>::new());
+        let mut altnames = Altnames::new();
+        altnames
+            .name(
+                "Show Title Episode 0: The First Contact",
+                ShowId(2),
+                &corpus,
+            )
+            .expect("the name is assigned");
+
+        let (_, answer) = read(
+            named("[Group] Show Title Episode 0: The First Contact [1080p].mkv"),
+            &altnames,
+            &corpus,
+            &Index::of(&corpus),
+        );
+
+        assert!(
+            matches!(
+                answer,
+                Recognition::Recognized(Match {
+                    show: ShowId(2),
+                    stage: Stage::Altname(_),
+                    ..
+                })
+            ),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_read_whole_keeps_the_type_it_spells() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3", Vec::<&str>::new());
+        corpus.file(ShowId(2), "Show Title Season 3 OVA", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title Season 3 OVA.mkv", &corpus);
+
+        assert_eq!(parsed.kind, Some(Kind::Extra));
+        assert_eq!(
+            answer,
+            recognized(2, "Show Title Season 3 OVA", Episode::Absent)
+        );
+    }
+
+    #[test]
+    fn a_name_read_whole_is_answered_by_its_whole_spelling_alone() {
+        // Without its type word the whole name is `Show Title Season 3`, which
+        // the list holds; the title as parsed answers it instead.
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 3", Vec::<&str>::new());
+
+        let (parsed, _) = read_as("Show Title Season 3 OVA - 01.mkv", &corpus);
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.season, Some(3));
+    }
+
+    #[test]
+    fn a_name_whose_whole_key_is_its_titles_keeps_its_parse() {
+        let mut corpus = Corpus::new();
+        corpus.file(ShowId(1), "Show Title Season 2", Vec::<&str>::new());
+
+        let (parsed, answer) = read_as("Show Title Season 2 - 03.mkv", &corpus);
+
+        assert_eq!(parsed.title.as_deref(), Some("Show Title"));
+        assert_eq!(parsed.season, Some(2));
+        assert_eq!(
+            answer,
+            recognized(1, "Show Title Season 2", Episode::Only(3))
+        );
     }
 
     #[test]

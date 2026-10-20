@@ -171,6 +171,23 @@ pub struct Parsed {
     /// letter or a digit after the title or the episode unread, as
     /// [`title_with_number`](Parsed::title_with_number) says.
     pub episode_first: Option<(u32, String)>,
+    /// The name read whole, from its title to the release after its episode,
+    /// and the episode a number after a dash ends it with.
+    ///
+    /// The parser reads the words a title is spelled with as what they say
+    /// elsewhere: `Show Title Episode 0: The First Contact [1080p].mkv` reads
+    /// as the title `Show Title` and episode 0, and `Show Title Season 7
+    /// Episode 13.mkv` as season 7 and episode 13, where both are the titles
+    /// of specials. This reading keeps the words, as
+    /// `("Show Title Episode 0: The First Contact", Episode::Absent)`, and the
+    /// list decides which reading holds. A number after a dash that ends it is
+    /// its episode, as `("Show Title", Episode::Only(3))` of
+    /// `Show Title - 03 (1080p).mkv`.
+    ///
+    /// Nothing where the parser found no title. Nothing either where a number
+    /// follows a dash inside it, as in `Show Title - 13 - The Subtitle.mkv`:
+    /// a number after a dash is an episode, whatever the list holds.
+    pub whole: Option<(String, Episode)>,
     /// The title was read from a directory above the file.
     ///
     /// The episode and the release group are what the file's name spells,
@@ -231,6 +248,7 @@ pub fn parse(name: &RawPath) -> Parsed {
         kind: None,
         title_with_number: None,
         episode_first: None,
+        whole: None,
         from_directory: false,
         release_group: None,
         confidence: decoded.confidence,
@@ -244,6 +262,7 @@ pub fn parse(name: &RawPath) -> Parsed {
     parsed.text = without_the_release(&text, &elements);
     parsed.title_with_number = title_read_on(&text, &elements);
     parsed.episode_first = episode_first(&text, &elements);
+    parsed.whole = read_whole(&text, &elements);
     parsed.kind = release_kind(&text, &elements);
 
     for element in elements {
@@ -387,6 +406,73 @@ fn episode_first(text: &str, elements: &[Element]) -> Option<(u32, String)> {
             Some((number, words.value.clone()))
         }
         _ => None,
+    }
+}
+
+/// The name read whole, as [`Parsed::whole`] says.
+fn read_whole(text: &str, elements: &[Element]) -> Option<(String, Episode)> {
+    let title = elements
+        .iter()
+        .find(|element| element.kind == ElementKind::Title)?;
+    let chars: Vec<char> = text.chars().collect();
+    let after = elements
+        .iter()
+        .filter(|element| element.kind == ElementKind::Episode)
+        .map(|element| element.position)
+        .fold(title.position, usize::max);
+    let release = elements
+        .iter()
+        .filter(|element| element.position > after)
+        .find(|element| is_of_the_release(element.kind))
+        .map_or(chars.len(), |element| element.position);
+    let read: String = chars
+        .get(title.position..release)?
+        .iter()
+        .map(|&c| if c == '_' { ' ' } else { c })
+        .collect();
+    let read = read.trim_end_matches(|c: char| c.is_whitespace() || "[({-.".contains(c));
+
+    let (spelled, episode) = read
+        .rsplit_once(" - ")
+        .and_then(|(spelled, number)| {
+            Some((spelled.trim_end(), Episode::Only(number.parse().ok()?)))
+        })
+        .unwrap_or((read, Episode::Absent));
+    let numbered_inside = spelled.split(" - ").skip(1).any(|after_dash| {
+        after_dash
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.parse::<u32>().is_ok())
+    });
+
+    (!numbered_inside).then(|| (spelled.to_owned(), episode))
+}
+
+/// Whether an element of this kind belongs to the release rather than to
+/// what the name spells.
+fn is_of_the_release(kind: ElementKind) -> bool {
+    match kind {
+        ElementKind::AudioTerm
+        | ElementKind::Device
+        | ElementKind::FileChecksum
+        | ElementKind::FileExtension
+        | ElementKind::Language
+        | ElementKind::ReleaseGroup
+        | ElementKind::ReleaseInformation
+        | ElementKind::ReleaseVersion
+        | ElementKind::Source
+        | ElementKind::Subtitles
+        | ElementKind::VideoResolution
+        | ElementKind::VideoTerm => true,
+        ElementKind::Episode
+        | ElementKind::EpisodeTitle
+        | ElementKind::Other
+        | ElementKind::Part
+        | ElementKind::Season
+        | ElementKind::Title
+        | ElementKind::Type
+        | ElementKind::Volume
+        | ElementKind::Year => false,
     }
 }
 
@@ -1404,5 +1490,40 @@ mod tests {
 
         assert_eq!(parsed.season, Some(3));
         assert_eq!(parsed.part, Some(2));
+    }
+
+    #[test]
+    fn a_name_read_whole_runs_from_its_title_to_the_release() {
+        assert_eq!(
+            spelled("[Group] Show Title Episode 0: The First Contact [1080p].mkv").whole,
+            Some((
+                "Show Title Episode 0: The First Contact".to_owned(),
+                Episode::Absent
+            ))
+        );
+        assert_eq!(
+            spelled("Show Title Season 7 Episode 13.mkv").whole,
+            Some(("Show Title Season 7 Episode 13".to_owned(), Episode::Absent))
+        );
+    }
+
+    #[test]
+    fn a_number_after_a_dash_that_ends_a_name_read_whole_is_its_episode() {
+        assert_eq!(
+            spelled("[Group] Show Title - 03 (1080p) [A1B2C3D4].mkv").whole,
+            Some(("Show Title".to_owned(), Episode::Only(3)))
+        );
+        assert_eq!(
+            spelled("Show Title Episode 0 - 02.mkv").whole,
+            Some(("Show Title Episode 0".to_owned(), Episode::Only(2)))
+        );
+    }
+
+    #[test]
+    fn a_name_that_spells_no_title_is_read_whole_as_nothing() {
+        let parsed = spelled("01 - Quiet Harbor.mkv");
+
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.whole, None);
     }
 }
