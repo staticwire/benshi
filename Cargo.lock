@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "benshi-core",
  "futures-util",
+ "tempfile",
  "thiserror",
  "tokio",
  "zbus",
