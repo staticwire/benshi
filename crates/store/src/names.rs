@@ -16,7 +16,9 @@ impl Store {
     ///
     /// Filed under `title` the first time the key is seen, and the same show
     /// every time after. Only the same key finds it: a name that differs in
-    /// its marks, its season or its part is a show of its own.
+    /// its marks, its season or its part is a show of its own. A row's season
+    /// or part of -1 is found as none, because the index that keeps a key to
+    /// one row reads none as -1.
     ///
     /// # Errors
     ///
@@ -28,7 +30,8 @@ impl Store {
         let kept: Option<i64> = transaction
             .query_row(
                 "SELECT show FROM names \
-                 WHERE letters = ?1 AND marks = ?2 AND season IS ?3 AND part IS ?4",
+                 WHERE letters = ?1 AND marks = ?2 \
+                 AND IFNULL(season, -1) = IFNULL(?3, -1) AND IFNULL(part, -1) = IFNULL(?4, -1)",
                 params![key.letters(), key.marks(), key.season(), key.part()],
                 |row| row.get(0),
             )
@@ -216,6 +219,24 @@ mod tests {
             "{:?}",
             store.unlisted_names()
         );
+    }
+
+    #[test]
+    fn a_season_and_a_part_of_minus_one_are_found_as_none() {
+        // The index that keeps a key to one row reads none as -1, so it
+        // refuses a row filed with none beside a row of -1.
+        let (home, mut store) = a_store();
+        let show = store
+            .unlisted(&key("Some Other Show"), "Some Other Show")
+            .expect("the name is kept");
+        Connection::open(home.path().join("benshi.db"))
+            .expect("the file opens")
+            .execute("UPDATE names SET season = -1, part = -1", [])
+            .expect("the row is changed by hand");
+
+        let found = store.unlisted(&key("Some Other Show"), "Some Other Show");
+
+        assert!(matches!(found, Ok(again) if again == show), "{found:?}");
     }
 
     #[test]
