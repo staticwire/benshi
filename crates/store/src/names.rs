@@ -1,9 +1,11 @@
-//! The names a list does not hold, each kept as a show of its own.
+//! The names a list does not hold, each kept as a show.
 //!
 //! A name that spells a title and reaches no entry of the list is a show with
-//! no link, and the name is found again by its key. The key is kept in its
-//! parts, as [`Key`] answers them, so the key a name was kept under is read
-//! back as it was and never built again from text.
+//! no link, and the name is found again by its key. The names of an entry
+//! that left the list are kept as the show it is linked to, as
+//! [`Store::file`] says. The key is kept in its parts, as [`Key`] answers
+//! them, so the key a name was kept under is read back as it was and never
+//! built again from text.
 
 use benshi_core::ShowId;
 use benshi_core::recognize::normalize::Key;
@@ -14,11 +16,12 @@ use crate::{Error, Store};
 impl Store {
     /// The show a name the list does not hold is kept as.
     ///
-    /// Filed under `title` the first time the key is seen, and the same show
-    /// every time after. Only the same key finds it: a name that differs in
-    /// its marks, its season or its part is a show of its own. A row's season
-    /// or part of -1 is found as none, because the index that keeps a key to
-    /// one row reads none as -1.
+    /// Found by the name's key alone, the same show every time: a name that
+    /// differs in its marks, its season or its part has a key of its own. A
+    /// key that is not kept is filed as a show titled `title`. A key
+    /// [`Store::file`] kept for an entry that left the list is the show of
+    /// that entry. A row's season or part of -1 is found as none, because the
+    /// index that keeps a key to one row reads none as -1.
     ///
     /// # Errors
     ///
@@ -56,8 +59,8 @@ impl Store {
         Ok(ShowId(show))
     }
 
-    /// Every name kept as a show of its own, with its show, in the order they
-    /// were first seen.
+    /// Every name kept, with the show it is kept as, in the order they were
+    /// kept.
     ///
     /// # Errors
     ///

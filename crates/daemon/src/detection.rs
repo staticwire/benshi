@@ -265,8 +265,9 @@ where
 /// A name recognition refused, as the show it is kept as where it spells a
 /// title, and as it was answered where it spells none.
 ///
-/// The store files the show the first time the name's key is seen, and finds
-/// it by that key alone after.
+/// The store finds the show by the name's key alone. A key it does not hold
+/// yet is filed as a show of its own, and a key kept for an entry that left
+/// the list is the show of that entry.
 async fn unlisted(
     store: Arc<Mutex<Store>>,
     answer: Recognition,
@@ -600,10 +601,12 @@ impl<W: PlayerWatcher> Detection<W> {
 mod tests {
     use super::{Detection, Seen, Wiring};
     use crate::bus::{BusEvent, EventBus};
-    use crate::listing::Wakes;
+    use crate::listing::{Wakes, kept};
     use crate::recognition::{Current, Decided, Recognizer};
+    use crate::secrets::ANILIST;
     use crate::supervisor::TaskError;
     use benshi_core::clock::{Clock, TestClock, Timestamp};
+    use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognize::altname::Altnames;
@@ -2286,6 +2289,61 @@ mod tests {
             }]
         );
         assert_eq!(database.count_of("names"), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_name_of_an_entry_that_left_the_list_is_recorded_as_the_show_it_was() {
+        let database = Database::new();
+        let departed = Entry {
+            id: EntryId(900_001),
+            title: "Departed Show".to_owned(),
+            spellings: Vec::new(),
+            format: None,
+            episodes: Some(12),
+            episode_length: None,
+            year: None,
+            released: true,
+            status: Status::Watching,
+            progress: 2,
+            rewatches: 0,
+            score: None,
+        };
+        let (show, recognizer) = {
+            let mut store = database.store.lock().expect("the store");
+            store
+                .file(ANILIST.backend, &[departed])
+                .expect("the list is filed");
+            let show = store.listed(ANILIST.backend).expect("the list is read")[0].0;
+            store
+                .file(ANILIST.backend, &[])
+                .expect("the list is filed without it");
+            (show, kept(&store).expect("the list kept is read"))
+        };
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(watching(
+            &mpv,
+            "/anime/[Group] Departed Show - 03 [1080p].mkv",
+            0..=HALF_AT,
+        ));
+        let mut detection = Detection::new(
+            watcher,
+            Wiring {
+                recognizer: Current::new(recognizer),
+                ..wired_to(&database)
+            },
+        );
+
+        rounds(&mut detection, HALF_AT + 1).await;
+
+        assert_eq!(
+            database.queued(),
+            [Operation {
+                id: 1,
+                show,
+                title: "Departed Show".to_owned(),
+                kind: Kind::Progress { episode: Some(3) },
+            }]
+        );
     }
 
     #[tokio::test]

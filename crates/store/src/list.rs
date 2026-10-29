@@ -6,11 +6,18 @@
 //! entry leaving the list**, so an entry that comes back is the show it was,
 //! with what was watched of it. What the entries hold, in `list_entries`, is
 //! replaced whole at each filing.
+//!
+//! The title and the spellings of an entry that left the list are kept in
+//! `names` as names of its show. A file named after it is that show where
+//! recognition refuses the name of the file.
 
+use std::collections::HashSet;
+use std::iter;
 use std::time::Duration;
 
 use benshi_core::ShowId;
 use benshi_core::list::{Entry, EntryId, Rating};
+use benshi_core::recognize::normalize::Key;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -24,7 +31,9 @@ impl Store {
     /// An entry with no show is filed as a show titled as the entry is, and
     /// linked to it. A show that is linked takes the entry's title. An entry
     /// of the list before that is not among these keeps its show and its
-    /// link.
+    /// link, and its names are kept as names of its show: the title of the
+    /// show, and the spellings the entry was filed with where they are still
+    /// there and read. A key kept already keeps the show it has.
     ///
     /// The length of an episode is kept in whole milliseconds, and one longer
     /// than the column holds is kept as the longest it holds.
@@ -36,6 +45,7 @@ impl Store {
     /// that is in the list twice among them. Nothing is filed with either.
     pub fn file(&mut self, backend: &str, entries: &[Entry]) -> Result<(), Error> {
         let transaction = self.connection.transaction()?;
+        keep_names_of_departed(&transaction, backend, entries)?;
         transaction.execute("DELETE FROM list_entries WHERE backend = ?1", [backend])?;
         for entry in entries {
             link(&transaction, backend, entry)?;
@@ -93,6 +103,51 @@ impl Store {
             .query_and_then([backend], |row| read(backend, row))?
             .collect()
     }
+}
+
+/// Keep the names of every entry linked on the backend that `entries` does
+/// not hold as names of its show, as [`Store::file`] says.
+fn keep_names_of_departed(
+    transaction: &Transaction,
+    backend: &str,
+    entries: &[Entry],
+) -> Result<(), Error> {
+    let listed: HashSet<i64> = entries.iter().map(|entry| entry.id.0).collect();
+    let linked: Vec<(i64, i64, String, Option<String>)> = transaction
+        .prepare(
+            "SELECT backend_ids.entry, backend_ids.show, shows.title, list_entries.spellings \
+             FROM backend_ids \
+             JOIN shows ON shows.id = backend_ids.show \
+             LEFT JOIN list_entries USING (backend, entry) \
+             WHERE backend_ids.backend = ?1",
+        )?
+        .query_map([backend], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    for (entry, show, title, spellings) in linked {
+        if listed.contains(&entry) {
+            continue;
+        }
+        // Spellings that do not read are passed over. This filing replaces
+        // the row, and a refusal here would refuse every filing after it.
+        let spellings: Vec<String> = spellings
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        for spelled in iter::once(title).chain(spellings) {
+            let Some(key) = Key::from_title(&spelled) else {
+                continue;
+            };
+            transaction.execute(
+                "INSERT INTO names (show, letters, marks, season, part) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+                params![show, key.letters(), key.marks(), key.season(), key.part()],
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Link an entry to its show, filing the show where the backend has none,
@@ -194,6 +249,7 @@ mod tests {
 
     use benshi_core::ShowId;
     use benshi_core::list::{Entry, EntryId, Format, Rating, Status};
+    use benshi_core::recognize::normalize::Key;
     use rusqlite::types::Value;
     use tempfile::TempDir;
 
@@ -265,6 +321,7 @@ mod tests {
     fn rows(store: &Store, table: &str) -> Vec<Vec<Value>> {
         let order = match table {
             "shows" => "id",
+            "names" => "rowid",
             _ => "backend, entry",
         };
         let mut statement = store
@@ -383,6 +440,112 @@ mod tests {
 
         assert_eq!(store.listed(BACKEND).expect("the list is read"), first);
         assert_eq!(count(&store, "shows"), 2);
+    }
+
+    /// The show a name is kept as, by the key of its spelling.
+    fn kept_as(store: &mut Store, spelled: &str) -> ShowId {
+        let key = Key::from_title(spelled).expect("a title with letters in it has a key");
+        store.unlisted(&key, spelled).expect("the name is kept")
+    }
+
+    #[test]
+    fn a_name_of_an_entry_that_left_the_list_is_the_show_it_was() {
+        let (_home, mut store) = a_store();
+        store
+            .file(BACKEND, &[a_series(900_001, "Departed Show")])
+            .expect("the list is filed");
+        let show = store.listed(BACKEND).expect("the list is read")[0].0;
+
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it");
+
+        for spelled in [
+            "Departed Show",
+            "Departed Show Spelled Otherwise",
+            "Departed Show 2",
+        ] {
+            assert_eq!(kept_as(&mut store, spelled), show, "{spelled}");
+        }
+        assert_eq!(count(&store, "shows"), 1);
+    }
+
+    #[test]
+    fn a_name_of_an_entry_that_left_keeps_its_season_and_its_part() {
+        let (_home, mut store) = a_store();
+        store
+            .file(
+                BACKEND,
+                &[a_series(900_001, "Departed Show Season 2 Part 2")],
+            )
+            .expect("the list is filed");
+        let show = store.listed(BACKEND).expect("the list is read")[0].0;
+
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it");
+
+        assert_eq!(kept_as(&mut store, "Departed Show Season 2 Part 2"), show);
+    }
+
+    #[test]
+    fn a_name_kept_before_its_entry_left_keeps_the_show_it_had() {
+        let (_home, mut store) = a_store();
+        let kept = kept_as(&mut store, "Departed Show");
+        store
+            .file(BACKEND, &[a_series(900_001, "Departed Show")])
+            .expect("the list is filed");
+
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it");
+
+        assert_eq!(kept_as(&mut store, "Departed Show"), kept);
+    }
+
+    #[test]
+    fn an_entry_whose_spellings_are_gone_is_found_by_the_title_of_its_show() {
+        // An entry that left at an earlier filing has no row in
+        // `list_entries`, so the title of its show is all there is to keep.
+        let (home, mut store) = a_store();
+        store
+            .file(BACKEND, &[a_series(900_001, "Departed Show")])
+            .expect("the list is filed");
+        let show = store.listed(BACKEND).expect("the list is read")[0].0;
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it");
+        rusqlite::Connection::open(home.path().join("benshi.db"))
+            .expect("the file opens")
+            .execute("DELETE FROM names", [])
+            .expect("the names are taken out by hand");
+
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it again");
+
+        assert_eq!(kept_as(&mut store, "Departed Show"), show);
+        assert_ne!(kept_as(&mut store, "Departed Show Spelled Otherwise"), show);
+    }
+
+    #[test]
+    fn an_entry_leaving_whose_spellings_do_not_read_keeps_the_title_of_its_show() {
+        let (home, mut store) = a_store();
+        store
+            .file(BACKEND, &[a_series(900_001, "Departed Show")])
+            .expect("the list is filed");
+        let show = store.listed(BACKEND).expect("the list is read")[0].0;
+        rusqlite::Connection::open(home.path().join("benshi.db"))
+            .expect("the file opens")
+            .execute("UPDATE list_entries SET spellings = 'not a list'", [])
+            .expect("the row is changed by hand");
+
+        store
+            .file(BACKEND, &[])
+            .expect("the list is filed without it");
+
+        assert_eq!(count(&store, "list_entries"), 0);
+        assert_eq!(kept_as(&mut store, "Departed Show"), show);
     }
 
     #[test]
