@@ -4,7 +4,7 @@
 //! store keeps the instant of a viewing in UTC, and the day is the one a zone
 //! names for that instant. Read in the zone where it was seen, a viewing just
 //! after midnight is on the day it was seen there. A past instant is read by
-//! the rules of summer time the zone had then.
+//! the offset the zone had then, summer time included.
 
 use std::time::SystemTime;
 
@@ -52,6 +52,33 @@ mod tests {
         TimeZone::fixed(Offset::constant(hours))
     }
 
+    /// A zone two hours east of UTC up to the start of 2016 and three hours
+    /// east from then on, built as `TZif` data of version 1, RFC 8536: the
+    /// counts, one transition, two local time types and their designations.
+    /// RFC 8536 leaves the time from the last transition on to the footer,
+    /// and version 1 has none. `jiff` reads that time by the type of the last
+    /// transition.
+    fn moved_east_in_2016() -> TimeZone {
+        // The magic, NUL for version 1, and 15 reserved bytes.
+        let mut data = b"TZif\0".to_vec();
+        data.extend([0; 15]);
+        // UT indicators, standard indicators, leap seconds, transitions,
+        // local time types, and bytes of designations.
+        for count in [0_u32, 0, 0, 1, 2, 8] {
+            data.extend(count.to_be_bytes());
+        }
+        // 2016-01-01T00:00:00Z, from when the second type is in force.
+        data.extend(1_451_606_400_i32.to_be_bytes());
+        data.push(1);
+        for (offset, designation) in [(7_200_i32, 0_u8), (10_800, 4)] {
+            data.extend(offset.to_be_bytes());
+            data.extend([0, designation]);
+        }
+        data.extend(b"TWO\0THR\0");
+
+        TimeZone::tzif("Test/Moved", &data).expect("the data is TZif")
+    }
+
     #[test]
     fn an_evening_in_utc_is_the_next_day_three_hours_east() {
         let late = at("2026-10-13T22:30:00Z");
@@ -86,6 +113,22 @@ mod tests {
         assert_eq!(
             day_in(at("2026-01-01T23:30:00Z"), &central),
             Some(day(2026, 1, 2))
+        );
+    }
+
+    #[test]
+    fn a_past_instant_is_read_by_the_offset_its_zone_had_then() {
+        let zone = moved_east_in_2016();
+
+        // 21:30 in UTC was 23:30 the same day, two hours east, before the
+        // zone moved, and is 00:30 the next day, three hours east, after.
+        assert_eq!(
+            day_in(at("2015-07-01T21:30:00Z"), &zone),
+            Some(day(2015, 7, 1))
+        );
+        assert_eq!(
+            day_in(at("2017-07-01T21:30:00Z"), &zone),
+            Some(day(2017, 7, 2))
         );
     }
 
