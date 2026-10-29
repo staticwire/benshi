@@ -337,6 +337,7 @@ mod tests {
     use benshi_core::ShowId;
     use benshi_core::list::EntryId;
     use benshi_core::path::RawPath;
+    use benshi_core::recognize::normalize::Key;
     use tempfile::TempDir;
 
     use super::{Error, Store, Viewing};
@@ -615,6 +616,18 @@ mod tests {
         let _writer = a_writer(&database);
 
         let refused = store.close(SHOW, Some(3));
+
+        assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
+    }
+
+    #[test]
+    fn a_name_kept_while_another_connection_writes_is_refused_as_busy() {
+        let (_home, database) = a_home();
+        let mut store = a_store_in_a_hurry(&database);
+        let _writer = a_writer(&database);
+        let key = Key::from_title("Another Show").expect("a title with letters in it has a key");
+
+        let refused = store.unlisted(&key, "Another Show");
 
         assert!(matches!(refused, Err(Error::Busy(_))), "got {refused:?}");
     }

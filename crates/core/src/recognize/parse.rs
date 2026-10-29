@@ -1031,6 +1031,29 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_opens_with_japanese_title_quotes_reads_the_words_of_both() {
+        // Left to the parser, a name that opens with 「」 would have the quoted
+        // words for its title, with the quotes kept and the rest left out. One
+        // that opens with 『』 would have the quoted words taken for a release
+        // group, and the rest alone for its title.
+        for (name, episode) in [
+            ("「作品名」副題.mkv", Episode::Absent),
+            ("『作品名』 副題 - 03.mkv", Episode::Only(3)),
+        ] {
+            let parsed = spelled(name);
+            let title = parsed.title.clone().unwrap_or_default();
+
+            assert!(
+                title.starts_with("作品名") && title.contains("副題"),
+                "{name}: {title:?}"
+            );
+            assert_eq!(parsed.release_group, None, "{name}");
+            assert_eq!(parsed.episode, episode, "{name}");
+            assert_eq!(words_left(name), ["作品名", "副題"], "{name}");
+        }
+    }
+
+    #[test]
     fn a_type_word_the_name_spells_is_kept_as_its_kind() {
         for (name, kind) in [
             (
