@@ -27,7 +27,9 @@
 //! names no date, the dates are the ones the entry holds. The last episode is
 //! the entry's count, and an entry with no count has no last episode. An
 //! entry completed with no count is taken as one of several. An episode past
-//! the count writes nothing.
+//! the count and episode 0 write nothing, whatever the entry holds, each with
+//! a reason of its own. Progress counts the episodes seen from the first, so
+//! it has no place for episode 0.
 
 use benshi_core::list::Status;
 
@@ -75,6 +77,9 @@ pub enum Why {
         /// The count.
         episodes: u32,
     },
+    /// The episode is 0, and progress counts the episodes seen from the
+    /// first.
+    EpisodeZero,
 }
 
 /// What a viewing writes, or why it writes nothing.
@@ -94,6 +99,9 @@ pub enum Plan {
 /// numbering.
 #[must_use]
 pub fn plan(held: Option<&Standing>, episodes: Option<u32>, episode: u32, day: Day) -> Plan {
+    if episode == 0 {
+        return Plan::Nothing(Why::EpisodeZero);
+    }
     if let Some(count) = episodes
         && episode > count
     {
@@ -461,6 +469,31 @@ mod tests {
                 Plan::Nothing(Why::PastCount { episodes: 12 }),
                 "{before:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_episode_zero_writes_nothing_whatever_the_entry_holds() {
+        let rewatching = Standing {
+            status: Status::Rewatching,
+            progress: 3,
+            ..completed(3, 1)
+        };
+
+        for before in [
+            None,
+            Some(held(Status::Planned, 0)),
+            Some(held(Status::Watching, 5)),
+            Some(completed(12, 0)),
+            Some(rewatching),
+        ] {
+            for episodes in [Some(12), Some(1), None] {
+                assert_eq!(
+                    plan(before.as_ref(), episodes, 0, TODAY),
+                    Plan::Nothing(Why::EpisodeZero),
+                    "{before:?} {episodes:?}"
+                );
+            }
         }
     }
 }
