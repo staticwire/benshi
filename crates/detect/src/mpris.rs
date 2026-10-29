@@ -46,7 +46,7 @@ const PLAYER_OBJECT: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_INTERFACE: InterfaceName<'static> =
     InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
 
-/// The scheme a `xesam:url` carries when it names a file on this machine.
+/// The scheme of a `xesam:url` that is a URL naming a file on this machine.
 const LOCAL_FILE_SCHEME: &str = "file://";
 
 /// How long from the start of one round of readings to the start of the next.
@@ -251,13 +251,25 @@ fn micros(properties: &Properties, key: &str) -> Option<i64> {
 /// bytes into the URL, where they survive exactly; by the time the same name
 /// reaches `xesam:title` it has been through a lossy conversion and is
 /// destroyed. mpv 0.41.0 does this to a Shift-JIS filename.
+///
+/// An absolute path with no scheme is a local file as well. `smplayer` 25.6
+/// publishes the file it plays that way. Such a path is a D-Bus string with
+/// no escapes, so a filename that is not valid UTF-8 does not survive in it.
 fn media_from(metadata: &Properties) -> Option<MediaRef> {
     if let Some(url) = non_empty_text(metadata, "xesam:url") {
-        return Some(match url.strip_prefix(LOCAL_FILE_SCHEME) {
-            // A remainder that does not begin with a slash carries an
+        // The authority `localhost` names this machine, RFC 8089.
+        let local = url
+            .strip_prefix(LOCAL_FILE_SCHEME)
+            .map(|rest| rest.strip_prefix("localhost").unwrap_or(rest));
+        return Some(match local {
+            // A remainder that does not begin with a slash carries another
             // authority, so the path it names is on another machine.
             Some(path) if path.starts_with('/') => {
                 MediaRef::LocalFile(RawPath::from_bytes(percent_decode(path)))
+            }
+            // A path is not a URL, so nothing in it is an escape.
+            None if url.starts_with('/') => {
+                MediaRef::LocalFile(RawPath::from_bytes(url.as_bytes().to_vec()))
             }
             _ => MediaRef::Remote(url.to_owned()),
         });
@@ -984,6 +996,66 @@ mod tests {
         assert_eq!(
             media_from(&metadata),
             Some(MediaRef::Remote("file://server/share/ep.mkv".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_file_url_naming_localhost_is_a_local_path() {
+        let metadata = properties(vec![(
+            "xesam:url",
+            a_string("file://localhost/anime/ep%2003.mkv"),
+        )]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/ep 03.mkv".to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_with_no_scheme_is_a_local_path() {
+        // SMPlayer 25.6 publishes the path of the file it plays as xesam:url,
+        // with no file:// in front of it.
+        let metadata = properties(vec![(
+            "xesam:url",
+            a_string("/anime/[Group] Show Title - 03 (1080p).mkv"),
+        )]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/[Group] Show Title - 03 (1080p).mkv".to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_scheme_has_no_escapes_to_decode() {
+        // A path is not a URL, so a percent in it is a percent in the name.
+        let metadata = properties(vec![("xesam:url", a_string("/anime/100%25 Show - 03.mkv"))]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/100%25 Show - 03.mkv".to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_source_with_a_url_and_a_title_is_read_by_its_url() {
+        let metadata = properties(vec![
+            ("xesam:url", a_string("file:///anime/ep%2003.mkv")),
+            ("xesam:title", a_string("Episode 3")),
+        ]);
+
+        assert_eq!(
+            media_from(&metadata),
+            Some(MediaRef::LocalFile(RawPath::from_bytes(
+                b"/anime/ep 03.mkv".to_vec()
+            )))
         );
     }
 
