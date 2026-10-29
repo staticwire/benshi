@@ -14,18 +14,21 @@
 //!    count;
 //! 3. a rule that takes that episode of that entry, wherever it sends it;
 //! 4. the entry, where the episode is past its count and numbers the first
-//!    season by the hundred, as `101` names episode 1, and the count holds
-//!    the episode it names;
+//!    season by the hundred, as `101` names episode 1, and the count, below
+//!    a hundred, holds the episode it names;
 //! 5. the entry, where the list holds no count for it and the episode is
 //!    above zero.
 //!
-//! Otherwise the episode is unresolved, with the reason. A rule is asked only
-//! where the count does not answer, because a rule describes a numbering that
-//! falls outside an entry's count. Where the count is not known a rule is
-//! asked first, and the entry takes an episode above
-//! zero that no rule takes. A rule that sends an episode to an entry the list
-//! does not hold resolves to it all the same: the work is the rule's to name,
-//! and the write that follows adds it to the list.
+//! Otherwise the episode is unresolved, with the reason. Where the count is
+//! below a hundred, an episode that numbers a season from 2 to 9 by the
+//! hundred, as `201` names episode 1 of the second, says that season and
+//! episode, and only a rule or a pin sends it to an entry. A rule is asked
+//! only where the count does not answer, because a rule describes a numbering
+//! that falls outside an entry's count. Where the count is not known a rule is
+//! asked first, and the entry takes an episode above zero that no rule takes.
+//! A rule that sends an episode to an entry the list does not hold resolves to
+//! it all the same: the work is the rule's to name, and the write that follows
+//! adds it to the list.
 //!
 //! A name that spells no episode is the one episode of an entry of one.
 
@@ -87,10 +90,20 @@ pub enum Unresolved {
         /// The entry's count, where the list holds one.
         episodes: Option<u32>,
     },
-    /// The episode is outside the entry's count, and no rule takes it.
+    /// The episode is outside the entry's count, no rule takes it, and it
+    /// numbers no later season by the hundred.
     Outside {
         /// The entry's count, where the list holds one.
         episodes: Option<u32>,
+    },
+    /// The entry has fewer than a hundred episodes, the episode is past them,
+    /// no rule takes it, and it numbers a later season by the hundred: `201`
+    /// is the first episode of the second.
+    LaterSeason {
+        /// The season, from 2 to 9.
+        season: u32,
+        /// The episode of that season.
+        episode: u32,
     },
     /// A rule takes the episode, and gives no number for where it goes.
     Unnumbered,
@@ -164,17 +177,32 @@ pub fn resolve(
         None => match episodes.map(|count| of_the_first_season(episode, count)) {
             Some(Some(numbered)) => the_entry(numbered),
             None if episode > 0 => the_entry(episode),
-            _ => Resolution::Unresolved(Unresolved::Outside { episodes }),
+            _ => match episodes.and_then(|count| of_a_later_season(episode, count)) {
+                Some((season, episode)) => {
+                    Resolution::Unresolved(Unresolved::LaterSeason { season, episode })
+                }
+                None => Resolution::Unresolved(Unresolved::Outside { episodes }),
+            },
         },
     }
 }
 
+/// The season and the episode of it a release names by the hundred, `201`
+/// for the first episode of the second, read for seasons 2 to 9 and episodes
+/// from 1. None where the entry's count is a hundred or more: a season that
+/// long cannot be numbered by the hundred.
+fn of_a_later_season(episode: u32, count: u32) -> Option<(u32, u32)> {
+    let (season, of_it) = (episode / 100, episode % 100);
+    (count < 100 && (2..=9).contains(&season) && of_it > 0).then_some((season, of_it))
+}
+
 /// The episode of the first season a release names by the hundred, `101` for
-/// the first, where the entry holds it. Asked only of an episode outside the
-/// count: an episode the count holds is that episode, however many there are.
+/// the first, where the entry holds it and has fewer than a hundred episodes.
+/// Asked only of an episode outside the count: an episode the count holds is
+/// that episode, however many there are.
 fn of_the_first_season(episode: u32, count: u32) -> Option<u32> {
     let numbered = episode.checked_sub(100)?;
-    (episode < 200 && (1..=count).contains(&numbered)).then_some(numbered)
+    (count < 100 && (1..=count).contains(&numbered)).then_some(numbered)
 }
 
 #[cfg(test)]
@@ -261,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn an_episode_numbered_by_the_hundred_is_of_the_first_season() {
+    fn an_episode_of_the_first_season_numbered_by_the_hundred_is_that_episode() {
         // A release that numbers its seasons by the hundred names the first
         // episode of the first season 101.
         let twelve = Some(of(Some(12)));
@@ -274,7 +302,11 @@ mod tests {
             on_anilist(Some(112), twelve, &no_rules()),
             to(900_001, 12, By::Entry)
         );
-        for outside in [100, 113, 201] {
+        assert_eq!(
+            on_anilist(Some(199), Some(of(Some(99))), &no_rules()),
+            to(900_001, 99, By::Entry)
+        );
+        for outside in [100, 113] {
             assert_eq!(
                 on_anilist(Some(outside), twelve, &no_rules()),
                 Resolution::Unresolved(Unresolved::Outside { episodes: Some(12) }),
@@ -284,18 +316,70 @@ mod tests {
     }
 
     #[test]
-    fn an_episode_the_count_holds_is_that_episode_however_many_there_are() {
-        for count in [150, 500] {
-            assert_eq!(
-                on_anilist(Some(101), Some(of(Some(count))), &no_rules()),
-                to(900_001, 101, By::Entry),
-                "{count}"
-            );
+    fn an_episode_past_the_count_numbered_by_the_hundred_names_a_later_season() {
+        for count in [12, 99] {
+            for (episode, season, of_it) in [(201, 2, 1), (212, 2, 12), (306, 3, 6), (999, 9, 99)] {
+                assert_eq!(
+                    on_anilist(Some(episode), Some(of(Some(count))), &no_rules()),
+                    Resolution::Unresolved(Unresolved::LaterSeason {
+                        season,
+                        episode: of_it,
+                    }),
+                    "{count} {episode}"
+                );
+            }
         }
         assert_eq!(
-            on_anilist(Some(101), Some(of(Some(100))), &no_rules()),
-            to(900_001, 1, By::Entry)
+            on_anilist(Some(201), Some(of(None)), &no_rules()),
+            to(900_001, 201, By::Entry)
         );
+    }
+
+    #[test]
+    fn a_hundred_with_no_episode_or_past_the_ninth_season_is_outside() {
+        for outside in [200, 300, 1001] {
+            assert_eq!(
+                on_anilist(Some(outside), Some(of(Some(12))), &no_rules()),
+                Resolution::Unresolved(Unresolved::Outside { episodes: Some(12) }),
+                "{outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_of_a_hundred_episodes_or_more_numbers_no_season_by_the_hundred() {
+        // A season of a hundred episodes or more cannot be numbered by the
+        // hundred: its episodes would run into the next season's numbers.
+        for (count, episode) in [(100, 101), (150, 151), (100, 250), (201, 250)] {
+            assert_eq!(
+                on_anilist(Some(episode), Some(of(Some(count))), &no_rules()),
+                Resolution::Unresolved(Unresolved::Outside {
+                    episodes: Some(count)
+                }),
+                "{count} {episode}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_that_takes_an_episode_of_a_later_season_is_asked_first() {
+        let second = rules("- ?|?|900001:201-212 -> ?|?|900002:1-12");
+
+        assert_eq!(
+            on_anilist(Some(201), Some(of(Some(12))), &second),
+            to(900_002, 1, By::Rule)
+        );
+    }
+
+    #[test]
+    fn an_episode_the_count_holds_is_that_episode_however_many_there_are() {
+        for (count, episode) in [(150, 101), (500, 101), (500, 201)] {
+            assert_eq!(
+                on_anilist(Some(episode), Some(of(Some(count))), &no_rules()),
+                to(900_001, episode, By::Entry),
+                "{count} {episode}"
+            );
+        }
         assert_eq!(
             on_anilist(Some(230), Some(of(Some(150))), &no_rules()),
             Resolution::Unresolved(Unresolved::Outside {
