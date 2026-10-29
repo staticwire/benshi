@@ -454,15 +454,15 @@ pub enum Stage {
 /// The show is the corpus entry that matched, rather than the text the filename
 /// spelled. A [`Refusal`] carries that second thing, and confusing the two is how
 /// a near miss gets written down as a title. Under [`Stage::Unlisted`] the show
-/// is one kept for a name the list does not hold, and the title is the name's
-/// own spelling.
+/// is one kept for a name the list does not hold, and the title is the one
+/// the show is kept under.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     /// The show the corpus filed the entry as, or the show kept for a name the
     /// list does not hold.
     pub show: ShowId,
-    /// The title as the corpus spells it, or as the name spelled it under
-    /// [`Stage::Unlisted`].
+    /// The title as the corpus spells it, or the title the show is kept under
+    /// for [`Stage::Unlisted`].
     pub title: String,
     /// The episode in the release's numbering, as it was read from the name.
     ///

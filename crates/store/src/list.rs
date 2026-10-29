@@ -445,7 +445,7 @@ mod tests {
     /// The show a name is kept as, by the key of its spelling.
     fn kept_as(store: &mut Store, spelled: &str) -> ShowId {
         let key = Key::from_title(spelled).expect("a title with letters in it has a key");
-        store.unlisted(&key, spelled).expect("the name is kept")
+        store.unlisted(&key, spelled).expect("the name is kept").0
     }
 
     #[test]

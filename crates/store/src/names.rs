@@ -14,7 +14,8 @@ use rusqlite::{OptionalExtension, params};
 use crate::{Error, Store};
 
 impl Store {
-    /// The show a name the list does not hold is kept as.
+    /// The show a name the list does not hold is kept as, and the title the
+    /// show has.
     ///
     /// Found by the name's key alone, the same show every time: a name that
     /// differs in its marks, its season or its part has a key of its own. A
@@ -28,19 +29,20 @@ impl Store {
     /// [`Error::Busy`] when another connection has the database, and
     /// [`Error::Write`] when a statement fails for any other reason. Nothing
     /// is filed with either.
-    pub fn unlisted(&mut self, key: &Key, title: &str) -> Result<ShowId, Error> {
+    pub fn unlisted(&mut self, key: &Key, title: &str) -> Result<(ShowId, String), Error> {
         let transaction = self.connection.transaction()?;
-        let kept: Option<i64> = transaction
+        let kept: Option<(i64, String)> = transaction
             .query_row(
-                "SELECT show FROM names \
+                "SELECT names.show, shows.title FROM names \
+                 JOIN shows ON shows.id = names.show \
                  WHERE letters = ?1 AND marks = ?2 \
                  AND IFNULL(season, -1) = IFNULL(?3, -1) AND IFNULL(part, -1) = IFNULL(?4, -1)",
                 params![key.letters(), key.marks(), key.season(), key.part()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let show = if let Some(show) = kept {
-            show
+        let (show, title) = if let Some(kept) = kept {
+            kept
         } else {
             let show: i64 = transaction.query_row(
                 "INSERT INTO shows (title) VALUES (?1) RETURNING id",
@@ -52,11 +54,11 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![show, key.letters(), key.marks(), key.season(), key.part()],
             )?;
-            show
+            (show, title.to_owned())
         };
         transaction.commit()?;
 
-        Ok(ShowId(show))
+        Ok((ShowId(show), title))
     }
 
     /// Every name kept, with the show it is kept as, in the order they were
@@ -157,7 +159,8 @@ mod tests {
             shows.push(
                 store
                     .unlisted(&key(spelled), spelled)
-                    .expect("the name is kept"),
+                    .expect("the name is kept")
+                    .0,
             );
         }
 
@@ -174,10 +177,10 @@ mod tests {
         let (_home, mut store) = a_store();
         let one = key("Some Other Show");
         let two = key("K-ON!! Season 3 Part 2");
-        let first = store
+        let (first, _) = store
             .unlisted(&one, "Some Other Show")
             .expect("the name is kept");
-        let second = store
+        let (second, _) = store
             .unlisted(&two, "K-ON!! Season 3 Part 2")
             .expect("the name is kept");
 
@@ -190,7 +193,7 @@ mod tests {
     #[test]
     fn a_name_whose_parts_are_no_key_is_refused_with_its_show() {
         let (home, mut store) = a_store();
-        let show = store
+        let (show, _) = store
             .unlisted(&key("Some Other Show"), "Some Other Show")
             .expect("the name is kept");
         Connection::open(home.path().join("benshi.db"))
@@ -229,7 +232,7 @@ mod tests {
         // The index that keeps a key to one row reads none as -1, so it
         // refuses a row filed with none beside a row of -1.
         let (home, mut store) = a_store();
-        let show = store
+        let kept = store
             .unlisted(&key("Some Other Show"), "Some Other Show")
             .expect("the name is kept");
         Connection::open(home.path().join("benshi.db"))
@@ -239,7 +242,7 @@ mod tests {
 
         let found = store.unlisted(&key("Some Other Show"), "Some Other Show");
 
-        assert!(matches!(found, Ok(again) if again == show), "{found:?}");
+        assert!(matches!(&found, Ok(again) if *again == kept), "{found:?}");
     }
 
     #[test]

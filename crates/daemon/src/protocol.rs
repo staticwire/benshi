@@ -204,8 +204,8 @@ pub enum Outcome {
     /// A title, an episode, the stage that decided, and the fact of the
     /// entry that refused the file, where one did.
     Recognized {
-        /// The title as the corpus spells it, or as the name spelled it where
-        /// the stage is [`DecidedBy::Unlisted`].
+        /// The title as the corpus spells it, or the title the show is kept
+        /// under where the stage is [`DecidedBy::Unlisted`].
         title: String,
         /// The episode in the release's numbering, as it was read from the name.
         episode: Episode,

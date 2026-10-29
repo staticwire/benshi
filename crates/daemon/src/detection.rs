@@ -266,8 +266,9 @@ where
 /// title, and as it was answered where it spells none.
 ///
 /// The store finds the show by the name's key alone. A key it does not hold
-/// yet is filed as a show of its own, and a key kept for an entry that left
-/// the list is the show of that entry.
+/// yet is filed as a show of its own, titled as [`kept_title`] says, and a
+/// key kept for an entry that left the list is the show of that entry. The
+/// answer carries the title the store has for the show.
 async fn unlisted(
     store: Arc<Mutex<Store>>,
     answer: Recognition,
@@ -276,11 +277,11 @@ async fn unlisted(
     let Recognition::Unrecognized(_) = &answer else {
         return Ok(answer);
     };
-    let (Some(title), Some(key)) = (parsed.title.clone(), Key::from_parsed(parsed)) else {
+    let (Some(title), Some(key)) = (parsed.title.as_deref(), Key::from_parsed(parsed)) else {
         return Ok(answer);
     };
-    let spelled = title.clone();
-    let show = ask(store, move |store| store.unlisted(&key, &spelled)).await?;
+    let filed_under = kept_title(title, parsed, &key);
+    let (show, title) = ask(store, move |store| store.unlisted(&key, &filed_under)).await?;
 
     Ok(Recognition::Recognized(Match {
         show,
@@ -288,6 +289,27 @@ async fn unlisted(
         episode: parsed.episode,
         stage: Stage::Unlisted,
     }))
+}
+
+/// The title a new show is filed under for a name the list does not hold:
+/// the title the parse read, and the season and the part it read apart from
+/// that title where the key holds them, as `Show Title Season 3 Part 2`. Two
+/// seasons of one title are then two titles. A first season is the show
+/// itself and adds nothing, and a season the title spells is in the title
+/// already.
+fn kept_title(title: &str, parsed: &Parsed, key: &Key) -> String {
+    let season = parsed
+        .season
+        .and(key.season())
+        .map(|season| format!(" Season {season}"))
+        .unwrap_or_default();
+    let part = parsed
+        .part
+        .and(key.part())
+        .map(|part| format!(" Part {part}"))
+        .unwrap_or_default();
+
+    format!("{title}{season}{part}")
 }
 
 /// Readings from a platform, filtered by policy, published to the bus and
@@ -599,7 +621,7 @@ impl<W: PlayerWatcher> Detection<W> {
 // nothing to await, rather than being spelled out as the future it desugars to.
 #[allow(clippy::unused_async_trait_impl)]
 mod tests {
-    use super::{Detection, Seen, Wiring};
+    use super::{Detection, Seen, Wiring, kept_title};
     use crate::bus::{BusEvent, EventBus};
     use crate::listing::{Wakes, kept};
     use crate::recognition::{Current, Decided, Recognizer};
@@ -611,8 +633,9 @@ mod tests {
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognize::altname::Altnames;
     use benshi_core::recognize::corpus::Corpus;
-    use benshi_core::recognize::parse::Episode;
-    use benshi_core::recognize::{Recognition, Stage};
+    use benshi_core::recognize::normalize::Key;
+    use benshi_core::recognize::parse::{Episode, parse};
+    use benshi_core::recognize::{Match, Recognition, Stage};
     use benshi_core::settle::{Fact, Facts, Settled};
     use benshi_core::{
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
@@ -2343,6 +2366,106 @@ mod tests {
                 title: "Departed Show".to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
             }]
+        );
+    }
+
+    /// The season the parse of this name holds, the season its key holds,
+    /// and the title a new show is filed under for it.
+    fn kept_under(name: &str) -> (Option<u32>, Option<u32>, String) {
+        let parsed = parse(&a_path(name));
+        let key = Key::from_parsed(&parsed).expect("a name with a title has a key");
+        let title = parsed.title.as_deref().expect("the name spells a title");
+
+        (
+            parsed.season,
+            key.season(),
+            kept_title(title, &parsed, &key),
+        )
+    }
+
+    #[test]
+    fn a_title_kept_carries_only_the_season_and_part_parsed_apart_from_it() {
+        assert_eq!(
+            kept_under("Some Other Show Season 3 Part 2 - 01.mkv"),
+            (
+                Some(3),
+                Some(3),
+                "Some Other Show Season 3 Part 2".to_owned()
+            )
+        );
+        assert_eq!(
+            kept_under("Some Other Show S01E02.mkv"),
+            (Some(1), None, "Some Other Show".to_owned())
+        );
+        assert_eq!(
+            kept_under("Some Other Show II - 01.mkv"),
+            (None, Some(2), "Some Other Show II".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn seasons_of_a_name_off_the_list_are_kept_under_their_seasons() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        for name in [
+            "/anime/[Group] Some Other Show Season 3 - 01 [1080p].mkv",
+            "/anime/[Group] Some Other Show Season 4 Part 2 - 01 [1080p].mkv",
+        ] {
+            let watcher = ScriptedWatcher::of(watching(&mpv, name, 0..=HALF_AT));
+            rounds(&mut recording(watcher, &database), HALF_AT + 1).await;
+        }
+
+        let titles: Vec<String> = database
+            .seen()
+            .into_iter()
+            .map(|viewed| viewed.title)
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Some Other Show Season 3",
+                "Some Other Show Season 4 Part 2"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_kept_once_is_answered_with_the_title_it_is_kept_under() {
+        let bus = Arc::new(EventBus::new());
+        let decided = Decided::new();
+        let mpv = a_source("mpv", "mpv");
+        let watcher = ScriptedWatcher::of(
+            [
+                "/anime/[Group] Some Other Show - 03.mkv",
+                "/anime/some.other.show.04.mkv",
+            ]
+            .map(|name| {
+                Ok(PollOutcome {
+                    sources: vec![mpv.clone()],
+                    snapshots: vec![a_reading_of_a_file(&mpv, name)],
+                    failures: Vec::new(),
+                })
+            })
+            .into(),
+        );
+        let (_database, mut detection) = deciding(watcher, bus, decided.clone());
+
+        detection.round().await.expect("the first round");
+        detection.round().await.expect("the second round");
+
+        let latest = decided.latest().expect("a decision was recorded");
+        assert_eq!(latest.parsed.title.as_deref(), Some("some other show"));
+        assert!(
+            matches!(
+                &latest.answer,
+                Recognition::Recognized(Match {
+                    title,
+                    stage: Stage::Unlisted,
+                    ..
+                }) if title == "Some Other Show"
+            ),
+            "{:?}",
+            latest.answer
         );
     }
 
