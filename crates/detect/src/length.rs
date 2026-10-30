@@ -6,12 +6,15 @@
 //! Player 26.08 reports a thousandth of it. The file itself holds it. Matroska
 //! and WebM record it in the `Duration` of the `Info` element of their
 //! `Segment`, in units of its `TimecodeScale`. MP4 records it in the `mvhd` box
-//! inside `moov`, in units of that box's own time scale.
+//! inside `moov`, in units of that box's own time scale. AVI records it in the
+//! `strh` of its video stream, in units of the stream's scale and rate, and in
+//! `avih` as frames of a number of microseconds each.
 //!
-//! Both are found by reading the headers of elements and boxes and skipping
-//! what they hold, so a file costs a few small reads wherever its length lies,
-//! a `moov` written after the media included. `Info` is looked for only ahead
-//! of the first `Cluster`.
+//! Matroska and MP4 are found by reading the headers of elements and boxes and
+//! skipping what they hold, so a file costs a few small reads wherever its
+//! length lies, a `moov` written after the media included. `Info` is looked for
+//! only ahead of the first `Cluster`. The `hdrl` that opens an AVI file is read
+//! whole.
 //!
 //! A file is read on a thread of its own, under the deadline of the reading
 //! that asked, and its length is kept while every round of readings names it.
@@ -72,6 +75,13 @@ const INFO_LIMIT: u64 = 64 * 1024;
 /// sought. Each costs one read of the header of a box.
 const BOXES_LOOKED_AT: usize = 16;
 
+/// The largest `hdrl` of an AVI file read, in bytes.
+///
+/// `hdrl` holds the main header and a list for each stream. FFmpeg pads each
+/// list to some 4 KiB, so this holds over a dozen streams, and a larger `hdrl`
+/// is taken for a broken file and left unread.
+const HEADER_LIMIT: u64 = 64 * 1024;
+
 /// What is known of the length of one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Look {
@@ -91,8 +101,8 @@ impl Lengths {
     /// The length the header of `file` records, read once and by `until`.
     ///
     /// None while the read runs, where it runs past `until`, and where the
-    /// file cannot be opened, records no length or is no Matroska, WebM or MP4
-    /// file.
+    /// file cannot be opened, records no length or is no Matroska, WebM, MP4
+    /// or AVI file.
     pub(crate) async fn of(&self, file: &RawPath, until: Instant) -> Option<Duration> {
         self.of_with(file, until, read_length).await
     }
@@ -165,20 +175,111 @@ fn read_length(path: &Path) -> Option<Duration> {
     length_in(&mut File::open(path).ok()?)
 }
 
-/// The length a Matroska, WebM or MP4 header records, read from `source`.
+/// The length a Matroska, WebM, MP4 or AVI header records, read from `source`.
 ///
 /// Matroska and WebM are told by the EBML header they open with, MP4 by the
-/// `ftyp` box it opens with. A file of any other kind records no length here.
+/// `ftyp` box it opens with, AVI by `RIFF` and `AVI ` at its start. A file of
+/// any other kind records no length here.
 fn length_in(source: &mut (impl Read + Seek)) -> Option<Duration> {
-    let opening = read_up_to(source, 0, 8)?;
+    let opening = read_up_to(source, 0, 12)?;
 
     if opening.starts_with(&EBML_HEADER.to_be_bytes()) {
         matroska_length(source)
     } else if opening.get(4..8) == Some(b"ftyp") {
         mp4_length(source)
+    } else if opening.starts_with(b"RIFF") && opening.get(8..12) == Some(b"AVI ") {
+        avi_length(source)
     } else {
         None
     }
+}
+
+/// The length an AVI file records in its `hdrl`: the length of the first video
+/// stream that records one, in units of that stream's scale and rate, or else
+/// the frames of the file at the microseconds of one frame.
+///
+/// The stream comes first. In a file split into several `RIFF` chunks, FFmpeg
+/// writes the frames of the whole file to the `strh` of the video stream and
+/// those of the first `RIFF` only to `avih`. `avih` also holds the microseconds
+/// of one frame as a whole number.
+///
+/// A `RIFF` whose size has every bit set was written where its writer could not
+/// go back, and its header holds no count at all: FFmpeg writes 2^30 frames to
+/// the `strh` of such a file and none to `avih`. It records no length.
+fn avi_length(source: &mut (impl Read + Seek)) -> Option<Duration> {
+    let opening = read_up_to(source, 0, 24)?;
+    if le_u32(&opening, 4)? == u32::MAX
+        || opening.get(12..16) != Some(b"LIST")
+        || opening.get(20..24) != Some(b"hdrl")
+    {
+        return None;
+    }
+    let size = u64::from(le_u32(&opening, 16)?)
+        .checked_sub(4)
+        .filter(|&size| size <= HEADER_LIMIT)?;
+    let header = read_up_to(source, 24, size)?;
+
+    let mut by_frames = None;
+    let mut by_stream = None;
+    for (id, data) in riff_chunks(&header) {
+        match &id {
+            b"avih" => by_frames = frames_length(data),
+            b"LIST" if by_stream.is_none() => {
+                by_stream = data.strip_prefix(b"strl").and_then(video_stream_length);
+            }
+            _ => {}
+        }
+    }
+
+    by_stream.or(by_frames)
+}
+
+/// The chunks of the data of a RIFF list, each by its code and its data, as
+/// far as the data holds whole ones. A chunk of odd size is padded to an even
+/// one.
+fn riff_chunks(mut data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+    std::iter::from_fn(move || {
+        let id = data.get(..4)?.try_into().ok()?;
+        let size = usize::try_from(le_u32(data, 4)?).ok()?;
+        let end = size.checked_add(8)?;
+        let chunk = data.get(8..end)?;
+        data = data.get(end.checked_add(size % 2)?.min(data.len())..)?;
+        Some((id, chunk))
+    })
+}
+
+/// The length `avih` records: the frames of the file at the microseconds of
+/// one frame.
+fn frames_length(avih: &[u8]) -> Option<Duration> {
+    let micros = u64::from(le_u32(avih, 0)?) * u64::from(le_u32(avih, 16)?);
+    (micros > 0).then(|| Duration::from_micros(micros))
+}
+
+/// The length a `strl` records where its `strh` is that of a video stream:
+/// the stream's length in units of its scale over its rate.
+fn video_stream_length(list: &[u8]) -> Option<Duration> {
+    let (_, header) = riff_chunks(list).find(|(id, _)| id == b"strh")?;
+    if header.get(..4) != Some(b"vids") {
+        return None;
+    }
+    let scale = u128::from(le_u32(header, 20)?);
+    let rate = u128::from(le_u32(header, 24)?);
+    let units = u128::from(le_u32(header, 32)?) * scale;
+    if rate == 0 {
+        return None;
+    }
+
+    let nanos = units % rate * 1_000_000_000 / rate;
+    let length = Duration::new(
+        u64::try_from(units / rate).ok()?,
+        u32::try_from(nanos).ok()?,
+    );
+    (length > Duration::ZERO).then_some(length)
+}
+
+/// The little-endian `u32` at `at`.
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
 
 /// Up to `limit` bytes of `source` from `offset`, fewer where it ends sooner.
@@ -910,11 +1011,210 @@ mod tests {
 
     #[test]
     fn a_file_of_another_kind_records_no_length() {
-        let avi = [&b"RIFF"[..], &[0, 0, 1, 0], b"AVI LIST", &[0; 64]].concat();
+        let wave = riff_chunk(
+            *b"RIFF",
+            &[&b"WAVE"[..], &riff_chunk(*b"fmt ", &[0; 16])].concat(),
+        );
 
-        assert_eq!(length_of(&avi), None);
+        assert_eq!(length_of(&wave), None);
         assert_eq!(length_of(b"#EXTM3U\n#EXTINF:1440,Episode\n"), None);
         assert_eq!(length_of(&[]), None);
+    }
+
+    /// A RIFF chunk: its code, the size of its data in little-endian, and the
+    /// data, padded to an even size.
+    fn riff_chunk(id: [u8; 4], data: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(data.len()).expect("a chunk under 4 GiB");
+        let mut chunk = [&id[..], &size.to_le_bytes(), data].concat();
+        if data.len() % 2 == 1 {
+            chunk.push(0);
+        }
+        chunk
+    }
+
+    /// A RIFF list: a `LIST` chunk whose data opens with the type of the list.
+    fn riff_list(kind: [u8; 4], chunks: &[u8]) -> Vec<u8> {
+        riff_chunk(*b"LIST", &[&kind[..], chunks].concat())
+    }
+
+    /// The `avih` of an AVI file, with the microseconds of one frame and the
+    /// frames of the file.
+    fn avih(micros_per_frame: u32, frames: u32) -> Vec<u8> {
+        let mut data = vec![0; 56];
+        data[0..4].copy_from_slice(&micros_per_frame.to_le_bytes());
+        data[16..20].copy_from_slice(&frames.to_le_bytes());
+        riff_chunk(*b"avih", &data)
+    }
+
+    /// A `strl` of a stream of the kind given, `vids` or `auds`: a `strh` with
+    /// the scale, the rate and the length, and a `strf`.
+    fn strl(kind: [u8; 4], scale: u32, rate: u32, length: u32) -> Vec<u8> {
+        let mut strh = vec![0; 56];
+        strh[0..4].copy_from_slice(&kind);
+        strh[20..24].copy_from_slice(&scale.to_le_bytes());
+        strh[24..28].copy_from_slice(&rate.to_le_bytes());
+        strh[32..36].copy_from_slice(&length.to_le_bytes());
+        riff_list(
+            *b"strl",
+            &[riff_chunk(*b"strh", &strh), riff_chunk(*b"strf", &[0; 40])].concat(),
+        )
+    }
+
+    /// An AVI file whose `hdrl` holds the chunks given, followed by its media.
+    fn avi(header: &[u8]) -> Vec<u8> {
+        riff_chunk(
+            *b"RIFF",
+            &[
+                &b"AVI "[..],
+                &riff_list(*b"hdrl", header),
+                &riff_list(*b"movi", &[0; 64]),
+            ]
+            .concat(),
+        )
+    }
+
+    /// The `hdrl` of an episode at 25 frames a second, with a sound stream
+    /// beside the video.
+    fn an_avi_episode_header() -> Vec<u8> {
+        [
+            avih(40_000, 36_000),
+            strl(*b"vids", 1, 25, 36_000),
+            strl(*b"auds", 1, 48_000, 69_000_000),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn an_avi_file_records_its_length_in_hdrl() {
+        assert_eq!(length_of(&avi(&an_avi_episode_header())), Some(EPISODE));
+    }
+
+    #[test]
+    fn the_video_stream_is_read_wherever_it_stands_among_the_streams() {
+        // With no `avih`, the length can come from the video stream alone.
+        let header = [
+            strl(*b"auds", 1, 48_000, 69_000_000),
+            strl(*b"vids", 1, 25, 36_000),
+        ]
+        .concat();
+
+        assert_eq!(length_of(&avi(&header)), Some(EPISODE));
+    }
+
+    #[test]
+    fn the_video_stream_outranks_the_frames_of_the_file() {
+        // 29.97 frames a second: three frames last 0.1001 s, which the
+        // microseconds of one frame, rounded, cannot say.
+        let header = [avih(33_367, 3), strl(*b"vids", 1001, 30_000, 3)].concat();
+
+        assert_eq!(
+            length_of(&avi(&header)),
+            Some(Duration::from_micros(100_100))
+        );
+    }
+
+    #[test]
+    fn an_avi_file_with_no_video_stream_is_read_by_its_frames() {
+        let header = [avih(40_000, 36_000), strl(*b"auds", 1, 48_000, 69_000_000)].concat();
+
+        assert_eq!(length_of(&avi(&header)), Some(EPISODE));
+    }
+
+    #[test]
+    fn a_video_stream_with_no_rate_leaves_the_frames_to_decide() {
+        let header = [avih(40_000, 36_000), strl(*b"vids", 1, 0, 36_000)].concat();
+
+        assert_eq!(length_of(&avi(&header)), Some(EPISODE));
+    }
+
+    #[test]
+    fn an_avi_file_of_no_frames_records_no_length() {
+        let header = [avih(40_000, 0), strl(*b"vids", 1, 25, 0)].concat();
+
+        assert_eq!(length_of(&avi(&header)), None);
+    }
+
+    #[test]
+    fn a_chunk_of_odd_size_is_padded_to_an_even_one() {
+        let header = [riff_chunk(*b"JUNK", &[0; 3]), an_avi_episode_header()].concat();
+
+        assert_eq!(length_of(&avi(&header)), Some(EPISODE));
+    }
+
+    #[test]
+    fn a_header_list_that_does_not_come_first_is_not_looked_for() {
+        let file = riff_chunk(
+            *b"RIFF",
+            &[
+                &b"AVI "[..],
+                &riff_chunk(*b"JUNK", &[0; 16]),
+                &riff_list(*b"hdrl", &an_avi_episode_header()),
+            ]
+            .concat(),
+        );
+
+        assert_eq!(length_of(&file), None);
+    }
+
+    #[test]
+    fn a_riff_file_of_another_form_is_not_read_as_avi() {
+        let file = riff_chunk(
+            *b"RIFF",
+            &[&b"WAVE"[..], &riff_list(*b"hdrl", &an_avi_episode_header())].concat(),
+        );
+
+        assert_eq!(length_of(&file), None);
+    }
+
+    #[test]
+    fn an_avi_file_written_without_going_back_records_no_length() {
+        // As FFmpeg writes one into a pipe: a `RIFF` of unknown size, no frames
+        // in `avih`, and 2^30 frames in `strh` for the count it never filled in.
+        let header = [avih(40_000, 0), strl(*b"vids", 1, 25, 1 << 30)].concat();
+        let mut file = avi(&header);
+        file[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        assert_eq!(length_of(&file), None);
+    }
+
+    #[test]
+    fn a_header_list_of_many_kilobytes_is_read() {
+        let header = [
+            riff_chunk(*b"JUNK", &vec![0; 32 * 1024]),
+            an_avi_episode_header(),
+        ]
+        .concat();
+
+        assert_eq!(length_of(&avi(&header)), Some(EPISODE));
+    }
+
+    #[test]
+    fn a_header_list_larger_than_sixty_four_kibibytes_is_not_read() {
+        let header = [
+            riff_chunk(*b"JUNK", &vec![0; 64 * 1024]),
+            an_avi_episode_header(),
+        ]
+        .concat();
+
+        assert_eq!(length_of(&avi(&header)), None);
+    }
+
+    #[test]
+    fn an_avi_file_cut_short_never_reads_past_its_end() {
+        let file = avi(&an_avi_episode_header());
+        // The file's own header, the header of `hdrl` and its type, and then
+        // `avih`, which gives the length by itself.
+        let avih_ends = 12 + 12 + avih(40_000, 36_000).len();
+
+        for cut in 0..file.len() {
+            let found = length_of(&file[..cut]);
+
+            if cut < avih_ends {
+                assert_eq!(found, None, "cut at {cut}");
+            } else {
+                assert_eq!(found, Some(EPISODE), "cut at {cut}");
+            }
+        }
     }
 
     /// A file on disk with the bytes given, named with no extension of a
