@@ -294,12 +294,11 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
-    use benshi_core::clock::SystemClock;
     use benshi_daemon::accounts::OnAniList;
     use benshi_daemon::config;
     use benshi_daemon::listing::{self, FromAniList, Listing};
     use benshi_daemon::paths::{DATABASE, Role, directory};
-    use benshi_detect::mpris::{MprisWatcher, POLL_INTERVAL, SOURCE_DEADLINE};
+    use benshi_detect::mpris::POLL_INTERVAL;
     use benshi_store::Store;
     use benshi_sync::anilist::transport::ANILIST;
 
@@ -382,7 +381,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     // A factory rather than a watcher: a restart has to reconnect to the
     // session bus, which is the failure it exists to recover from.
     let running = benshi_daemon::run(
-        || MprisWatcher::connect(SystemClock::new(), SOURCE_DEADLINE),
+        watchers,
         listener,
         recognizer,
         store,
@@ -420,6 +419,27 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     words.last(|| voice.say(format_args!("stopped by {signal}")));
 
     STOPPED
+}
+
+/// What detection reads: MPRIS, and Kodi beside it.
+///
+/// The two are given copies of one clock, since a session compares the times
+/// of two players of one episode. Fails where the session bus cannot be
+/// reached.
+#[cfg(target_os = "linux")]
+async fn watchers() -> Result<impl benshi_detect::PlayerWatcher + Send, benshi_detect::WatchError> {
+    use benshi_core::clock::SystemClock;
+    use benshi_detect::both::Both;
+    use benshi_detect::kodi::{self, KodiWatcher};
+    use benshi_detect::mpris::{MprisWatcher, SOURCE_DEADLINE};
+
+    let clock = SystemClock::new();
+    let mpris = MprisWatcher::connect(clock, SOURCE_DEADLINE).await?;
+
+    Ok(Both::new(
+        mpris,
+        KodiWatcher::new(kodi::ADDRESS, clock, SOURCE_DEADLINE),
+    ))
 }
 
 /// The token for AniList given from the environment, where one is: for tests

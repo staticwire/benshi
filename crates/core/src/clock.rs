@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Unlike [`std::time::Instant`] this is an ordinary value: it serializes, so a
 /// recorded trace replays to exactly the state that was recorded. The epoch is
 /// arbitrary and only differences between timestamps are meaningful; comparing
-/// timestamps taken from two different [`Clock`] instances is not defined.
+/// timestamps taken from clocks of two different epochs is not defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(Duration);
 
@@ -46,7 +46,10 @@ pub trait Clock: Send + Sync {
 }
 
 /// The real clock, backed by [`std::time::Instant`].
-#[derive(Debug)]
+///
+/// A copy keeps the epoch of the clock it is copied from, so the timestamps of
+/// the two compare with each other.
+#[derive(Debug, Clone, Copy)]
 pub struct SystemClock {
     origin: std::time::Instant,
 }

@@ -206,6 +206,8 @@ version = "0.1.0"
 dependencies = [
  "benshi-core",
  "futures-util",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
