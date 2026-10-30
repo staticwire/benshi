@@ -32,15 +32,15 @@ use crate::{Known, MediaRef, PlayState, PlayerSnapshot};
 /// free not to report one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
-    /// Where playback is, as the source reported it.
+    /// Where playback is, as the reading carries it.
     pub position: Known<Duration>,
     /// How much of the media has been watched, accumulated over the readings
     /// on top of the total the timeline resumed, where it resumed one.
     pub watched: Duration,
     /// How long the media is, as far as it can be known.
     ///
-    /// The source's own answer, except where its own reading contradicts it. A
-    /// length below the position it arrived with, and a length of zero, arrive
+    /// The length the reading carries, except where the reading contradicts it.
+    /// A length below the position it arrived with, and a length of zero, arrive
     /// here as [`Known::NotReported`]: both are impossible, and a consumer
     /// handed one has no way to tell it from a true one.
     pub duration: Known<Duration>,

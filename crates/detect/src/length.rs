@@ -1,11 +1,12 @@
 //! The length a video file records in its own header.
 //!
-//! A player that reports no length leaves a reading without the number that
-//! tells a trailer from an episode and sets how much of a file is watched.
-//! `smplayer` 25.6 reports none for any file. The file itself holds it. Matroska
+//! A player that reports no length, or one in the wrong unit, leaves a reading
+//! without the number that tells a trailer from an episode and sets how much of
+//! a file is watched. `smplayer` 25.6 reports none for any file, and Dragon
+//! Player 26.08 reports a thousandth of it. The file itself holds it. Matroska
 //! and WebM record it in the `Duration` of the `Info` element of their
-//! `Segment`, in units of its `TimecodeScale`. MP4 records it in the `mvhd`
-//! box inside `moov`, in units of that box's own time scale.
+//! `Segment`, in units of its `TimecodeScale`. MP4 records it in the `mvhd` box
+//! inside `moov`, in units of that box's own time scale.
 //!
 //! Both are found by reading the headers of elements and boxes and skipping
 //! what they hold, so a file costs a few small reads wherever its length lies,
