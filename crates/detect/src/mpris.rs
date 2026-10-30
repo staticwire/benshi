@@ -13,9 +13,10 @@
 //! is pure and testable without a bus. A reading of a source whose answer names
 //! neither a path nor an address goes two steps further: it asks the bus which
 //! process owns the source's name, and reads that process's descriptors in
-//! `/proc` for the file it plays. A reading of a local file that carries no
-//! length takes the length the file's own header records, read once and kept
-//! while the readings of each round name the file.
+//! `/proc` for the file it plays. A reading of a local file is held to the
+//! length the file's own header records, read once and kept while the readings
+//! of each round name the file: a reading that carries no length takes it, and
+//! one whose length is a thousandth of it is read in milliseconds.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -463,12 +464,12 @@ fn observe(
     }
 }
 
-/// The local file a reading is of, where the reading carries no length. Its
-/// header is read for one.
+/// The local file a reading is of. The header of that file records the length
+/// the reading is held to.
 fn file_to_measure(reading: &PlayerSnapshot) -> Option<&RawPath> {
-    match (&reading.media, reading.duration) {
-        (MediaRef::LocalFile(file), Known::NotReported) => Some(file),
-        _ => None,
+    match &reading.media {
+        MediaRef::LocalFile(file) => Some(file),
+        MediaRef::Remote(_) | MediaRef::Title(_) => None,
     }
 }
 
@@ -483,14 +484,53 @@ fn with_length_of_file(mut reading: PlayerSnapshot, length: Option<Duration>) ->
     reading
 }
 
+/// How near a reported length, multiplied by a thousand, has to come to the
+/// length of its file for the reading to be taken as one in milliseconds.
+///
+/// Dragon Player 26.08 reports its length and position in milliseconds where
+/// MPRIS asks microseconds, and its length to the millisecond: a file whose
+/// header records 600.002 s is reported as 600002. A player that reports
+/// microseconds reports a length near the file's, which multiplied by a
+/// thousand misses it by far more than this.
+const MILLISECONDS_MATCH: Duration = Duration::from_secs(1);
+
+/// A reading whose length is a thousandth of its file's, read in milliseconds:
+/// its length and its position multiplied by a thousand. Any other reading is
+/// kept as it is.
+fn with_milliseconds_read(mut reading: PlayerSnapshot, file: Option<Duration>) -> PlayerSnapshot {
+    let (Known::Value(reported), Some(file)) = (reading.duration, file) else {
+        return reading;
+    };
+    let length = reported.saturating_mul(1000);
+    if length.abs_diff(file) > MILLISECONDS_MATCH {
+        return reading;
+    }
+
+    // `duration_of` held the reported length to the position in the same
+    // unit, so the two stay in order once both are multiplied.
+    if let Known::Value(position) = reading.position {
+        reading.position = Known::Value(position.saturating_mul(1000));
+    }
+    reading.duration = Known::Value(length);
+
+    reading
+}
+
+/// A reading held to the length its file's header records: one that carries
+/// no length takes it, and one whose length is a thousandth of it is read in
+/// milliseconds.
+fn held_to_its_file(reading: PlayerSnapshot, length: Option<Duration>) -> PlayerSnapshot {
+    with_length_of_file(with_milliseconds_read(reading, length), length)
+}
+
 /// Every MPRIS player on the session bus.
 #[derive(Debug)]
 pub struct MprisWatcher<C> {
     connection: zbus::Connection,
     clock: C,
     deadline: Duration,
-    /// The lengths of the files sources play, read for a reading that
-    /// carries none.
+    /// The lengths of the files sources play, which their readings are held
+    /// to.
     lengths: Lengths,
 }
 
@@ -504,8 +544,8 @@ impl<C: Clock> MprisWatcher<C> {
     /// names in each round, to each source's `GetAll` when sources are listed,
     /// and to each source's reading: its `GetAll`, the look for the file its
     /// process holds where that names no location, and the read of the header
-    /// of a local file where the reading carries no length. It bounds one of
-    /// those rather than one round.
+    /// of the local file a reading names. It bounds one of those rather than
+    /// one round.
     ///
     /// # Errors
     ///
@@ -563,8 +603,8 @@ impl<C: Clock> MprisWatcher<C> {
         (identity, Ok(observed))
     }
 
-    /// An observation whose reading of a local file carries no length, given
-    /// the length the header of that file records, read by `until`.
+    /// An observation whose reading names a local file, held to the length the
+    /// header of that file records, read by `until`.
     async fn measured(&self, mut observed: Observation, until: Instant) -> Observation {
         let Some(file) = observed.reading.as_ref().and_then(file_to_measure) else {
             return observed;
@@ -572,7 +612,7 @@ impl<C: Clock> MprisWatcher<C> {
         let length = self.lengths.of(file, until).await;
         observed.reading = observed
             .reading
-            .map(|reading| with_length_of_file(reading, length));
+            .map(|reading| held_to_its_file(reading, length));
 
         observed
     }
@@ -691,14 +731,8 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
         sources.sort_by(|left, right| left.player.cmp(&right.player));
         snapshots.sort_by(|left, right| left.player.cmp(&right.player));
         // A file no source plays any more is read again when one opens it.
-        self.lengths.keep_only(
-            snapshots
-                .iter()
-                .filter_map(|snapshot| match &snapshot.media {
-                    MediaRef::LocalFile(file) => Some(file),
-                    MediaRef::Remote(_) | MediaRef::Title(_) => None,
-                }),
-        );
+        self.lengths
+            .keep_only(snapshots.iter().filter_map(file_to_measure));
 
         Ok(PollOutcome {
             sources,
@@ -712,8 +746,8 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 mod tests {
     use super::{
         BusTimeout, PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
-        duration_of, file_to_measure, identity_from_bus_name, media_from, names_no_location,
-        observe, percent_decode, play_state, position_of, with_length_of_file,
+        duration_of, file_to_measure, held_to_its_file, identity_from_bus_name, media_from,
+        names_no_location, observe, percent_decode, play_state, position_of, with_length_of_file,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
@@ -1412,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_that_reports_a_length_is_not_measured() {
+    fn a_reading_that_reports_a_length_is_measured_as_well() {
         let reading = observe(
             &id("totem"),
             &a_player_naming_nothing(),
@@ -1422,7 +1456,7 @@ mod tests {
         .reading
         .expect("a reading");
 
-        assert_eq!(file_to_measure(&reading), None);
+        assert_eq!(file_to_measure(&reading), Some(&held()));
     }
 
     #[test]
@@ -1482,5 +1516,106 @@ mod tests {
         let measured = with_length_of_file(reading, Some(Duration::from_mins(2)));
 
         assert_eq!(measured.duration, Known::Value(Duration::from_mins(24)));
+    }
+
+    /// The length the header of the file Dragon Player plays in these tests
+    /// records.
+    const DRAGONS_FILE: Duration = Duration::from_millis(600_002);
+
+    /// A reading of a player as Dragon Player 26.08 answers while it plays
+    /// that file, at the position given: its length and position in
+    /// milliseconds, where MPRIS asks microseconds.
+    fn a_reading_in_milliseconds(position: Option<i64>) -> PlayerSnapshot {
+        let mut properties = vec![("PlaybackStatus", a_string("Playing"))];
+        if let Some(position) = position {
+            properties.push(("Position", OwnedValue::from(position)));
+        }
+        let player = a_player(
+            properties,
+            vec![
+                ("xesam:url", a_string("file:///media/video/episode.mkv")),
+                ("mpris:length", OwnedValue::from(600_002_i64)),
+            ],
+        );
+
+        observe(
+            &id("org.kde.dragonplayer"),
+            &player,
+            None,
+            Timestamp::epoch(),
+        )
+        .reading
+        .expect("a reading")
+    }
+
+    #[test]
+    fn a_length_a_thousandth_of_the_file_s_is_read_in_milliseconds() {
+        let read = held_to_its_file(a_reading_in_milliseconds(Some(42_000)), Some(DRAGONS_FILE));
+
+        assert_eq!(read.duration, Known::Value(DRAGONS_FILE));
+        assert_eq!(read.position, Known::Value(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn a_length_a_millisecond_from_a_thousandth_of_the_file_s_is_read_in_milliseconds() {
+        let file = DRAGONS_FILE + Duration::from_secs(1);
+
+        let read = held_to_its_file(a_reading_in_milliseconds(Some(42_000)), Some(file));
+
+        assert_eq!(read.duration, Known::Value(DRAGONS_FILE));
+        assert_eq!(read.position, Known::Value(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn a_length_further_from_a_thousandth_of_the_file_s_is_kept() {
+        let file = DRAGONS_FILE + Duration::from_millis(1_001);
+
+        let read = held_to_its_file(a_reading_in_milliseconds(Some(42_000)), Some(file));
+
+        assert_eq!(read.duration, Known::Value(Duration::from_micros(600_002)));
+        assert_eq!(read.position, Known::Value(Duration::from_millis(42)));
+    }
+
+    #[test]
+    fn a_length_that_matches_its_file_is_kept_with_its_position() {
+        let reading = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            Some(held()),
+            Timestamp::epoch(),
+        )
+        .reading
+        .expect("a reading");
+
+        let read = held_to_its_file(reading, Some(Duration::from_mins(24)));
+
+        assert_eq!(read.duration, Known::Value(Duration::from_mins(24)));
+        assert_eq!(read.position, Known::Value(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn a_reading_in_milliseconds_with_no_position_is_read_all_the_same() {
+        let read = held_to_its_file(a_reading_in_milliseconds(None), Some(DRAGONS_FILE));
+
+        assert_eq!(read.duration, Known::Value(DRAGONS_FILE));
+        assert_eq!(read.position, Known::Unsupported);
+    }
+
+    #[test]
+    fn a_file_that_records_no_length_leaves_a_reading_in_milliseconds_as_it_is() {
+        let reading = a_reading_in_milliseconds(Some(42_000));
+
+        assert_eq!(held_to_its_file(reading.clone(), None), reading);
+    }
+
+    #[test]
+    fn a_reading_with_no_length_takes_the_file_s_and_keeps_its_position() {
+        let read = held_to_its_file(
+            a_reading_with_no_length(Duration::from_secs(42)),
+            Some(Duration::from_mins(24)),
+        );
+
+        assert_eq!(read.duration, Known::Value(Duration::from_mins(24)));
+        assert_eq!(read.position, Known::Value(Duration::from_secs(42)));
     }
 }

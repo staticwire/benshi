@@ -185,7 +185,9 @@ pub struct PlayerSnapshot {
     pub position: Known<Duration>,
     /// How long the media is, as the source reported it. Where a source reports
     /// none for a local file, the MPRIS adapter reads it from the file's
-    /// header. Advisory: players lie about it.
+    /// header, and where a source reports a thousandth of what the header
+    /// records, the adapter reads it and the position as milliseconds.
+    /// Advisory: players lie about it.
     pub duration: Known<Duration>,
     /// When the reading was taken, on the clock the watcher was given.
     pub observed_at: Timestamp,
