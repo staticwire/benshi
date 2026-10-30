@@ -378,7 +378,7 @@ impl WatchedPolicy {
 /// the life of the source, the second is about this reading alone.
 ///
 /// **This is the second place the rule lives.** The MPRIS adapter refuses the
-/// same two values before a reading is ever built. It is repeated here because a
+/// same two values before a reading leaves it. It is repeated here because a
 /// recording is a text file anyone can edit, and because another adapter is not
 /// bound by what this one refuses.
 pub(crate) fn duration_of(reading: &PlayerSnapshot) -> Known<Duration> {

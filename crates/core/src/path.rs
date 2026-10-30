@@ -11,8 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// A filesystem path exactly as the platform reported it.
 ///
-/// A path on Linux is an arbitrary byte string, so this type holds bytes. It is
-/// never opened: callers parse the filename and display it.
+/// A path on Linux is an arbitrary byte string, so this type holds bytes.
+/// This crate parses the filename and displays the path, and never opens it.
 ///
 /// The serialized form keeps runs of valid UTF-8 verbatim, so an ordinary name
 /// stays readable in a trace, and escapes every other byte, plus the escape

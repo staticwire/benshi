@@ -37,7 +37,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// told so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Known<T> {
-    /// The source reported this value.
+    /// The value is known: the source reported it, or the adapter read it where
+    /// the source did not.
     Value(T),
     /// The source did not report it, though this detection method can carry it.
     NotReported,
@@ -182,7 +183,9 @@ pub struct PlayerSnapshot {
     pub state: PlayState,
     /// How far into the media playback has reached.
     pub position: Known<Duration>,
-    /// How long the media is, as reported. Advisory: players lie about it.
+    /// How long the media is, as the source reported it. Where a source reports
+    /// none for a local file, the MPRIS adapter reads it from the file's
+    /// header. Advisory: players lie about it.
     pub duration: Known<Duration>,
     /// When the reading was taken, on the clock the watcher was given.
     pub observed_at: Timestamp,
