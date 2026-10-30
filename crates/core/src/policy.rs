@@ -25,37 +25,37 @@ use crate::AppName;
 /// and a track called `Artist - 03.flac` would be filed as episode three of
 /// `Artist` with nothing anywhere to say so.
 ///
-/// Three entries were read rather than guessed, and one of them is why this
-/// holds published names rather than commands: `mpc-qt` registers `MpcQt`,
-/// where `mpv` and `vlc` register the names they are called by. A lookup
-/// lowercases, so case is the one thing an entry need not get right - the
-/// hyphen `MpcQt` drops is not. A measured entry is written the way it is
-/// published, so the list shows what was read and not what was inferred from
-/// it. Measuring one costs nothing and does not need the player running:
-/// `strings <binary or plugin> | grep org.mpris.MediaPlayer2`.
+/// Eight entries were measured, each with its player running, rather than
+/// guessed. `mpv`, `vlc`, `haruna`, `smplayer` and `totem` are read as the
+/// names they are called by. The other three are why this list holds
+/// published names rather than commands: `mpc-qt` is read as `MpcQt`,
+/// Celluloid 0.30 as `io.github.celluloid_player.Celluloid`, and Dragon
+/// Player 26.08 as `org.kde.dragonplayer`. The constructor and a lookup both
+/// lowercase, so case is the one thing an entry need not get right: an entry
+/// spelled as the command, `mpc-qt` or `celluloid`, misses the player. A
+/// measured entry is written the way it is published, capitals included, so
+/// the list holds what was read. A player is measured by running it and
+/// reading the application `benshi sources` lists for it;
+/// `strings <binary or plugin> | grep org.mpris.MediaPlayer2` finds the name
+/// where the binary holds it whole.
 ///
 /// An entry nobody has measured is a guess that fails visibly, which is the
 /// only kind of guess this list can safely hold - but a guess already believed
-/// wrong is not one of those, and belongs nowhere. That is why no unmeasured
-/// name here carries punctuation: the one measurement there is says
-/// punctuation does not survive.
+/// wrong is not one of those, and belongs nowhere. Kodi 21.3 publishes no
+/// MPRIS name at all, so it has no entry.
 const VIDEO_PLAYERS: &[&str] = &[
     // Measured.
     "mpv",
     "vlc",
-    // Written as it is published rather than lowercased on the way in, so
-    // that the one entry proving the constructor lowercases is in the list
-    // rather than only in a comment.
     "MpcQt",
-    // Conventional names, unmeasured.
-    "celluloid",
     "haruna",
     "smplayer",
     "totem",
-    "dragonplayer",
+    "io.github.celluloid_player.Celluloid",
+    "org.kde.dragonplayer",
+    // Conventional names, unmeasured.
     "parole",
     "qmplay2",
-    "kodi",
     "jellyfinmediaplayer",
     "plexmediaplayer",
     "iina",
@@ -172,12 +172,43 @@ mod tests {
 
         assert_eq!(table.policy_for(&app("mpv")), Policy::Auto);
         assert_eq!(table.policy_for(&app("vlc")), Policy::Auto);
-        assert_eq!(table.policy_for(&app("kodi")), Policy::Auto);
+    }
+
+    #[test]
+    fn every_player_measured_is_allowed_under_the_name_it_publishes() {
+        // The name benshi reads for each of these players. Written out rather
+        // than taken from `VIDEO_PLAYERS`, so that the test fails when the
+        // table stops allowing one of them.
+        let table = PolicyTable::allowing_video_players();
+
+        for published in [
+            "mpv",
+            "vlc",
+            "MpcQt",
+            "haruna",
+            "smplayer",
+            "totem",
+            "io.github.celluloid_player.Celluloid",
+            "org.kde.dragonplayer",
+        ] {
+            assert_eq!(
+                table.policy_for(&app(published)),
+                Policy::Auto,
+                "{published}"
+            );
+        }
+    }
+
+    #[test]
+    fn kodi_has_no_entry_since_it_publishes_no_mpris_name() {
+        let table = PolicyTable::allowing_video_players();
+
+        assert_eq!(table.policy_for(&app("kodi")), Policy::Deny);
     }
 
     #[test]
     fn a_player_is_allowed_however_it_capitalizes_its_own_name() {
-        // Not hypothetical, and the reason the list holds published names
+        // Not hypothetical, and one reason the list holds published names
         // rather than commands. mpc-qt registers
         // org.mpris.MediaPlayer2.MpcQt, which is not the command a user types.
         // The constructor and a lookup both lowercase, so the published name
