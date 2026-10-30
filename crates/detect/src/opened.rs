@@ -245,8 +245,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_video_a_process_holds_is_read_from_its_descriptors() {
-        // The process of this test holds the file, and no other test here
-        // holds a video file open.
+        // The process of this test holds the file. The tests of this crate
+        // share one process, and no other test holds a video file open.
         let directory = tempfile::tempdir().expect("a directory of our own");
         let played = fs::canonicalize(directory.path())
             .expect("the directory's own path")

@@ -13,7 +13,9 @@
 //! is pure and testable without a bus. A reading of a source whose answer names
 //! neither a path nor an address goes two steps further: it asks the bus which
 //! process owns the source's name, and reads that process's descriptors in
-//! `/proc` for the file it plays.
+//! `/proc` for the file it plays. A reading of a local file that carries no
+//! length takes the length the file's own header records, read once and kept
+//! while the readings of each round name the file.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -28,6 +30,7 @@ use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
 
+use crate::length::Lengths;
 use crate::{PlayerWatcher, PollOutcome, SourceInfo, WatchError, opened};
 
 /// The prefix every MPRIS bus name carries, including its trailing dot.
@@ -74,8 +77,9 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// round is two steps deep, the listing and then every reading together, and
 /// each is bounded separately, so a round costs twice the deadline at worst. A
 /// reading is one step however many calls it makes: the look for the file a
-/// source's process holds shares that source's deadline. Half the interval is
-/// the largest deadline that keeps a whole round inside one interval.
+/// source's process holds and the read of the length of a file share that
+/// source's deadline. Half the interval is the largest deadline that keeps a
+/// whole round inside one interval.
 ///
 /// Nothing is given up to get it. On one desktop machine a listing and a
 /// reading across three players cost about ten milliseconds together over
@@ -240,8 +244,13 @@ fn duration_of(
     let Some(length) = micros(metadata, "mpris:length").filter(|&value| value > 0) else {
         return Known::NotReported;
     };
-    let length = Duration::from_micros(length.unsigned_abs());
 
+    length_beside(Duration::from_micros(length.unsigned_abs()), position)
+}
+
+/// A length, unless it is shorter than the position a reading carries beside
+/// it, which no file can be.
+fn length_beside(length: Duration, position: Known<Duration>) -> Known<Duration> {
     match position {
         Known::Value(position) if length < position => Known::NotReported,
         _ => Known::Value(length),
@@ -454,12 +463,35 @@ fn observe(
     }
 }
 
+/// The local file a reading is of, where the reading carries no length. Its
+/// header is read for one.
+fn file_to_measure(reading: &PlayerSnapshot) -> Option<&RawPath> {
+    match (&reading.media, reading.duration) {
+        (MediaRef::LocalFile(file), Known::NotReported) => Some(file),
+        _ => None,
+    }
+}
+
+/// A reading that carries no length, given the length its file's header
+/// records. A length the player reported is kept, and the length of the file is
+/// held to the position as a reported one is.
+fn with_length_of_file(mut reading: PlayerSnapshot, length: Option<Duration>) -> PlayerSnapshot {
+    if let (Known::NotReported, Some(length)) = (reading.duration, length) {
+        reading.duration = length_beside(length, reading.position);
+    }
+
+    reading
+}
+
 /// Every MPRIS player on the session bus.
 #[derive(Debug)]
 pub struct MprisWatcher<C> {
     connection: zbus::Connection,
     clock: C,
     deadline: Duration,
+    /// The lengths of the files sources play, read for a reading that
+    /// carries none.
+    lengths: Lengths,
 }
 
 impl<C: Clock> MprisWatcher<C> {
@@ -470,8 +502,9 @@ impl<C: Clock> MprisWatcher<C> {
     ///
     /// The deadline applies separately to this call, to the listing of bus
     /// names in each round, to each source's `GetAll` when sources are listed,
-    /// and to each source's reading: its `GetAll` and, where that names no
-    /// location, the look for the file its process holds. It bounds one of
+    /// and to each source's reading: its `GetAll`, the look for the file its
+    /// process holds where that names no location, and the read of the header
+    /// of a local file where the reading carries no length. It bounds one of
     /// those rather than one round.
     ///
     /// # Errors
@@ -485,6 +518,7 @@ impl<C: Clock> MprisWatcher<C> {
             connection,
             clock,
             deadline,
+            lengths: Lengths::default(),
         })
     }
 
@@ -505,9 +539,10 @@ impl<C: Clock> MprisWatcher<C> {
     /// so the two halves of a reported failure cannot name different players.
     ///
     /// The whole reading stays inside one deadline, the look for the file the
-    /// process holds included. A look that runs out of time comes after the
-    /// source has answered, so the source is read by what it names, or as one
-    /// with nothing open, rather than as one that failed.
+    /// process holds and the read of the length of a file included. Both come
+    /// after the source has answered. One that runs out of time leaves out
+    /// what it looked for, a file or a length, and the source does not count
+    /// as failed.
     async fn read(&self, identity: PlayerId) -> (PlayerId, Result<Observation, WatchError>) {
         let until = Instant::now() + self.deadline;
         let player = match self.player_properties(&identity, until).await {
@@ -523,8 +558,23 @@ impl<C: Clock> MprisWatcher<C> {
             None
         };
         let observed = observe(&identity, &player, opened, at);
+        let observed = self.measured(observed, until).await;
 
         (identity, Ok(observed))
+    }
+
+    /// An observation whose reading of a local file carries no length, given
+    /// the length the header of that file records, read by `until`.
+    async fn measured(&self, mut observed: Observation, until: Instant) -> Observation {
+        let Some(file) = observed.reading.as_ref().and_then(file_to_measure) else {
+            return observed;
+        };
+        let length = self.lengths.of(file, until).await;
+        observed.reading = observed
+            .reading
+            .map(|reading| with_length_of_file(reading, length));
+
+        observed
     }
 
     /// The one video file held open by the process that owns a source's name.
@@ -640,6 +690,15 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 
         sources.sort_by(|left, right| left.player.cmp(&right.player));
         snapshots.sort_by(|left, right| left.player.cmp(&right.player));
+        // A file no source plays any more is read again when one opens it.
+        self.lengths.keep_only(
+            snapshots
+                .iter()
+                .filter_map(|snapshot| match &snapshot.media {
+                    MediaRef::LocalFile(file) => Some(file),
+                    MediaRef::Remote(_) | MediaRef::Title(_) => None,
+                }),
+        );
 
         Ok(PollOutcome {
             sources,
@@ -653,12 +712,12 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 mod tests {
     use super::{
         BusTimeout, PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
-        duration_of, identity_from_bus_name, media_from, names_no_location, observe,
-        percent_decode, play_state, position_of,
+        duration_of, file_to_measure, identity_from_bus_name, media_from, names_no_location,
+        observe, percent_decode, play_state, position_of, with_length_of_file,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
-    use benshi_core::{AppName, Known, MediaRef, PlayState, PlayerId};
+    use benshi_core::{AppName, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
     use std::time::Duration;
     use zbus::names::InterfaceName;
     use zbus::zvariant::{OwnedValue, Value};
@@ -1323,5 +1382,105 @@ mod tests {
             unanswered.to_string(),
             "session bus did not answer within 2s"
         );
+    }
+
+    /// A reading of a player as `smplayer` 25.6 answers while it plays: a
+    /// bare path, a state and a position, and no length.
+    fn a_reading_with_no_length(position: Duration) -> PlayerSnapshot {
+        let path = std::str::from_utf8(held().as_bytes())
+            .expect("the path is UTF-8")
+            .to_owned();
+        let micros = i64::try_from(position.as_micros()).expect("a position in 64 bits");
+        let player = a_player(
+            vec![
+                ("PlaybackStatus", a_string("Playing")),
+                ("Position", OwnedValue::from(micros)),
+            ],
+            vec![("xesam:url", a_string(&path))],
+        );
+
+        observe(&id("smplayer"), &player, None, Timestamp::epoch())
+            .reading
+            .expect("a reading")
+    }
+
+    #[test]
+    fn a_reading_of_a_local_file_with_no_length_is_measured() {
+        let reading = a_reading_with_no_length(Duration::from_secs(42));
+
+        assert_eq!(file_to_measure(&reading), Some(&held()));
+    }
+
+    #[test]
+    fn a_reading_that_reports_a_length_is_not_measured() {
+        let reading = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            Some(held()),
+            Timestamp::epoch(),
+        )
+        .reading
+        .expect("a reading");
+
+        assert_eq!(file_to_measure(&reading), None);
+    }
+
+    #[test]
+    fn an_address_or_a_title_is_not_measured() {
+        for metadata in [
+            vec![("xesam:url", a_string("https://example.org/episode.mkv"))],
+            vec![("xesam:title", a_string("Show Title - 03"))],
+        ] {
+            let player = a_player(vec![("Position", OwnedValue::from(0_i64))], metadata);
+            let reading = observe(&id("vlc"), &player, None, Timestamp::epoch())
+                .reading
+                .expect("a reading");
+
+            assert_eq!(file_to_measure(&reading), None, "{:?}", reading.media);
+        }
+    }
+
+    #[test]
+    fn a_reading_with_no_length_takes_the_length_of_its_file() {
+        let reading = a_reading_with_no_length(Duration::from_secs(42));
+
+        let measured = with_length_of_file(reading, Some(Duration::from_mins(24)));
+
+        assert_eq!(measured.duration, Known::Value(Duration::from_mins(24)));
+    }
+
+    #[test]
+    fn a_length_of_the_file_below_the_position_is_no_length() {
+        let reading = a_reading_with_no_length(Duration::from_secs(30));
+
+        let measured = with_length_of_file(reading, Some(Duration::from_secs(10)));
+
+        assert_eq!(measured.duration, Known::NotReported);
+    }
+
+    #[test]
+    fn a_file_that_records_no_length_leaves_the_reading_without_one() {
+        let reading = a_reading_with_no_length(Duration::from_secs(42));
+
+        assert_eq!(
+            with_length_of_file(reading, None).duration,
+            Known::NotReported
+        );
+    }
+
+    #[test]
+    fn a_reported_length_outranks_the_length_of_the_file() {
+        let reading = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            Some(held()),
+            Timestamp::epoch(),
+        )
+        .reading
+        .expect("a reading");
+
+        let measured = with_length_of_file(reading, Some(Duration::from_mins(2)));
+
+        assert_eq!(measured.duration, Known::Value(Duration::from_mins(24)));
     }
 }
