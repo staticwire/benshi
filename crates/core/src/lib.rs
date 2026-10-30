@@ -64,9 +64,9 @@ pub struct Capabilities {
     pub paused: bool,
     /// A location for what is open: a path or an address, not only a title.
     ///
-    /// Answers whether this source names what it opened, which is what
-    /// recognition needs. Whether that name turns out to be a local file is a
-    /// fact about the media rather than about the source, so it belongs to
+    /// Answers whether a reading from this source names what is open, which is
+    /// what recognition needs. Whether that name turns out to be a local file
+    /// is a fact about the media rather than about the source, so it belongs to
     /// [`MediaRef`] and not here.
     pub location: bool,
 }

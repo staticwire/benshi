@@ -10,7 +10,10 @@
 //!
 //! Every property this adapter reads arrives in a single `GetAll` per source,
 //! so a listing costs one round trip per player and the whole translation below
-//! is pure and testable without a bus.
+//! is pure and testable without a bus. A reading of a source whose answer names
+//! neither a path nor an address goes two steps further: it asks the bus which
+//! process owns the source's name, and reads that process's descriptors in
+//! `/proc` for the file it plays.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,13 +22,13 @@ use benshi_core::clock::{Clock, Timestamp};
 use benshi_core::path::RawPath;
 use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
 use futures_util::future::join_all;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
-use zbus::names::InterfaceName;
+use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
 
-use crate::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
+use crate::{PlayerWatcher, PollOutcome, SourceInfo, WatchError, opened};
 
 /// The prefix every MPRIS bus name carries, including its trailing dot.
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -58,7 +61,8 @@ const LOCAL_FILE_SCHEME: &str = "file://";
 /// it.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long one call may take before it is given up on.
+/// How long one call, or one source's whole reading, may take before it is
+/// given up on.
 ///
 /// A suggestion rather than a rule: [`MprisWatcher::connect`] takes the
 /// deadline it is to use, because the daemon may know better than this crate
@@ -67,10 +71,11 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The size is set by [`POLL_INTERVAL`] and not by how fast a player answers. A
 /// source that has stopped answering must be given up on before the next round
 /// begins, or rounds overlap and one round's failures arrive during the next. A
-/// round is two calls deep, the listing and then every reading together, and
-/// each is bounded separately, so a round costs twice the deadline at worst.
-/// Half the interval is the largest deadline that keeps a whole round inside
-/// one interval.
+/// round is two steps deep, the listing and then every reading together, and
+/// each is bounded separately, so a round costs twice the deadline at worst. A
+/// reading is one step however many calls it makes: the look for the file a
+/// source's process holds shares that source's deadline. Half the interval is
+/// the largest deadline that keeps a whole round inside one interval.
 ///
 /// Nothing is given up to get it. On one desktop machine a listing and a
 /// reading across three players cost about ten milliseconds together over
@@ -134,6 +139,11 @@ fn identity_from_bus_name(name: &str) -> Option<PlayerId> {
     (!suffix.is_empty()).then(|| PlayerId(suffix.to_owned()))
 }
 
+/// The name on the bus a source claimed, from its identity.
+fn bus_name(identity: &PlayerId) -> String {
+    format!("{MPRIS_PREFIX}{}", identity.0)
+}
+
 /// The application an identity belongs to.
 ///
 /// One trailing component is removed when it qualifies an instance, and never
@@ -180,7 +190,8 @@ fn play_state(status: Option<&str>) -> PlayState {
 /// is a property of the player: mpv publishes one for everything it opens, and
 /// a browser publishes none. Whether that address turns out to name a local
 /// file changes with the track, so it is carried by `MediaRef` in the reading
-/// and decides nothing here.
+/// and decides nothing here. For a source that names no location, [`observe`]
+/// declares one beside a reading of the file its process holds.
 fn declare_capabilities(player: &Properties, metadata: &Properties) -> Capabilities {
     Capabilities {
         position: player.contains_key("Position"),
@@ -244,7 +255,7 @@ fn micros(properties: &Properties, key: &str) -> Option<i64> {
         .and_then(|value| i64::try_from(value).ok())
 }
 
-/// What the source has open, or nothing when it has nothing open.
+/// What the source names as open, or nothing when it names nothing.
 ///
 /// `xesam:url` is preferred over `xesam:title`, and not merely tried first. A
 /// player holding a filename that is not valid UTF-8 percent-encodes those
@@ -362,6 +373,15 @@ fn metadata_of(player: &Properties) -> Properties {
         .unwrap_or_default()
 }
 
+/// Whether a source's answer names neither a path nor an address. The file
+/// its process holds is looked for only in that case.
+fn names_no_location(player: &Properties) -> bool {
+    matches!(
+        media_from(&metadata_of(player)),
+        None | Some(MediaRef::Title(_))
+    )
+}
+
 /// What a source is, as its own properties describe it.
 fn describe(identity: &PlayerId, player: &Properties, metadata: &Properties) -> SourceInfo {
     SourceInfo {
@@ -372,30 +392,50 @@ fn describe(identity: &PlayerId, player: &Properties, metadata: &Properties) -> 
     }
 }
 
-/// What one answer from a source amounts to: what the source is, and what it
+/// What [`observe`] finds about one source: what the source is, and what it
 /// has open.
 #[derive(Debug)]
 struct Observation {
-    /// The source, as the answer describes it.
+    /// The source, as the answer describes it. Beside a reading of the file its
+    /// process holds, it is declared with a location as well.
     source: SourceInfo,
     /// The reading, absent when the source has nothing open.
     reading: Option<PlayerSnapshot>,
 }
 
-/// Describe a source and read it, from one answer.
+/// Describe a source and read it, from one answer and, where that answer
+/// names no location, the file the source's process holds.
 ///
 /// The metadata is decoded once and the reading takes its capabilities and
 /// playback state from the description, so a round cannot publish a description
-/// that contradicts the reading beside it.
-fn observe(identity: &PlayerId, player: &Properties, at: Timestamp) -> Observation {
+/// that contradicts the reading beside it. A reading of the file the process
+/// holds is described as naming what is open, for the same reason.
+///
+/// A path or an address the source names is what its reading carries. Where
+/// it names neither, the file its process holds is read in its place, and a
+/// title it names is kept where no such file is found.
+fn observe(
+    identity: &PlayerId,
+    player: &Properties,
+    opened: Option<RawPath>,
+    at: Timestamp,
+) -> Observation {
     let metadata = metadata_of(player);
-    let source = describe(identity, player, &metadata);
+    let mut source = describe(identity, player, &metadata);
 
-    let Some(media) = media_from(&metadata) else {
-        return Observation {
-            source,
-            reading: None,
-        };
+    let media = match (media_from(&metadata), opened) {
+        (Some(location @ (MediaRef::LocalFile(_) | MediaRef::Remote(_))), _) => location,
+        (_, Some(held)) => {
+            source.capabilities.location = true;
+            MediaRef::LocalFile(held)
+        }
+        (Some(title), None) => title,
+        (None, None) => {
+            return Observation {
+                source,
+                reading: None,
+            };
+        }
     };
 
     let position = position_of(player, source.capabilities.position);
@@ -428,9 +468,11 @@ impl<C: Clock> MprisWatcher<C> {
     /// The clock is taken rather than read, so a test can move twenty seconds
     /// of playback in no time at all.
     ///
-    /// The deadline applies to every call this watcher makes, separately: this
-    /// one, the listing of bus names in each round, and each source's own
-    /// `GetAll`. It bounds one call rather than one round.
+    /// The deadline applies separately to this call, to the listing of bus
+    /// names in each round, to each source's `GetAll` when sources are listed,
+    /// and to each source's reading: its `GetAll` and, where that names no
+    /// location, the look for the file its process holds. It bounds one of
+    /// those rather than one round.
     ///
     /// # Errors
     ///
@@ -461,28 +503,67 @@ impl<C: Clock> MprisWatcher<C> {
     ///
     /// The identity returned here is the one a [`WatchError`] was built from,
     /// so the two halves of a reported failure cannot name different players.
+    ///
+    /// The whole reading stays inside one deadline, the look for the file the
+    /// process holds included. A look that runs out of time comes after the
+    /// source has answered, so the source is read by what it names, or as one
+    /// with nothing open, rather than as one that failed.
     async fn read(&self, identity: PlayerId) -> (PlayerId, Result<Observation, WatchError>) {
-        let observed = self
-            .player_properties(&identity)
-            .await
-            .map(|player| observe(&identity, &player, self.clock.now()));
+        let until = Instant::now() + self.deadline;
+        let player = match self.player_properties(&identity, until).await {
+            Ok(player) => player,
+            Err(failed) => return (identity, Err(failed)),
+        };
+        // The moment of the answer, which is the moment its position was the
+        // player's.
+        let at = self.clock.now();
+        let opened = if names_no_location(&player) {
+            self.held_by(&identity, until).await
+        } else {
+            None
+        };
+        let observed = observe(&identity, &player, opened, at);
 
-        (identity, observed)
+        (identity, Ok(observed))
+    }
+
+    /// The one video file held open by the process that owns a source's name.
+    ///
+    /// The bus names the process, and [`opened::video_held_by`] reads what it
+    /// holds. A name given up since the answer, a process that has ended, one
+    /// this user may not inspect and a look that runs out of time all leave
+    /// no file.
+    async fn held_by(&self, identity: &PlayerId, until: Instant) -> Option<RawPath> {
+        let bus = DBusProxy::new(&self.connection).await.ok()?;
+        let name = BusName::try_from(bus_name(identity)).ok()?;
+        let process = timeout_at(until, bus.get_connection_unix_process_id(name))
+            .await
+            .ok()?
+            .ok()?;
+
+        opened::video_held_by(process, until).await
     }
 
     /// Describe one source, or nothing if it did not answer.
     async fn listed(&self, identity: PlayerId) -> Option<SourceInfo> {
-        let player = self.player_properties(&identity).await.ok()?;
+        let player = self
+            .player_properties(&identity, Instant::now() + self.deadline)
+            .await
+            .ok()?;
         let metadata = metadata_of(&player);
 
         Some(describe(&identity, &player, &metadata))
     }
 
-    /// Read every playback property of one source in a single call.
-    async fn player_properties(&self, identity: &PlayerId) -> Result<Properties, WatchError> {
-        let destination = format!("{MPRIS_PREFIX}{}", identity.0);
+    /// Read every playback property of one source in a single call, which
+    /// must answer by `until`.
+    async fn player_properties(
+        &self,
+        identity: &PlayerId,
+        until: Instant,
+    ) -> Result<Properties, WatchError> {
         let proxy = PropertiesProxy::builder(&self.connection)
-            .destination(destination)
+            .destination(bus_name(identity))
             .map_err(transport)?
             .path(PLAYER_OBJECT)
             .map_err(transport)?
@@ -494,7 +575,7 @@ impl<C: Clock> MprisWatcher<C> {
             .await
             .map_err(transport)?;
 
-        timeout(self.deadline, proxy.get_all(PLAYER_INTERFACE))
+        timeout_at(until, proxy.get_all(PLAYER_INTERFACE))
             .await
             .map_err(|_elapsed| WatchError::Timeout {
                 player: identity.clone(),
@@ -572,8 +653,8 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 mod tests {
     use super::{
         BusTimeout, PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
-        duration_of, identity_from_bus_name, media_from, observe, percent_decode, play_state,
-        position_of,
+        duration_of, identity_from_bus_name, media_from, names_no_location, observe,
+        percent_decode, play_state, position_of,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
@@ -792,7 +873,7 @@ mod tests {
         let clock = TestClock::new();
         clock.advance(Duration::from_secs(20));
 
-        let snapshot = observe(&id("mpv"), &player, clock.now())
+        let snapshot = observe(&id("mpv"), &player, None, clock.now())
             .reading
             .expect("a reading");
 
@@ -816,7 +897,7 @@ mod tests {
             ],
         );
 
-        let snapshot = observe(&id("mpv"), &player, Timestamp::epoch())
+        let snapshot = observe(&id("mpv"), &player, None, Timestamp::epoch())
             .reading
             .expect("a reading");
 
@@ -833,11 +914,149 @@ mod tests {
         // itself about.
         let player = a_player(vec![("Position", OwnedValue::from(0_i64))], vec![]);
 
-        let observed = observe(&id("chromium"), &player, Timestamp::epoch());
+        let observed = observe(&id("chromium"), &player, None, Timestamp::epoch());
 
         assert_eq!(observed.reading, None);
         assert_eq!(observed.source.player, id("chromium"));
         assert_eq!(observed.source.app, AppName("chromium".to_owned()));
+    }
+
+    /// The file the process of a source in these tests holds open.
+    fn held() -> RawPath {
+        RawPath::from_bytes(b"/media/video/[Group] Show Title - 03 [1080p].mkv".to_vec())
+    }
+
+    /// A player as Totem 43.2 answers while it plays: a state, a position and
+    /// a length, and nothing that names the file.
+    fn a_player_naming_nothing() -> Properties {
+        a_player(
+            vec![
+                ("PlaybackStatus", a_string("Playing")),
+                ("Position", OwnedValue::from(42_000_000_i64)),
+            ],
+            vec![("mpris:length", OwnedValue::from(1_440_000_000_i64))],
+        )
+    }
+
+    #[test]
+    fn a_source_naming_nothing_is_read_by_the_file_its_process_holds() {
+        let observed = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            Some(held()),
+            Timestamp::epoch(),
+        );
+
+        let snapshot = observed.reading.expect("a reading");
+        assert_eq!(snapshot.media, MediaRef::LocalFile(held()));
+        assert_eq!(snapshot.state, PlayState::Playing);
+        assert_eq!(snapshot.position, Known::Value(Duration::from_secs(42)));
+        assert_eq!(snapshot.duration, Known::Value(Duration::from_mins(24)));
+    }
+
+    #[test]
+    fn a_reading_of_the_file_a_process_holds_is_described_as_naming_it() {
+        // `benshi sources` shows a source declared without a location as one
+        // that names a title only, and that would sit beside a reading that
+        // names a file.
+        let held_open = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            Some(held()),
+            Timestamp::epoch(),
+        );
+        let nothing = observe(
+            &id("totem"),
+            &a_player_naming_nothing(),
+            None,
+            Timestamp::epoch(),
+        );
+
+        assert!(held_open.source.capabilities.location);
+        assert!(!nothing.source.capabilities.location);
+        assert_eq!(nothing.reading, None);
+    }
+
+    #[test]
+    fn a_location_a_source_names_outranks_the_file_its_process_holds() {
+        let local = a_player(
+            vec![],
+            vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
+        );
+        let remote = a_player(
+            vec![],
+            vec![("xesam:url", a_string("https://example.invalid/s.m3u8"))],
+        );
+
+        let by_path = observe(&id("mpv"), &local, Some(held()), Timestamp::epoch());
+        let by_address = observe(&id("vlc"), &remote, Some(held()), Timestamp::epoch());
+
+        assert_eq!(
+            by_path.reading.expect("a reading").media,
+            MediaRef::LocalFile(RawPath::from_bytes(b"/anime/ep.mkv".to_vec()))
+        );
+        assert_eq!(
+            by_address.reading.expect("a reading").media,
+            MediaRef::Remote("https://example.invalid/s.m3u8".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_file_a_process_holds_outranks_a_title() {
+        let titled = a_player(
+            vec![],
+            vec![("xesam:title", a_string("Some Streaming Site"))],
+        );
+
+        let observed = observe(&id("chromium"), &titled, Some(held()), Timestamp::epoch());
+
+        assert_eq!(
+            observed.reading.expect("a reading").media,
+            MediaRef::LocalFile(held())
+        );
+        assert!(observed.source.capabilities.location);
+    }
+
+    #[test]
+    fn a_title_is_kept_where_the_process_holds_no_one_video_file() {
+        let titled = a_player(
+            vec![],
+            vec![("xesam:title", a_string("Some Streaming Site"))],
+        );
+
+        let observed = observe(&id("chromium"), &titled, None, Timestamp::epoch());
+
+        assert_eq!(
+            observed.reading.expect("a reading").media,
+            MediaRef::Title("Some Streaming Site".to_owned())
+        );
+        assert!(!observed.source.capabilities.location);
+    }
+
+    #[test]
+    fn the_process_is_asked_only_where_the_answer_names_no_location() {
+        let local = a_player(
+            vec![],
+            vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
+        );
+        let remote = a_player(
+            vec![],
+            vec![("xesam:url", a_string("https://example.invalid/s.m3u8"))],
+        );
+        let titled = a_player(
+            vec![],
+            vec![("xesam:title", a_string("Some Streaming Site"))],
+        );
+        let blank = a_player(
+            vec![],
+            vec![("xesam:url", a_string("")), ("xesam:title", a_string(""))],
+        );
+
+        assert!(!names_no_location(&local));
+        assert!(!names_no_location(&remote));
+        assert!(names_no_location(&titled));
+        assert!(names_no_location(&a_player_naming_nothing()));
+        assert!(names_no_location(&blank));
     }
 
     #[test]

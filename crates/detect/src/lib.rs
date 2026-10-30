@@ -11,6 +11,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod mpris;
+#[cfg(target_os = "linux")]
+mod opened;
 
 pub mod replay;
 
