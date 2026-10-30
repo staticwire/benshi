@@ -334,7 +334,7 @@ pub struct Detection<W> {
 }
 
 impl<W: PlayerWatcher> Detection<W> {
-    /// Detection over one platform, wired to what outlives it.
+    /// Detection over what `watcher` reads, wired to what outlives it.
     ///
     /// Nothing is open in the session it begins with. What was watched
     /// before it began comes back from the store, at the first reading of

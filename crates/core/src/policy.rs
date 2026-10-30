@@ -41,8 +41,10 @@ use crate::AppName;
 ///
 /// An entry nobody has measured is a guess that fails visibly, which is the
 /// only kind of guess this list can safely hold - but a guess already believed
-/// wrong is not one of those, and belongs nowhere. Kodi 21.3 publishes no
-/// MPRIS name at all, so it has no entry.
+/// wrong is not one of those, and belongs nowhere.
+///
+/// Kodi 21.3 publishes no MPRIS name at all. The adapter that reads it over
+/// its JSON-RPC declares the application `kodi`, and the entry is that name.
 const VIDEO_PLAYERS: &[&str] = &[
     // Measured.
     "mpv",
@@ -53,6 +55,8 @@ const VIDEO_PLAYERS: &[&str] = &[
     "totem",
     "io.github.celluloid_player.Celluloid",
     "org.kde.dragonplayer",
+    // Declared by the adapter that reads Kodi over JSON-RPC.
+    "kodi",
     // Conventional names, unmeasured.
     "parole",
     "qmplay2",
@@ -200,10 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn kodi_has_no_entry_since_it_publishes_no_mpris_name() {
+    fn kodi_is_allowed_under_the_name_its_adapter_declares() {
         let table = PolicyTable::allowing_video_players();
 
-        assert_eq!(table.policy_for(&app("kodi")), Policy::Deny);
+        assert_eq!(table.policy_for(&app("kodi")), Policy::Auto);
     }
 
     #[test]

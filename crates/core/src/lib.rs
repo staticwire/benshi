@@ -74,9 +74,9 @@ pub struct Capabilities {
 
 /// Stable identity of a media source, as provided by the platform.
 ///
-/// The MPRIS bus suffix on Linux, the `AppUserModelId` under SMTC on Windows,
-/// the bundle identifier on macOS. Never a process name matched by a regular
-/// expression.
+/// The MPRIS bus suffix on Linux, the address Kodi answers JSON-RPC at, the
+/// `AppUserModelId` under SMTC on Windows, the bundle identifier on macOS.
+/// Never a process name matched by a regular expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlayerId(pub String);
 

@@ -10,6 +10,10 @@
 //! source that accepts a message and never replies must not hang the poll.
 
 #[cfg(target_os = "linux")]
+pub mod both;
+#[cfg(target_os = "linux")]
+pub mod kodi;
+#[cfg(target_os = "linux")]
 mod length;
 #[cfg(target_os = "linux")]
 pub mod mpris;
