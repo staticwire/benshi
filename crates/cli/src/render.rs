@@ -13,12 +13,15 @@ use std::fmt::Write as _;
 use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
+use benshi_core::pin::Episodes;
 use benshi_core::policy::Policy;
 use benshi_core::recognize::parse::{Episode, Kind, Parsed};
 use benshi_core::settle::Fact;
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
-use benshi_daemon::protocol::{DecidedBy, Explanation, NameListing, Outcome, SourceListing};
+use benshi_daemon::protocol::{
+    DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
+};
 use humantime::format_rfc3339_seconds;
 
 /// What is shown for a source that cannot name what it opened.
@@ -426,16 +429,19 @@ pub fn removed(spelled: &str) -> String {
     format!("removed: \"{spelled}\"\n")
 }
 
-/// Every name given, one to a line, with what it means and why it is not in
-/// force where it is not.
+/// Every name given and every run of episodes mapped, one to a line, the
+/// names first.
+///
+/// A name says what it means and why it is not in force where it is not; a
+/// pin says the entry's title, or that the list no longer holds the entry.
 #[must_use]
-pub fn names(given: &[NameListing]) -> String {
-    if given.is_empty() {
+pub fn maps(names: &[NameListing], pins: &[PinListing]) -> String {
+    if names.is_empty() && pins.is_empty() {
         return NOTHING_MAPPED.to_owned();
     }
 
     let mut shown = String::new();
-    for name in given {
+    for name in names {
         write!(
             shown,
             "\"{}\" to {}",
@@ -448,7 +454,68 @@ pub fn names(given: &[NameListing]) -> String {
         }
         shown.push('\n');
     }
+    for pin in pins {
+        writeln!(shown, "{}", pin_words(pin)).expect("a String accepts every write");
+    }
     shown
+}
+
+/// What episodes of a show mean now, and what they meant before where they
+/// meant other episodes or another entry.
+#[must_use]
+pub fn pinned(pin: &PinListing, replaced: Option<&PinListing>) -> String {
+    let mut shown = format!("mapped: {}", pin_words(pin));
+    if let Some(before) = replaced {
+        write!(shown, ", in place of {}", entry_run(before)).expect("a String accepts every write");
+    }
+    shown.push('\n');
+    shown
+}
+
+/// Episodes of a show taken back, the show by the title it is filed under.
+#[must_use]
+pub fn unpinned(show: &str, episodes: Episodes) -> String {
+    format!("removed: \"{show}\" {}\n", run_words(episodes))
+}
+
+/// That those episodes of a show were not mapped, so nothing was taken back.
+#[must_use]
+pub fn not_pinned(show: &str, episodes: Episodes) -> String {
+    let verb = if episodes.count() == 1 { "is" } else { "are" };
+    format!("\"{show}\" {} {verb} not mapped", run_words(episodes))
+}
+
+/// A pin in words: the show, its episodes, and the episodes of the entry.
+fn pin_words(pin: &PinListing) -> String {
+    format!(
+        "\"{}\" {} to {}",
+        pin.show,
+        run_words(pin.episodes),
+        entry_run(pin)
+    )
+}
+
+/// The episodes of the entry a pin names, with the entry's title or that the
+/// list no longer holds it.
+fn entry_run(pin: &PinListing) -> String {
+    let title = pin.title.as_ref().map_or_else(
+        || "not on the list".to_owned(),
+        |title| format!("\"{title}\""),
+    );
+    format!(
+        "AniList {} {}, {title}",
+        pin.anilist,
+        run_words(pin.entry_episodes)
+    )
+}
+
+/// A run of episodes in words: `episode 2`, `episodes 14-26`.
+fn run_words(episodes: Episodes) -> String {
+    if episodes.count() == 1 {
+        format!("episode {}", episodes.first())
+    } else {
+        format!("episodes {}-{}", episodes.first(), episodes.last())
+    }
 }
 
 /// An entry a name means: its number on AniList and its title, or the title
@@ -463,11 +530,12 @@ fn meaning(anilist: Option<i64>, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capabilities, event, explanation, listing, logged_in, mapped, moment, names, removed,
-        state, why,
+        capabilities, event, explanation, listing, logged_in, mapped, maps, moment, not_pinned,
+        pinned, removed, state, unpinned, why,
     };
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
+    use benshi_core::pin::Episodes;
     use benshi_core::policy::Policy;
     use benshi_core::recognize::altname::Assignment;
     use benshi_core::recognize::parse::{Episode, Kind};
@@ -476,7 +544,9 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_daemon::bus::BusEvent;
-    use benshi_daemon::protocol::{DecidedBy, Explanation, NameListing, Outcome, SourceListing};
+    use benshi_daemon::protocol::{
+        DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
+    };
     use benshi_daemon::recognition::Recognizer;
     // The reason a failure carries comes from here in the daemon, so the tests
     // that check how one reads take it from here too rather than writing one.
@@ -1273,11 +1343,14 @@ mod tests {
         };
 
         assert_eq!(
-            names(&[
-                a_name("Show Title", Some(12345), "Show Title Season 2"),
-                left,
-                a_name("Other Title", Some(678), "Other Title"),
-            ]),
+            maps(
+                &[
+                    a_name("Show Title", Some(12345), "Show Title Season 2"),
+                    left,
+                    a_name("Other Title", Some(678), "Other Title"),
+                ],
+                &[]
+            ),
             "\"Show Title\" to AniList 12345, \"Show Title Season 2\"\n\
              \"Old Title\" to \"A Show That Left\", not in force: its entry is not on the list\n\
              \"Other Title\" to AniList 678, \"Other Title\"\n"
@@ -1285,7 +1358,113 @@ mod tests {
     }
 
     #[test]
-    fn no_name_given_says_so_rather_than_printing_nothing() {
-        assert_eq!(names(&[]), "nothing is mapped\n");
+    fn nothing_mapped_says_so_rather_than_printing_nothing() {
+        assert_eq!(maps(&[], &[]), "nothing is mapped\n");
+    }
+
+    fn run(first: u32, last: u32) -> Episodes {
+        Episodes::new(first, last).expect("a run from its first episode to its last")
+    }
+
+    /// Episodes 14 to 26 of a show, which are an entry's 1 to 13.
+    fn a_pin() -> PinListing {
+        PinListing {
+            show: "Show Title".to_owned(),
+            episodes: run(14, 26),
+            anilist: 12345,
+            entry_episodes: run(1, 13),
+            title: Some("Show Title Season 2".to_owned()),
+        }
+    }
+
+    #[test]
+    fn episodes_mapped_say_which_episodes_of_which_entry_they_are() {
+        assert_eq!(
+            pinned(&a_pin(), None),
+            "mapped: \"Show Title\" episodes 14-26 to AniList 12345 episodes 1-13, \
+             \"Show Title Season 2\"\n"
+        );
+    }
+
+    #[test]
+    fn one_episode_mapped_is_said_as_one() {
+        let one = PinListing {
+            episodes: run(2, 2),
+            anilist: 678,
+            entry_episodes: run(1, 1),
+            title: Some("Show Title Film".to_owned()),
+            ..a_pin()
+        };
+
+        assert_eq!(
+            pinned(&one, None),
+            "mapped: \"Show Title\" episode 2 to AniList 678 episode 1, \"Show Title Film\"\n"
+        );
+    }
+
+    #[test]
+    fn episodes_mapped_again_say_what_they_meant_before() {
+        // The pin they leave is the one a user would have to put back.
+        let before = PinListing {
+            anilist: 678,
+            entry_episodes: run(14, 26),
+            title: Some("Show Title".to_owned()),
+            ..a_pin()
+        };
+
+        assert_eq!(
+            pinned(&a_pin(), Some(&before)),
+            "mapped: \"Show Title\" episodes 14-26 to AniList 12345 episodes 1-13, \
+             \"Show Title Season 2\", in place of AniList 678 episodes 14-26, \"Show Title\"\n"
+        );
+    }
+
+    #[test]
+    fn episodes_taken_back_are_said_by_the_title_the_show_is_filed_under() {
+        assert_eq!(
+            unpinned("Show Title", run(14, 26)),
+            "removed: \"Show Title\" episodes 14-26\n"
+        );
+    }
+
+    #[test]
+    fn episodes_never_mapped_are_said_to_be_so_in_one_number_or_more() {
+        assert_eq!(
+            not_pinned("Show Title", run(14, 26)),
+            "\"Show Title\" episodes 14-26 are not mapped"
+        );
+        assert_eq!(
+            not_pinned("Show Title", run(2, 2)),
+            "\"Show Title\" episode 2 is not mapped"
+        );
+    }
+
+    #[test]
+    fn episodes_mapped_are_listed_where_no_name_is_given() {
+        assert_eq!(
+            maps(&[], &[a_pin()]),
+            "\"Show Title\" episodes 14-26 to AniList 12345 episodes 1-13, \"Show Title Season 2\"\n"
+        );
+    }
+
+    #[test]
+    fn names_and_episodes_mapped_are_listed_the_names_first() {
+        let left = PinListing {
+            show: "Other Title".to_owned(),
+            episodes: run(2, 2),
+            anilist: 678,
+            entry_episodes: run(1, 1),
+            title: None,
+        };
+
+        assert_eq!(
+            maps(
+                &[a_name("Show Title", Some(12345), "Show Title Season 2")],
+                &[a_pin(), left]
+            ),
+            "\"Show Title\" to AniList 12345, \"Show Title Season 2\"\n\
+             \"Show Title\" episodes 14-26 to AniList 12345 episodes 1-13, \"Show Title Season 2\"\n\
+             \"Other Title\" episode 2 to AniList 678 episode 1, not on the list\n"
+        );
     }
 }

@@ -10,6 +10,7 @@
 //! nothing about these types can still tell one message from another, and a
 //! value that is not an object cannot be mistaken for a complete message.
 
+use benshi_core::pin::Episodes;
 use benshi_core::policy::Policy;
 use benshi_core::recognize::altname::Assignment;
 use benshi_core::recognize::parse::{Episode, Parsed};
@@ -21,7 +22,7 @@ use benshi_detect::SourceInfo;
 use serde::{Deserialize, Serialize};
 
 use crate::bus::BusEvent;
-use crate::mapping::{Given, Meant};
+use crate::mapping::{Given, Meant, Pinned};
 use crate::recognition::Decision;
 
 /// One request from a client.
@@ -95,6 +96,35 @@ pub enum Request {
     ///
     /// Answered with [`Response::Names`] or [`Response::Error`].
     Names,
+
+    /// Make episodes of a show mean as many episodes of an entry of the list.
+    ///
+    /// Answered with [`Response::Pinned`] or [`Response::Error`].
+    Pin {
+        /// The show, as `benshi why` names it.
+        show: String,
+        /// The show's episodes, in the numbering its files carry.
+        episodes: Episodes,
+        /// The entry, by AniList's number for the work.
+        anilist: i64,
+        /// The entry's episodes.
+        entry_episodes: Episodes,
+    },
+
+    /// Take back what episodes of a show were made to mean.
+    ///
+    /// Answered with [`Response::Unpinned`] or [`Response::Error`].
+    Unpin {
+        /// The show, as `benshi why` names it.
+        show: String,
+        /// The show's episodes, as they were pinned.
+        episodes: Episodes,
+    },
+
+    /// Every pin the user made, in the order made.
+    ///
+    /// Answered with [`Response::Pins`] or [`Response::Error`].
+    Pins,
 }
 
 /// A name the user gave, and the entry it means.
@@ -130,6 +160,36 @@ impl NameListing {
             anilist: meant.entry.map(|entry| entry.0),
             title: meant.title.clone(),
             not_in_force: None,
+        }
+    }
+}
+
+/// Episodes of a show and the episodes of an entry they are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinListing {
+    /// The show, by the title the store files it under.
+    pub show: String,
+    /// The show's episodes, in the numbering its files carry.
+    pub episodes: Episodes,
+    /// The entry, by AniList's number for the work.
+    pub anilist: i64,
+    /// The entry's episodes.
+    pub entry_episodes: Episodes,
+    /// The title the list gives the entry, and none where the list no longer
+    /// holds it.
+    pub title: Option<String>,
+}
+
+impl PinListing {
+    /// A pin, as a client is told it.
+    #[must_use]
+    pub fn of(pinned: &Pinned) -> Self {
+        Self {
+            show: pinned.show.clone(),
+            episodes: pinned.episodes,
+            anilist: pinned.entry.0,
+            entry_episodes: pinned.entry_episodes,
+            title: pinned.title.clone(),
         }
     }
 }
@@ -237,6 +297,23 @@ pub enum Response {
 
     /// Every name given, in answer to [`Request::Names`].
     Names(Vec<NameListing>),
+
+    /// Episodes of a show kept as episodes of an entry, in answer to
+    /// [`Request::Pin`].
+    Pinned {
+        /// The pin made.
+        pinned: PinListing,
+        /// The pin of the same episodes it took the place of, where that one
+        /// named other episodes or another entry.
+        replaced: Option<PinListing>,
+    },
+
+    /// The title the show is filed under, in answer to [`Request::Unpin`],
+    /// and none where those episodes were not pinned.
+    Unpinned(Option<String>),
+
+    /// Every pin made, in answer to [`Request::Pins`].
+    Pins(Vec<PinListing>),
 }
 
 /// The most recent decision, as a client is told it.
@@ -397,11 +474,14 @@ impl DecidedBy {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecidedBy, Explanation, NameListing, Outcome, Request, Response, SourceListing};
+    use super::{
+        DecidedBy, Explanation, NameListing, Outcome, PinListing, Request, Response, SourceListing,
+    };
     use crate::bus::BusEvent;
     use crate::recognition::{Decision, Recognizer};
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
+    use benshi_core::pin::Episodes;
     use benshi_core::policy::Policy;
     use benshi_core::recognize::altname::Assignment;
     use benshi_core::recognize::parse::{Episode, Kind};
@@ -552,30 +632,9 @@ mod tests {
         ]
     }
 
-    /// One of every response, so that a check over all of them cannot miss one.
-    fn every_response() -> Vec<Response> {
-        let mut responses = vec![
-            Response::Sources(vec![SourceListing::of(&a_source(), Policy::Auto)]),
-            Response::Sources(Vec::new()),
-            Response::Event(BusEvent::Snapshot(a_snapshot())),
-            Response::Event(BusEvent::SourcesChanged {
-                sources: vec![PlayerId("mpv".to_owned())],
-            }),
-            Response::Lagged { missed: 17 },
-            Response::Ok,
-            Response::Error {
-                message: "expected value at line 1 column 1".to_owned(),
-            },
-            Response::Why(None),
-            Response::LoggedIn {
-                name: "someone".to_owned(),
-                expires: Some(1_900_000_000),
-            },
-            Response::LoggedIn {
-                name: "someone".to_owned(),
-                expires: None,
-            },
-            Response::LoggedOut,
+    /// One of every answer to a request of `benshi map`.
+    fn every_map_response() -> Vec<Response> {
+        vec![
             Response::Mapped {
                 spelled: "Show Title".to_owned(),
                 anilist: 900_002,
@@ -610,7 +669,51 @@ mod tests {
                 },
             ]),
             Response::Names(Vec::new()),
+            Response::Pinned {
+                pinned: a_pin_listing(),
+                replaced: None,
+            },
+            Response::Pinned {
+                pinned: a_pin_listing(),
+                replaced: Some(PinListing {
+                    anilist: 678,
+                    title: None,
+                    ..a_pin_listing()
+                }),
+            },
+            Response::Unpinned(Some("Show Title".to_owned())),
+            Response::Unpinned(None),
+            Response::Pins(vec![a_pin_listing()]),
+            Response::Pins(Vec::new()),
+        ]
+    }
+
+    /// One of every response, so that a check over all of them cannot miss one.
+    fn every_response() -> Vec<Response> {
+        let mut responses = vec![
+            Response::Sources(vec![SourceListing::of(&a_source(), Policy::Auto)]),
+            Response::Sources(Vec::new()),
+            Response::Event(BusEvent::Snapshot(a_snapshot())),
+            Response::Event(BusEvent::SourcesChanged {
+                sources: vec![PlayerId("mpv".to_owned())],
+            }),
+            Response::Lagged { missed: 17 },
+            Response::Ok,
+            Response::Error {
+                message: "expected value at line 1 column 1".to_owned(),
+            },
+            Response::Why(None),
+            Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: Some(1_900_000_000),
+            },
+            Response::LoggedIn {
+                name: "someone".to_owned(),
+                expires: None,
+            },
+            Response::LoggedOut,
         ];
+        responses.extend(every_map_response());
         responses.extend(
             every_recognition()
                 .into_iter()
@@ -673,7 +776,33 @@ mod tests {
                 spelled: "Show Title".to_owned(),
             },
             Request::Names,
+            Request::Pin {
+                show: "Show Title".to_owned(),
+                episodes: run(14, 26),
+                anilist: 12345,
+                entry_episodes: run(1, 13),
+            },
+            Request::Unpin {
+                show: "Show Title".to_owned(),
+                episodes: run(2, 2),
+            },
+            Request::Pins,
         ]
+    }
+
+    fn run(first: u32, last: u32) -> Episodes {
+        Episodes::new(first, last).expect("a run from its first episode to its last")
+    }
+
+    /// Episodes 14 to 26 of a show, which are an entry's 1 to 13.
+    fn a_pin_listing() -> PinListing {
+        PinListing {
+            show: "Show Title".to_owned(),
+            episodes: run(14, 26),
+            anilist: 12345,
+            entry_episodes: run(1, 13),
+            title: Some("Show Title Season 2".to_owned()),
+        }
     }
 
     /// Every message either side may put on the wire, serialized.
