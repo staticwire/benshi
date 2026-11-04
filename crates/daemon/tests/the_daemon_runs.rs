@@ -45,6 +45,7 @@ use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, Ta
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use benshi_store::queue::{Kind, Operation};
+use benshi_store::watching::Kept;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -415,13 +416,21 @@ fn a_daemon_that_tells(
 }
 
 /// What the store holds as watched of the episode the platform plays.
+///
+/// # Panics
+///
+/// Where the viewing has registered, which keeps no total to compare.
 fn watched(store: &Arc<Mutex<Store>>) -> Option<Duration> {
-    store
+    let kept = store
         .lock()
         .expect("the store")
         .resume(THE_SHOW, Some(3))
-        .expect("the total reads")
-        .map(|kept| kept.watched)
+        .expect("the total reads");
+    match kept {
+        Some(Kept::Watching { watched, .. }) => Some(watched),
+        Some(Kept::Registered) => panic!("the episode registered, and keeps no total to compare"),
+        None => None,
+    }
 }
 
 /// Keep reading the queue until something is in it, or fail.

@@ -43,15 +43,23 @@
 //! session knows of the episode, and a total of that would take the place of
 //! everything the earlier sittings added up to.
 //!
-//! **An episode is recorded once in a sitting**, at the first reading that
+//! **An episode is recorded once in a viewing**, at the first reading that
 //! adds to the total and leaves it where the [`WatchedPolicy`] counts it as
-//! watched. The total is kept in the same answer ahead of it. The policy is
-//! asked with the length of the file that reading is of, which is the last
-//! length a reading of that file reported, so a reading that reports no
-//! length is decided by the length its file reported before, and the
-//! policy's fallback decides only where no reading of the file has reported
-//! one. A reading that adds nothing records nothing. A sitting told by the
-//! store that the episode registered already records nothing at all.
+//! watched. The total is kept in the same answer ahead of it, and nothing is
+//! kept after it. The policy is asked with the length of the file that
+//! reading is of, which is the last length a reading of that file reported,
+//! so a reading that reports no length is decided by the length its file
+//! reported before, and the policy's fallback decides only where no reading
+//! of the file has reported one. A reading that adds nothing records nothing.
+//!
+//! **A sitting of an episode whose last viewing registered is another viewing
+//! where it begins near the start of its file**, under [`NEAR_THE_START`],
+//! and goes on with the viewing that registered where it begins further in,
+//! which keeps and records nothing. A seek in its [`FIRST_SECONDS`] of play
+//! moves where it begins, so nothing is kept before they are played. Another
+//! viewing counts from nothing, and its first total takes the place of what
+//! the store kept of the one before. A sitting whose readings report no
+//! position cannot tell where it began, and goes on with the viewing.
 //!
 //! **What names no episode begins no sitting.** That is a reading that names
 //! no file, a reading nothing was settled about, a name recognition refused,
@@ -69,6 +77,22 @@ use crate::recognize::parse::Episode;
 use crate::settle::Settled;
 use crate::timeline::{Progress, Timeline, WatchedPolicy};
 use crate::{Known, MediaRef, PlayerId, PlayerSnapshot, ShowId};
+
+/// A sitting of an episode whose last viewing registered is another viewing
+/// where it begins under this far into its file.
+///
+/// A player that resumes a file as it opens it reports the position it
+/// resumes at from its first reading, so a sitting that resumes one begins
+/// where the last one stopped.
+pub const NEAR_THE_START: Duration = Duration::from_secs(5);
+
+/// How long a sitting of an episode whose last viewing registered plays
+/// before it is decided where it began.
+///
+/// A seek within it moves where the sitting begins. VLC 3.0.24 offers to
+/// resume a file for six seconds after it opens and plays it from the start
+/// meanwhile, and the offer taken is a seek.
+pub const FIRST_SECONDS: Duration = Duration::from_secs(10);
 
 /// What a store is to do, in answer to a reading or to the end of a round.
 ///
@@ -89,6 +113,9 @@ pub enum Effect {
     },
     /// Keep the total watched of an episode, in place of the one kept
     /// before.
+    ///
+    /// A total is of a viewing that has not registered. The first total of
+    /// another viewing takes the place of the one before, its mark included.
     Keep {
         /// The show that is open.
         show: ShowId,
@@ -136,18 +163,18 @@ pub enum Effect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Question(u64);
 
-/// What a store had kept of an episode, as [`Session::resumed`] takes it.
+/// What a store had kept of the last viewing of an episode, as
+/// [`Session::resumed`] takes it.
 ///
 /// The file the total was kept for is no part of it. A total is of the
 /// episode, whichever file it was watched in, and a sitting counts on from
 /// it in the files that are open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Resumed {
-    /// What the store had kept of the episode when the question was asked.
-    pub watched: Duration,
-    /// Whether the episode registered on that total already. A sitting that
-    /// resumes from one that did records nothing.
-    pub registered: bool,
+pub enum Resumed {
+    /// The viewing has not registered, and this much of it was watched.
+    Watching(Duration),
+    /// The viewing registered.
+    Registered,
 }
 
 /// What a reading names, with its file borrowed from the reading.
@@ -253,17 +280,37 @@ enum Count {
         held: Vec<Held>,
     },
     /// The store answered, and readings are counted.
-    Counting {
-        /// The total the store answered with and everything counted since.
-        watched: Duration,
-        /// Whether the episode registered, in this sitting or by the answer.
-        registered: bool,
+    Answered {
+        /// Where the sitting stands with the viewing it counts into.
+        stage: Stage,
         /// The latest instant played time has been counted up to, and the
         /// epoch where none has been.
         until: Timestamp,
         /// Every player that has the episode open.
         players: Vec<Counted>,
     },
+}
+
+/// Where a sitting stands with the viewing of its episode.
+#[derive(Debug)]
+enum Stage {
+    /// The last viewing registered, and the sitting has not played its
+    /// [`FIRST_SECONDS`].
+    Opening {
+        /// Where the sitting began, or where a seek in its first seconds
+        /// left it.
+        begins: Known<Duration>,
+        /// What the sitting has played.
+        played: Duration,
+    },
+    /// A viewing that has not registered.
+    Counting {
+        /// The total the store answered with and everything counted since.
+        watched: Duration,
+    },
+    /// A viewing that registered, in this sitting or before it, which
+    /// counts nothing.
+    Registered,
 }
 
 /// One episode open, in one player or in several, and in none from the
@@ -303,7 +350,7 @@ impl Sitting {
     fn has(&self, player: &PlayerId) -> bool {
         match &self.count {
             Count::Asked { held, .. } => held.iter().any(|held| held.reading.player == *player),
-            Count::Counting { players, .. } => {
+            Count::Answered { players, .. } => {
                 players.iter().any(|counted| counted.player == *player)
             }
         }
@@ -316,7 +363,7 @@ impl Sitting {
                 media: media.clone(),
                 reading: reading.clone(),
             }),
-            Count::Counting { players, .. } => players.push(Counted::from(media.clone(), reading)),
+            Count::Answered { players, .. } => players.push(Counted::from(media.clone(), reading)),
         }
     }
 
@@ -324,7 +371,7 @@ impl Sitting {
     fn is_empty(&self) -> bool {
         match &self.count {
             Count::Asked { held, .. } => held.is_empty(),
-            Count::Counting { players, .. } => players.is_empty(),
+            Count::Answered { players, .. } => players.is_empty(),
         }
     }
 
@@ -332,7 +379,7 @@ impl Sitting {
     fn leave(&mut self, player: &PlayerId) {
         match &mut self.count {
             Count::Asked { held, .. } => held.retain(|held| held.reading.player != *player),
-            Count::Counting { players, .. } => {
+            Count::Answered { players, .. } => {
                 players.retain(|counted| counted.player != *player);
             }
         }
@@ -347,21 +394,25 @@ impl Sitting {
         if *question != to {
             return;
         }
-        let Resumed {
-            watched,
-            registered,
-        } = kept.unwrap_or(Resumed {
-            watched: Duration::ZERO,
-            registered: false,
-        });
+        let stage = match kept {
+            None => Stage::Counting {
+                watched: Duration::ZERO,
+            },
+            Some(Resumed::Watching(watched)) => Stage::Counting { watched },
+            Some(Resumed::Registered) => Stage::Opening {
+                begins: held
+                    .first()
+                    .map_or(Known::NotReported, |held| held.reading.position),
+                played: Duration::ZERO,
+            },
+        };
 
         let players = mem::take(held)
             .into_iter()
             .map(|held| Counted::from(held.media, &held.reading))
             .collect();
-        self.count = Count::Counting {
-            watched,
-            registered,
+        self.count = Count::Answered {
+            stage,
             until: Timestamp::epoch(),
             players,
         };
@@ -375,7 +426,7 @@ impl Sitting {
         reading: &PlayerSnapshot,
         policy: &WatchedPolicy,
     ) -> Vec<Effect> {
-        let (watched, registered, until, players) = match &mut self.count {
+        let (stage, until, players) = match &mut self.count {
             Count::Asked { held, .. } => {
                 if let Some(held) = held
                     .iter_mut()
@@ -386,12 +437,15 @@ impl Sitting {
                 }
                 return Vec::new();
             }
-            Count::Counting {
-                watched,
-                registered,
+            Count::Answered {
+                stage: Stage::Registered,
+                ..
+            } => return Vec::new(),
+            Count::Answered {
+                stage,
                 until,
                 players,
-            } => (watched, registered, until, players),
+            } => (stage, until, players),
         };
         let Some(player) = players
             .iter_mut()
@@ -412,6 +466,11 @@ impl Sitting {
         if let Known::Value(_) = progress.duration {
             player.length = progress.duration;
         }
+        if progress.seeked
+            && let Stage::Opening { begins, .. } = stage
+        {
+            *begins = progress.position;
+        }
         // Nothing was played, so nothing is counted and the instant counted
         // up to stays where it is: moved by a paused player, it would take
         // from every interval of one that plays beside it.
@@ -424,21 +483,41 @@ impl Sitting {
         if added.is_zero() {
             return Vec::new();
         }
-        *watched += added;
+        let watched = match stage {
+            Stage::Opening { begins, played } => {
+                *played += added;
+                if *played < FIRST_SECONDS {
+                    return Vec::new();
+                }
+                let watched = *played;
+                let near_the_start = matches!(begins, Known::Value(at) if *at < NEAR_THE_START);
+                if !near_the_start {
+                    *stage = Stage::Registered;
+                    return Vec::new();
+                }
+                *stage = Stage::Counting { watched };
+                watched
+            }
+            Stage::Counting { watched } => {
+                *watched += added;
+                *watched
+            }
+            Stage::Registered => return Vec::new(),
+        };
 
         let mut effects = vec![Effect::Keep {
             show: self.show,
             episode: self.episode,
             media: player.media.clone(),
-            watched: *watched,
+            watched,
         }];
         let reached = Progress {
-            watched: *watched,
+            watched,
             duration: player.length,
             ..progress
         };
-        if !*registered && policy.counts_as_watched(&reached) {
-            *registered = true;
+        if policy.counts_as_watched(&reached) {
+            *stage = Stage::Registered;
             effects.push(Effect::Record {
                 show: self.show,
                 episode: self.episode,
@@ -525,6 +604,10 @@ impl Session {
     /// reported, and not at all where it is longer than
     /// [`OBSERVED_LIMIT`](crate::timeline::OBSERVED_LIMIT).
     ///
+    /// Where the last viewing registered, the sitting begins at the position
+    /// of the reading its first player counts on from, and counts nothing
+    /// until it has played its [`FIRST_SECONDS`].
+    ///
     /// An answer is dropped where the sitting that asked is over, and where
     /// it has its answer already. A sitting of the same episode that began
     /// since has a question of its own and does not take it.
@@ -592,7 +675,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{Effect, Question, Resumed, Session};
+    use super::{Effect, FIRST_SECONDS, NEAR_THE_START, Question, Resumed, Session};
     use crate::clock::{Clock, TestClock, Timestamp};
     use crate::path::RawPath;
     use crate::recognize::altname::Altnames;
@@ -678,8 +761,8 @@ mod tests {
 
         /// The next reading, a second after the one before it.
         ///
-        /// No position, because nothing here is about one: watched time is
-        /// counted from the instants and the states.
+        /// No position: watched time is counted from the instants and the
+        /// states. A [`Playback`] gives its readings one.
         fn reading(&self, media: MediaRef, state: PlayState) -> PlayerSnapshot {
             self.clock.advance(SECOND);
             PlayerSnapshot {
@@ -760,6 +843,46 @@ mod tests {
 
         fn paused(&self, player: &str, name: &str, millis: u64) -> PlayerSnapshot {
             self.reading(player, name, PlayState::Paused, millis)
+        }
+    }
+
+    /// One player with one file open, whose position moves with its clock
+    /// while it plays and goes where a test seeks it.
+    struct Playback<'player> {
+        player: &'player Player,
+        name: &'static str,
+        position: Duration,
+    }
+
+    impl<'player> Playback<'player> {
+        fn from_millis(player: &'player Player, name: &'static str, millis: u64) -> Self {
+            Self {
+                player,
+                name,
+                position: Duration::from_millis(millis),
+            }
+        }
+
+        /// The next reading, playing, a second after the one before it.
+        fn playing(&mut self) -> PlayerSnapshot {
+            let reading = PlayerSnapshot {
+                position: Known::Value(self.position),
+                ..self.player.playing(self.name)
+            };
+            self.position += SECOND;
+            reading
+        }
+
+        /// The next reading, paused where playback stands.
+        fn paused(&mut self) -> PlayerSnapshot {
+            PlayerSnapshot {
+                position: Known::Value(self.position),
+                ..self.player.paused(self.name)
+            }
+        }
+
+        fn seek_to(&mut self, seconds: u64) {
+            self.position = Duration::from_secs(seconds);
         }
     }
 
@@ -899,10 +1022,32 @@ mod tests {
 
     /// What the store had, unregistered.
     fn unregistered(seconds: u64) -> Resumed {
-        Resumed {
-            watched: Duration::from_secs(seconds),
-            registered: false,
-        }
+        Resumed::Watching(Duration::from_secs(seconds))
+    }
+
+    /// The reading of a sitting of a viewing that registered at which its
+    /// [`FIRST_SECONDS`] have been played, with readings a second apart.
+    fn last_of_the_first_seconds() -> usize {
+        usize::try_from(FIRST_SECONDS.as_secs()).expect("a few seconds")
+    }
+
+    /// What a sitting of an episode whose last viewing registered answers to
+    /// 150 readings of `playback`, sought `to` seconds in before the reading
+    /// `at`.
+    fn sought(
+        session: &mut Session,
+        playback: &mut Playback<'_>,
+        at: usize,
+        to: u64,
+    ) -> Vec<Vec<Effect>> {
+        (0..150)
+            .map(|reading| {
+                if reading == at {
+                    playback.seek_to(to);
+                }
+                answering(session, &playback.playing(), Some(Resumed::Registered))
+            })
+            .collect()
     }
 
     /// The question of this number, a session's first being the first.
@@ -1058,18 +1203,11 @@ mod tests {
 
     #[test]
     fn an_answer_to_a_question_asked_before_a_close_is_dropped() {
-        // The same episode, closed and opened again, so that show and
-        // episode tell the two questions apart no longer. A store drops a
-        // total at a close where the episode registered, so the answer to
-        // the first question says what the store no longer holds: taken, it
-        // would mark this sitting registered, and its viewing would not be
-        // recorded.
+        // Opened again, the episode tells the two questions apart no longer.
+        // The first answer is about the store before the close.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
-        let before_the_close = Some(Resumed {
-            watched: Duration::from_secs(120),
-            registered: true,
-        });
+        let before_the_close = Some(Resumed::Registered);
 
         let first = advance(&mut session, &player.playing(THIRD));
         let closed = session.end_round(std::slice::from_ref(&player.id));
@@ -1152,7 +1290,6 @@ mod tests {
                 record(SERIES, Some(3), THIRD)
             ]
         );
-        assert_eq!(answers[ASKED_AT + 1], [keep(SERIES, Some(3), THIRD, 101)]);
     }
 
     #[test]
@@ -1220,26 +1357,170 @@ mod tests {
                 record(SERIES, Some(3), THIRD)
             ]
         );
-        assert_eq!(after, [keep(SERIES, Some(3), THIRD, 152)]);
+        assert_eq!(after, NOTHING);
     }
 
     #[test]
-    fn an_episode_that_registered_before_is_not_recorded_again() {
-        // What a process that was killed leaves: the episode registered and
-        // the sitting never closed. The sitting that begins after it goes on
-        // from that total, which the second assertion shows, and has nothing
-        // to record.
+    fn a_viewing_that_registered_keeps_nothing_more() {
         let mut session = Session::new(half());
         let player = Player::named("mpv");
-        let kept = Some(Resumed {
-            watched: Duration::from_secs(120),
-            registered: true,
-        });
 
-        let answers = watch(&mut session, &player, THIRD, 30, kept);
+        let answers = watch(&mut session, &player, THIRD, 150, None);
 
-        assert_eq!(recorded_at(&answers), AT_NO_READING);
-        assert_eq!(answers[1], [keep(SERIES, Some(3), THIRD, 121)]);
+        assert_eq!(recorded_at(&answers), [ASKED_AT]);
+        assert_eq!(answers[ASKED_AT + 1..].concat(), NOTHING);
+    }
+
+    #[test]
+    fn a_sitting_begun_near_the_start_of_an_episode_that_registered_is_another_viewing() {
+        // Counted from nothing: the first total is what its first seconds played.
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let mut playback = Playback::from_millis(&player, THIRD, 500);
+
+        let answers: Vec<Vec<Effect>> = (0..150)
+            .map(|_| answering(&mut session, &playback.playing(), Some(Resumed::Registered)))
+            .collect();
+
+        assert_eq!(answers[last_of_the_first_seconds() - 1], NOTHING);
+        assert_eq!(kept_in(&answers).first(), Some(&FIRST_SECONDS));
+        assert_eq!(recorded_at(&answers), [ASKED_AT]);
+    }
+
+    #[test]
+    fn a_sitting_begun_further_in_goes_on_with_the_viewing_that_registered() {
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let mut playback = Playback::from_millis(&player, THIRD, 15_700);
+
+        let answers: Vec<Vec<Effect>> = (0..150)
+            .map(|_| answering(&mut session, &playback.playing(), Some(Resumed::Registered)))
+            .collect();
+
+        assert_eq!(answers[0], [resume(1, SERIES, Some(3))]);
+        assert_eq!(answers[1..].concat(), NOTHING);
+    }
+
+    #[test]
+    fn a_sitting_begun_at_the_mark_is_not_near_the_start() {
+        let just_under = NEAR_THE_START
+            .checked_sub(Duration::from_millis(1))
+            .expect("five seconds hold a millisecond");
+        let cases = [
+            (NEAR_THE_START, AT_NO_READING.to_vec()),
+            (just_under, vec![ASKED_AT]),
+        ];
+
+        for (begins, recorded) in cases {
+            let mut session = Session::new(half());
+            let player = Player::named("mpv");
+            let millis = u64::try_from(begins.as_millis()).expect("a few seconds");
+            let mut playback = Playback::from_millis(&player, THIRD, millis);
+
+            let answers: Vec<Vec<Effect>> = (0..150)
+                .map(|_| answering(&mut session, &playback.playing(), Some(Resumed::Registered)))
+                .collect();
+
+            assert_eq!(recorded_at(&answers), recorded, "begun at {begins:?}");
+        }
+    }
+
+    #[test]
+    fn a_seek_in_the_first_seconds_to_where_the_last_viewing_stopped_goes_on_with_it() {
+        // The seek VLC makes where its offer to resume is taken, at the last
+        // reading that moves where the sitting begins.
+        let mut session = Session::new(half());
+        let player = Player::named("vlc");
+        let mut playback = Playback::from_millis(&player, THIRD, 400);
+
+        let answers = sought(
+            &mut session,
+            &mut playback,
+            last_of_the_first_seconds(),
+            120,
+        );
+
+        assert_eq!(answers[1..].concat(), NOTHING);
+    }
+
+    #[test]
+    fn a_seek_in_the_first_seconds_back_to_the_start_is_another_viewing() {
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let mut playback = Playback::from_millis(&player, THIRD, 15_700);
+
+        let answers = sought(&mut session, &mut playback, 3, 0);
+
+        assert_eq!(kept_in(&answers).first(), Some(&FIRST_SECONDS));
+        assert_eq!(recorded_at(&answers), [ASKED_AT]);
+    }
+
+    #[test]
+    fn a_seek_after_the_first_seconds_moves_nothing() {
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let mut playback = Playback::from_millis(&player, THIRD, 500);
+
+        let answers = sought(
+            &mut session,
+            &mut playback,
+            last_of_the_first_seconds() + 1,
+            120,
+        );
+
+        assert_eq!(recorded_at(&answers), [ASKED_AT]);
+    }
+
+    #[test]
+    fn the_first_seconds_are_seconds_played() {
+        // Opened paused for half a minute, played three seconds and sought to
+        // where the last viewing stopped: no second of the pause is one of them.
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+        let mut playback = Playback::from_millis(&player, THIRD, 400);
+
+        let mut answers = vec![answering(
+            &mut session,
+            &playback.paused(),
+            Some(Resumed::Registered),
+        )];
+        answers.extend((0..30).map(|_| advance(&mut session, &playback.paused())));
+        answers.extend((0..4).map(|_| advance(&mut session, &playback.playing())));
+        playback.seek_to(120);
+        answers.extend((0..150).map(|_| advance(&mut session, &playback.playing())));
+
+        assert_eq!(answers[1..].concat(), NOTHING);
+    }
+
+    #[test]
+    fn a_sitting_two_players_opened_before_the_answer_begins_where_the_first_stands() {
+        let mut session = Session::new(half());
+        let mpv = Player::named("mpv");
+        let vlc = Player::named("vlc");
+        let mut first = Playback::from_millis(&mpv, THIRD, 500);
+        let further_in = PlayerSnapshot {
+            position: Known::Value(Duration::from_secs(120)),
+            ..vlc.playing(THIRD)
+        };
+
+        advance(&mut session, &first.playing());
+        advance(&mut session, &further_in);
+        session.resumed(Question(1), Some(Resumed::Registered));
+        let answers: Vec<Vec<Effect>> = (0..150)
+            .map(|_| advance(&mut session, &first.playing()))
+            .collect();
+
+        assert_eq!(recorded_at(&answers), [ASKED_AT - 1]);
+    }
+
+    #[test]
+    fn a_sitting_that_reports_no_position_goes_on_with_the_viewing_that_registered() {
+        let mut session = Session::new(half());
+        let player = Player::named("mpv");
+
+        let answers = watch(&mut session, &player, THIRD, 150, Some(Resumed::Registered));
+
+        assert_eq!(answers[1..].concat(), NOTHING);
     }
 
     #[test]
@@ -1408,11 +1689,9 @@ mod tests {
     }
 
     #[test]
-    fn another_file_of_the_episode_keeps_it_open_with_its_total_and_its_mark() {
+    fn another_file_of_the_episode_keeps_it_open_with_its_mark() {
         // A better release opened in the middle of an episode is the same
-        // viewing. Closed and asked about again, the store would drop the
-        // total of an episode that registered, and the rest of the viewing
-        // would count towards recording it a second time.
+        // viewing, and asks the store nothing.
         let mut session = Session::new(half());
         let player = Player::named("mpv");
 
@@ -1421,10 +1700,8 @@ mod tests {
         let second = watch(&mut session, &player, THIRD_BY_OTHERS, 150, None);
 
         assert_eq!(recorded_at(&first), [ASKED_AT]);
-        assert_eq!(first[101], [keep(SERIES, Some(3), THIRD, 101)]);
         assert_eq!(moved, NOTHING);
-        assert_eq!(second[0], [keep(SERIES, Some(3), THIRD_BY_OTHERS, 102)]);
-        assert_eq!(recorded_at(&second), AT_NO_READING);
+        assert_eq!(second.concat(), NOTHING);
     }
 
     #[test]
@@ -1597,11 +1874,8 @@ mod tests {
 
     #[test]
     fn two_players_playing_at_once_add_a_second_a_second_and_record_once() {
-        // Ninety-eight seconds kept, and a hundred asked. From the first
-        // reading to the last, 2.2 s pass and the total grows by 2.2 s. The
-        // reading that reaches a hundred records the episode, and the
-        // reading of the other player after it, past the policy as well,
-        // records nothing.
+        // Ninety-eight seconds kept and a hundred asked: two seconds of two
+        // players add two, and the reading after the record answers nothing.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
 
@@ -1630,10 +1904,7 @@ mod tests {
                 record(SERIES, Some(3), THIRD)
             ]
         );
-        assert_eq!(
-            answers[5],
-            [keep_ms(SERIES, Some(3), THIRD_BY_OTHERS, 100_200)]
-        );
+        assert_eq!(answers[5], NOTHING);
     }
 
     #[test]
@@ -1929,11 +2200,8 @@ mod tests {
 
     #[test]
     fn an_episode_handed_from_one_player_to_another_in_one_round_stays_open() {
-        // The readings of a round are taken before the players that are
-        // gone are named. The episode registered in the first player, the
-        // second opens it in the round the first leaves in, and it is one
-        // sitting: nothing is closed, the total goes on, and nothing is
-        // recorded again.
+        // Registered in the first player and opened by the second in the round
+        // the first leaves in, the episode is one sitting, closed once.
         let mut session = Session::new(half());
         let stamps = Stamps::new();
 
@@ -1954,17 +2222,14 @@ mod tests {
         assert_eq!(recorded_at(&first), [ASKED_AT]);
         assert_eq!(opened, NOTHING);
         assert_eq!(left, NOTHING);
-        assert_eq!(second, [keep(SERIES, Some(3), THIRD, 102)]);
+        assert_eq!(second, NOTHING);
         assert_eq!(closed, [close(SERIES, Some(3))]);
     }
 
     #[test]
     fn an_episode_one_player_moves_on_from_and_another_opens_in_one_round_stays_open() {
-        // The first player is not gone: it opens the next episode in the
-        // round the second opens this one in. Whichever of the two readings
-        // is taken first, it is one sitting: nothing is closed, nothing is
-        // asked about the episode again, the total goes on, and nothing is
-        // recorded again.
+        // The first player opens the next episode in the round the second opens
+        // this one in. Whichever is read first, it is one sitting, asked once.
         for the_one_that_moves_on_is_read_first in [true, false] {
             let mut session = Session::new(half());
             let stamps = Stamps::new();
@@ -1995,7 +2260,7 @@ mod tests {
             assert_eq!(moved, [resume(2, SERIES, Some(4))], "{order}");
             assert_eq!(opened, NOTHING, "{order}");
             assert_eq!(over, NOTHING, "{order}");
-            assert_eq!(second, [keep(SERIES, Some(3), THIRD, 102)], "{order}");
+            assert_eq!(second, NOTHING, "{order}");
         }
     }
 

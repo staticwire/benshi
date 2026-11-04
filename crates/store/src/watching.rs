@@ -7,12 +7,12 @@
 //! it, so the total is kept here, one row of `watching` for each episode, and
 //! [`Store::resume`] hands it back.
 //!
-//! **A total outlives the sitting until the episode registers, and the
-//! sitting it registers in until that sitting closes.** Dropping it at the
-//! moment of registration would put the rest of that sitting into a fresh
-//! total with no mark on it, and that total would count towards registering
-//! the episode a second time. A process that is killed closes nothing, so
-//! what it kept is there for the next one.
+//! **A total is kept while its viewing has not registered.** The total a
+//! viewing registers on is marked, in the transaction that records the
+//! episode, and dropped when the sitting it registered in closes. A process
+//! that is killed closes nothing and leaves the mark. Either way the last
+//! viewing of the episode registered, and [`Store::resume`] says so. The
+//! first total of another viewing takes the place of the mark.
 
 use std::time::{Duration, SystemTime};
 
@@ -38,22 +38,28 @@ pub struct Total {
     pub at: SystemTime,
 }
 
-/// What the store kept for one episode, as [`Store::resume`] answers it.
+/// What the store kept of the last viewing of an episode, as
+/// [`Store::resume`] answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Kept {
-    /// The file that was open when the total was last kept.
-    pub media: RawPath,
-    /// Everything watched of the episode, in whole milliseconds.
-    pub watched: Duration,
-    /// Whether the episode registered in the sitting the total belongs to.
-    pub registered: bool,
+pub enum Kept {
+    /// A viewing that has not registered.
+    Watching {
+        /// The file that was open when the total was last kept.
+        media: RawPath,
+        /// Everything watched of the episode in this viewing, in whole
+        /// milliseconds.
+        watched: Duration,
+    },
+    /// A viewing that registered.
+    Registered,
 }
 
 impl Store {
     /// Keep the total watched of an episode.
     ///
-    /// The total takes the place of the one kept before, with its media and
-    /// its instant. Whether the episode registered stays as it was.
+    /// The total takes the place of the one kept before, with its media, its
+    /// instant and its mark: a total that is kept is of a viewing that has
+    /// not registered.
     ///
     /// The column holds whole milliseconds. What is under one is dropped,
     /// and a total longer than the column holds is kept as the longest it
@@ -74,7 +80,7 @@ impl Store {
         let show = total.show.0;
         let transaction = self.connection.transaction()?;
         let kept = transaction.execute(
-            "UPDATE watching SET media = ?3, watched_ms = ?4, updated_at = ?5 \
+            "UPDATE watching SET media = ?3, watched_ms = ?4, updated_at = ?5, registered = 0 \
              WHERE show = ?1 AND episode IS ?2",
             params![show, total.episode, media, watched, at],
         )?;
@@ -90,15 +96,19 @@ impl Store {
         Ok(())
     }
 
-    /// What was kept for an episode, or nothing where none was.
+    /// What was kept of the last viewing of an episode, or nothing where
+    /// none was.
+    ///
+    /// An episode recorded with no total kept registered in its last
+    /// viewing.
     ///
     /// # Errors
     ///
     /// [`Error::Busy`] when the database cannot be read because another
     /// connection has it, which in WAL a connection that writes to it does
     /// not cause. [`Error::Write`] when the row cannot be read for any other
-    /// reason, a total below zero included. [`Error::Media`] for a row
-    /// whose media is not a path as this store writes one.
+    /// reason, an unmarked total below zero included. [`Error::Media`] for an
+    /// unmarked row whose media is not a path as this store writes one.
     pub fn resume(&self, show: ShowId, episode: Option<u32>) -> Result<Option<Kept>, Error> {
         let row = self
             .connection
@@ -117,18 +127,25 @@ impl Store {
             )
             .optional()?;
         let Some((id, text, watched, registered)) = row else {
-            return Ok(None);
+            let recorded: bool = self.connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM episodes_seen WHERE show = ?1 AND episode IS ?2)",
+                params![show.0, episode],
+                |row| row.get(0),
+            )?;
+            return Ok(recorded.then_some(Kept::Registered));
         };
+        if registered {
+            return Ok(Some(Kept::Registered));
+        }
         let Some(media) = RawPath::from_escaped(&text) else {
             return Err(Error::Media { id, text });
         };
         let watched = u64::try_from(watched)
             .map_err(|_| Error::Write(rusqlite::Error::IntegralValueOutOfRange(2, watched)))?;
 
-        Ok(Some(Kept {
+        Ok(Some(Kept::Watching {
             media,
             watched: Duration::from_millis(watched),
-            registered,
         }))
     }
 
@@ -229,11 +246,10 @@ mod tests {
         }
     }
 
-    fn kept(watched: Duration, registered: bool) -> Kept {
-        Kept {
+    fn watching(watched: Duration) -> Kept {
+        Kept::Watching {
             media: RawPath::from_bytes(MEDIA.to_vec()),
             watched,
-            registered,
         }
     }
 
@@ -241,6 +257,17 @@ mod tests {
         store
             .connection
             .query_row("SELECT count(*) FROM watching", [], |row| row.get(0))
+            .expect("the table is there")
+    }
+
+    fn has_a_total(store: &Store, show: ShowId, episode: Option<u32>) -> bool {
+        store
+            .connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM watching WHERE show = ?1 AND episode IS ?2)",
+                rusqlite::params![show.0, episode],
+                |row| row.get(0),
+            )
             .expect("the table is there")
     }
 
@@ -271,7 +298,7 @@ mod tests {
 
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false))
+            Some(watching(A_SITTING))
         );
     }
 
@@ -339,10 +366,9 @@ mod tests {
         assert_eq!(rows(&store), 1);
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(Kept {
+            Some(Kept::Watching {
                 media: RawPath::from_bytes(b"/anime/[Other] Show Title - 03.mkv".to_vec()),
                 watched: TWO_SITTINGS,
-                registered: false,
             })
         );
         let updated_at: String = store
@@ -372,7 +398,7 @@ mod tests {
         assert_eq!(rows(&store), 1);
         assert_eq!(
             store.resume(FILM, None).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, false))
+            Some(watching(TWO_SITTINGS))
         );
     }
 
@@ -393,15 +419,15 @@ mod tests {
         assert_eq!(rows(&store), 3);
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false))
+            Some(watching(A_SITTING))
         );
         assert_eq!(
             store.resume(SERIES, Some(4)).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, false))
+            Some(watching(TWO_SITTINGS))
         );
         assert_eq!(
             store.resume(ANOTHER, Some(3)).expect("the store answers"),
-            Some(kept(Duration::from_millis(5_000), false))
+            Some(watching(Duration::from_millis(5_000)))
         );
     }
 
@@ -422,18 +448,19 @@ mod tests {
             .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
 
+        assert!(has_a_total(&store, SERIES, Some(3)));
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, true))
+            Some(Kept::Registered)
         );
         assert_eq!(
             store.resume(SERIES, Some(4)).expect("the store answers"),
-            Some(kept(A_SITTING, false)),
+            Some(watching(A_SITTING)),
             "another episode of the show did not register"
         );
         assert_eq!(
             store.resume(ANOTHER, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false)),
+            Some(watching(A_SITTING)),
             "the same episode of another show did not register"
         );
     }
@@ -449,9 +476,10 @@ mod tests {
             .record(&viewing(FILM, None))
             .expect("recording cannot fail");
 
+        assert!(has_a_total(&store, FILM, None));
         assert_eq!(
             store.resume(FILM, None).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, true))
+            Some(Kept::Registered)
         );
     }
 
@@ -468,8 +496,40 @@ mod tests {
         assert_eq!(rows(&store), 0);
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            None
+            Some(Kept::Registered)
         );
+    }
+
+    #[test]
+    fn a_recorded_episode_with_no_total_is_the_one_that_resumes_registered() {
+        let (_home, mut store) = a_store();
+
+        store
+            .record(&viewing(SERIES, Some(3)))
+            .expect("recording cannot fail");
+        store
+            .record(&viewing(FILM, None))
+            .expect("recording cannot fail");
+
+        for (show, episode) in [(SERIES, Some(3)), (FILM, None)] {
+            assert_eq!(
+                store.resume(show, episode).expect("the store answers"),
+                Some(Kept::Registered),
+                "{show:?} {episode:?}"
+            );
+        }
+        for (show, episode) in [
+            (SERIES, Some(4)),
+            (SERIES, None),
+            (ANOTHER, Some(3)),
+            (FILM, Some(1)),
+        ] {
+            assert_eq!(
+                store.resume(show, episode).expect("the store answers"),
+                None,
+                "{show:?} {episode:?} was never recorded"
+            );
+        }
     }
 
     #[test]
@@ -493,7 +553,7 @@ mod tests {
         assert!(matches!(refused, Err(Error::Write(_))), "got {refused:?}");
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, false))
+            Some(watching(TWO_SITTINGS))
         );
     }
 
@@ -531,24 +591,23 @@ mod tests {
     }
 
     #[test]
-    fn a_total_kept_after_the_episode_registered_stays_registered() {
-        // The viewer goes on watching after the episode registers, and the
-        // total goes on growing.
+    fn a_total_kept_after_the_episode_registered_is_of_another_viewing() {
         let (_home, mut store) = a_store();
         store
-            .keep(&total(SERIES, Some(3), A_SITTING))
+            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
             .expect("the total is kept");
         store
             .record(&viewing(SERIES, Some(3)))
             .expect("recording cannot fail");
 
         store
-            .keep(&total(SERIES, Some(3), TWO_SITTINGS))
+            .keep(&total(SERIES, Some(3), A_SITTING))
             .expect("the total is kept");
 
+        assert_eq!(rows(&store), 1);
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, true))
+            Some(watching(A_SITTING))
         );
     }
 
@@ -565,11 +624,12 @@ mod tests {
 
         store.close(SERIES, Some(3)).expect("the store closes");
 
+        assert_eq!(rows(&store), 0);
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            None
+            Some(Kept::Registered),
+            "the record says what the total said"
         );
-        assert_eq!(rows(&store), 0);
     }
 
     #[test]
@@ -585,7 +645,7 @@ mod tests {
 
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false))
+            Some(watching(A_SITTING))
         );
     }
 
@@ -608,14 +668,10 @@ mod tests {
 
         store.close(SERIES, Some(3)).expect("the store closes");
 
-        assert_eq!(
-            store.resume(SERIES, Some(3)).expect("the store answers"),
-            None
-        );
+        assert!(!has_a_total(&store, SERIES, Some(3)));
         for (show, episode) in [(SERIES, Some(4)), (SERIES, None), (ANOTHER, Some(3))] {
-            assert_eq!(
-                store.resume(show, episode).expect("the store answers"),
-                Some(kept(TWO_SITTINGS, true)),
+            assert!(
+                has_a_total(&store, show, episode),
                 "{show:?} {episode:?} was closed with it"
             );
         }
@@ -634,7 +690,11 @@ mod tests {
 
         store.close(FILM, None).expect("the store closes");
 
-        assert_eq!(store.resume(FILM, None).expect("the store answers"), None);
+        assert_eq!(rows(&store), 0);
+        assert_eq!(
+            store.resume(FILM, None).expect("the store answers"),
+            Some(Kept::Registered)
+        );
     }
 
     #[test]
@@ -654,7 +714,7 @@ mod tests {
 
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(Duration::from_millis(5_000), false))
+            Some(watching(Duration::from_millis(5_000)))
         );
     }
 
@@ -679,7 +739,7 @@ mod tests {
 
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(Duration::from_millis(1_999), false))
+            Some(watching(Duration::from_millis(1_999)))
         );
     }
 
@@ -710,11 +770,11 @@ mod tests {
             })
             .expect("the total is kept");
 
-        let resumed = store
-            .resume(SERIES, Some(3))
-            .expect("the store answers")
-            .expect("the total is there");
-        assert_eq!(resumed.media.as_bytes(), shift_jis);
+        let resumed = store.resume(SERIES, Some(3)).expect("the store answers");
+        let Some(Kept::Watching { media, .. }) = resumed else {
+            panic!("the total is there, got {resumed:?}")
+        };
+        assert_eq!(media.as_bytes(), shift_jis);
     }
 
     #[test]
@@ -767,6 +827,30 @@ mod tests {
     }
 
     #[test]
+    fn a_mark_is_read_past_what_an_unmarked_row_is_refused_for() {
+        // Nothing is counted on from a viewing that registered.
+        let (_home, mut store) = a_store();
+        store
+            .keep(&total(SERIES, Some(3), A_SITTING))
+            .expect("the total is kept");
+        store
+            .record(&viewing(SERIES, Some(3)))
+            .expect("recording cannot fail");
+        store
+            .connection
+            .execute(
+                "UPDATE watching SET media = '/anime/100% - 03.mkv', watched_ms = -5",
+                [],
+            )
+            .expect("the row is edited by hand");
+
+        assert_eq!(
+            store.resume(SERIES, Some(3)).expect("the store answers"),
+            Some(Kept::Registered)
+        );
+    }
+
+    #[test]
     fn an_instant_the_column_cannot_hold_is_refused_and_nothing_is_kept() {
         let (_home, mut store) = a_store();
 
@@ -801,11 +885,11 @@ mod tests {
 
         assert_eq!(
             reopened.resume(SERIES, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false))
+            Some(watching(A_SITTING))
         );
         assert_eq!(
             reopened.resume(SERIES, Some(4)).expect("the store answers"),
-            Some(kept(TWO_SITTINGS, true)),
+            Some(Kept::Registered),
             "and so is the mark on the one that registered"
         );
     }
@@ -838,13 +922,14 @@ mod tests {
 
         store.close(SERIES, Some(3)).expect("the store closes");
 
+        assert!(!has_a_total(&store, SERIES, Some(3)));
         assert_eq!(
             store.resume(SERIES, Some(3)).expect("the store answers"),
-            None
+            Some(Kept::Registered)
         );
         assert_eq!(
             store.resume(namesake, Some(3)).expect("the store answers"),
-            Some(kept(A_SITTING, false))
+            Some(watching(A_SITTING))
         );
     }
 }
