@@ -18,7 +18,7 @@ use benshi_core::recognize::parse::{Episode, Kind, Parsed};
 use benshi_core::settle::Fact;
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
-use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
+use benshi_daemon::protocol::{DecidedBy, Explanation, NameListing, Outcome, SourceListing};
 use humantime::format_rfc3339_seconds;
 
 /// What is shown for a source that cannot name what it opened.
@@ -41,6 +41,9 @@ const UNSUPPORTED: &str = "n/a";
 
 /// What is shown when no reading has been decided yet.
 const NOTHING_DECIDED: &str = "nothing has been decided yet\n";
+
+/// What is shown when nothing has been mapped.
+const NOTHING_MAPPED: &str = "nothing is mapped\n";
 
 /// What a source is able to report, and what that leaves recognition to work
 /// from.
@@ -400,9 +403,69 @@ fn day_and_minute(seconds: u64) -> Option<String> {
     ))
 }
 
+/// What a name means now, and what it meant before where it meant another
+/// entry.
+#[must_use]
+pub fn mapped(spelled: &str, anilist: i64, title: &str, replaced: Option<&NameListing>) -> String {
+    let mut shown = format!("mapped: \"{spelled}\" to {}", meaning(Some(anilist), title));
+    if let Some(before) = replaced {
+        write!(
+            shown,
+            ", in place of {}",
+            meaning(before.anilist, &before.title)
+        )
+        .expect("a String accepts every write");
+    }
+    shown.push('\n');
+    shown
+}
+
+/// The name taken back, as it was given.
+#[must_use]
+pub fn removed(spelled: &str) -> String {
+    format!("removed: \"{spelled}\"\n")
+}
+
+/// Every name given, one to a line, with what it means and why it is not in
+/// force where it is not.
+#[must_use]
+pub fn names(given: &[NameListing]) -> String {
+    if given.is_empty() {
+        return NOTHING_MAPPED.to_owned();
+    }
+
+    let mut shown = String::new();
+    for name in given {
+        write!(
+            shown,
+            "\"{}\" to {}",
+            name.spelled,
+            meaning(name.anilist, &name.title)
+        )
+        .expect("a String accepts every write");
+        if let Some(why) = &name.not_in_force {
+            write!(shown, ", not in force: {why}").expect("a String accepts every write");
+        }
+        shown.push('\n');
+    }
+    shown
+}
+
+/// An entry a name means: its number on AniList and its title, or the title
+/// alone where the list holds no entry of its show.
+fn meaning(anilist: Option<i64>, title: &str) -> String {
+    match anilist {
+        Some(number) => format!("AniList {number}, \"{title}\""),
+        None => format!("\"{title}\""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{capabilities, event, explanation, listing, logged_in, moment, state, why};
+    use super::{
+        capabilities, event, explanation, listing, logged_in, mapped, moment, names, removed,
+        state, why,
+    };
     use benshi_core::clock::Timestamp;
     use benshi_core::path::RawPath;
     use benshi_core::policy::Policy;
@@ -413,7 +476,7 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_daemon::bus::BusEvent;
-    use benshi_daemon::protocol::{DecidedBy, Explanation, Outcome, SourceListing};
+    use benshi_daemon::protocol::{DecidedBy, Explanation, NameListing, Outcome, SourceListing};
     use benshi_daemon::recognition::Recognizer;
     // The reason a failure carries comes from here in the daemon, so the tests
     // that check how one reads take it from here too rather than writing one.
@@ -1154,5 +1217,75 @@ mod tests {
                 "{past}"
             );
         }
+    }
+
+    /// A name given, as the daemon lists it.
+    fn a_name(spelled: &str, anilist: Option<i64>, title: &str) -> NameListing {
+        NameListing {
+            spelled: spelled.to_owned(),
+            anilist,
+            title: title.to_owned(),
+            not_in_force: None,
+        }
+    }
+
+    #[test]
+    fn a_name_mapped_says_which_entry_it_means() {
+        assert_eq!(
+            mapped("Show Title", 12345, "Show Title Season 2", None),
+            "mapped: \"Show Title\" to AniList 12345, \"Show Title Season 2\"\n"
+        );
+    }
+
+    #[test]
+    fn a_name_mapped_again_says_what_it_meant_before() {
+        // The entry it leaves is the one a user would have to put back.
+        let before = a_name("show title", Some(678), "Show Title");
+
+        assert_eq!(
+            mapped("Show Title", 12345, "Show Title Season 2", Some(&before)),
+            "mapped: \"Show Title\" to AniList 12345, \"Show Title Season 2\", \
+             in place of AniList 678, \"Show Title\"\n"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_left_the_list_is_said_by_its_title_alone() {
+        let before = a_name("Show Title", None, "Show Title");
+
+        assert_eq!(
+            mapped("Show Title", 12345, "Show Title Season 2", Some(&before)),
+            "mapped: \"Show Title\" to AniList 12345, \"Show Title Season 2\", \
+             in place of \"Show Title\"\n"
+        );
+    }
+
+    #[test]
+    fn a_name_taken_back_is_said_as_it_was_given() {
+        assert_eq!(removed("Show Title"), "removed: \"Show Title\"\n");
+    }
+
+    #[test]
+    fn the_names_given_are_listed_one_to_a_line_in_the_order_given() {
+        let left = NameListing {
+            not_in_force: Some("its entry is not on the list".to_owned()),
+            ..a_name("Old Title", None, "A Show That Left")
+        };
+
+        assert_eq!(
+            names(&[
+                a_name("Show Title", Some(12345), "Show Title Season 2"),
+                left,
+                a_name("Other Title", Some(678), "Other Title"),
+            ]),
+            "\"Show Title\" to AniList 12345, \"Show Title Season 2\"\n\
+             \"Old Title\" to \"A Show That Left\", not in force: its entry is not on the list\n\
+             \"Other Title\" to AniList 678, \"Other Title\"\n"
+        );
+    }
+
+    #[test]
+    fn no_name_given_says_so_rather_than_printing_nothing() {
+        assert_eq!(names(&[]), "nothing is mapped\n");
     }
 }

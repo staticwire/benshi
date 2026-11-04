@@ -1,7 +1,7 @@
 //! What each command does, and what the process should exit with.
 //!
 //! A command opens a connection, sends a request and renders what comes back:
-//! one answer for `sources`, `policy` and `why`, and a stream for `watch` until
+//! one answer for `sources`, `policy`, `why` and `map`, and a stream for `watch` until
 //! the daemon or the user ends it. `record` wants both an answer and a stream, so
 //! it takes a second connection for the answer: a stream is the last thing a
 //! connection carries. What it records goes to a file, and only a summary of
@@ -26,7 +26,7 @@ use benshi_core::trace::{TraceHeader, header_line, snapshot_line};
 use benshi_core::{AppName, PlayerId, SourceInfo};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::protocol::{Request, Response, SourceListing};
-use clap::{Subcommand, ValueEnum};
+use clap::{ArgGroup, Subcommand, ValueEnum};
 use humantime::format_rfc3339_seconds;
 
 use crate::client::Daemon;
@@ -88,6 +88,28 @@ pub enum Command {
 
     /// Remove the AniList token from the secret store.
     Logout,
+
+    /// Make a name mean an entry of the list, or take that back.
+    ///
+    /// With a name and --anilist, a file whose title is that name is
+    /// recognized as that entry from then on. With a name and --remove, the
+    /// name means what the list says again. With no arguments, every name
+    /// given is listed with the entry it means.
+    #[command(group(ArgGroup::new("meaning").args(["anilist", "remove"])))]
+    Map {
+        /// The title as benshi why spells it, in quotes. Where why spells a
+        /// season or a part, the name spells it too: "Show Title Season 2".
+        #[arg(requires = "meaning")]
+        name: Option<String>,
+
+        /// The entry the name means, by its number on AniList.
+        #[arg(long, value_name = "ID", requires = "name")]
+        anilist: Option<i64>,
+
+        /// Take back what the name was made to mean.
+        #[arg(long, requires = "name")]
+        remove: bool,
+    },
 }
 
 /// A policy as it is typed on the command line.
@@ -171,6 +193,24 @@ async fn carry_out(
             login(socket, typed, out, err).await
         }
         Command::Logout => logout(&mut daemon, out).await,
+        Command::Map {
+            name: None,
+            anilist: None,
+            remove: false,
+        } => names(&mut daemon, out).await,
+        Command::Map {
+            name: Some(name),
+            anilist: Some(anilist),
+            remove: false,
+        } => map(&mut daemon, &name, anilist, out).await,
+        Command::Map {
+            name: Some(name),
+            anilist: None,
+            remove: true,
+        } => unmap(&mut daemon, &name, out).await,
+        // The parser refuses each of these, so only a command built in code
+        // reaches this arm.
+        Command::Map { .. } => bail!("map takes a name with --anilist or --remove, or nothing"),
     }
 }
 
@@ -298,6 +338,63 @@ async fn logout(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
         }
         Response::Error { message } => bail!("{message}"),
         unexpected => bail!("daemon answered a logout with {unexpected:?}"),
+    }
+}
+
+/// Have the daemon make a name mean an entry, and say what it means now.
+async fn map(daemon: &mut Daemon, spelled: &str, anilist: i64, out: &mut impl Write) -> Result<()> {
+    daemon
+        .ask(&Request::Map {
+            spelled: spelled.to_owned(),
+            anilist,
+        })
+        .await?;
+
+    match daemon.expect_answer().await? {
+        Response::Mapped {
+            spelled,
+            anilist,
+            title,
+            replaced,
+        } => write!(
+            out,
+            "{}",
+            render::mapped(&spelled, anilist, &title, replaced.as_ref())
+        )
+        .context("mapping could not be printed"),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a mapping with {unexpected:?}"),
+    }
+}
+
+/// Have the daemon take back what a name was made to mean, and say so.
+async fn unmap(daemon: &mut Daemon, spelled: &str, out: &mut impl Write) -> Result<()> {
+    daemon
+        .ask(&Request::Unmap {
+            spelled: spelled.to_owned(),
+        })
+        .await?;
+
+    match daemon.expect_answer().await? {
+        Response::Unmapped(Some(given)) => {
+            write!(out, "{}", render::removed(&given)).context("removal could not be printed")
+        }
+        Response::Unmapped(None) => bail!("\"{spelled}\" is not mapped"),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a removal with {unexpected:?}"),
+    }
+}
+
+/// Print every name given and the entry it means.
+async fn names(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::Names).await?;
+
+    match daemon.expect_answer().await? {
+        Response::Names(given) => {
+            write!(out, "{}", render::names(&given)).context("names could not be printed")
+        }
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a listing of names with {unexpected:?}"),
     }
 }
 
@@ -517,6 +614,7 @@ mod tests {
     use crate::client::DEADLINE;
     use crate::prompt::Typed;
     use benshi_core::clock::{Clock, TestClock};
+    use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::settle::Settled;
@@ -530,11 +628,13 @@ mod tests {
     use benshi_daemon::bus::{BusEvent, EventBus};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
-    use benshi_daemon::listing::Wakes;
+    use benshi_daemon::listing::{BACKEND, Wakes};
+    use benshi_daemon::mapping::Mapping;
     use benshi_daemon::protocol::{Request, Response};
-    use benshi_daemon::recognition::{Decided, Decision, Recognizer};
+    use benshi_daemon::recognition::{Current, Decided, Decision, Recognizer};
     use benshi_daemon::secrets;
     use benshi_daemon::supervisor::TaskError;
+    use benshi_store::Store;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -751,6 +851,7 @@ mod tests {
         policy: Arc<RwLock<PolicyTable>>,
         decided: Decided,
         accounts: Arc<Logins>,
+        store: Arc<Mutex<Store>>,
         serving: JoinHandle<Result<(), TaskError>>,
     }
 
@@ -811,6 +912,9 @@ mod tests {
             seen.record(sources);
             let decided = Decided::new();
             let accounts = Arc::new(accounts);
+            let store = Arc::new(Mutex::new(
+                Store::open(&home.path().join("benshi.db")).expect("the database opens"),
+            ));
             let server = Arc::new(Server::new(
                 Arc::clone(&bus),
                 Arc::clone(&policy),
@@ -818,6 +922,7 @@ mod tests {
                 decided.clone(),
                 Arc::clone(&accounts) as Arc<dyn Accounts>,
                 Wakes::new(),
+                Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty())),
             ));
 
             Self {
@@ -827,8 +932,21 @@ mod tests {
                 policy,
                 decided,
                 accounts,
+                store,
                 serving: tokio::spawn(server.listen(Arc::new(listener))),
             }
+        }
+
+        /// File two entries a name cannot tell apart, as a list read would.
+        fn has_two_of_one_name(&self) {
+            self.store
+                .lock()
+                .expect("the store")
+                .file(
+                    BACKEND,
+                    &[an_entry(900_001, "Nisekoi"), an_entry(900_002, "Nisekoi:")],
+                )
+                .expect("the list is filed");
         }
 
         /// Leave behind a decision about a file of this name, as a detection
@@ -1345,7 +1463,7 @@ mod tests {
     }
 
     /// Every command, with the trace of a recording beside `socket`.
-    fn every_command(socket: &Path) -> [Command; 7] {
+    fn every_command(socket: &Path) -> [Command; 10] {
         [
             Command::Sources,
             Command::Watch,
@@ -1360,7 +1478,55 @@ mod tests {
             },
             Command::Login,
             Command::Logout,
+            mapping("Nisekoi", 900_002),
+            removing("Nisekoi"),
+            names(),
         ]
+    }
+
+    /// A `map` of `name` to the entry numbered `anilist`.
+    fn mapping(name: &str, anilist: i64) -> Command {
+        Command::Map {
+            name: Some(name.to_owned()),
+            anilist: Some(anilist),
+            remove: false,
+        }
+    }
+
+    /// A `map` that takes `name` back.
+    fn removing(name: &str) -> Command {
+        Command::Map {
+            name: Some(name.to_owned()),
+            anilist: None,
+            remove: true,
+        }
+    }
+
+    /// A `map` that lists the names given.
+    fn names() -> Command {
+        Command::Map {
+            name: None,
+            anilist: None,
+            remove: false,
+        }
+    }
+
+    /// An entry of the list, as a list read files one.
+    fn an_entry(id: i64, title: &str) -> Entry {
+        Entry {
+            id: EntryId(id),
+            title: title.to_owned(),
+            spellings: Vec::new(),
+            format: None,
+            episodes: Some(12),
+            episode_length: None,
+            year: None,
+            released: true,
+            status: Status::Watching,
+            progress: 0,
+            rewatches: 0,
+            score: None,
+        }
     }
 
     /// How long a test on the paused clock gives a command to end, which is
@@ -1834,6 +2000,21 @@ mod tests {
                 policy,
                 Response::Why(None),
                 "benshi: daemon answered a policy change with Why(None)\n",
+            ),
+            (
+                mapping("Nisekoi", 900_002),
+                Response::Ok,
+                "benshi: daemon answered a mapping with Ok\n",
+            ),
+            (
+                removing("Nisekoi"),
+                Response::Ok,
+                "benshi: daemon answered a removal with Ok\n",
+            ),
+            (
+                names(),
+                Response::Ok,
+                "benshi: daemon answered a listing of names with Ok\n",
             ),
         ] {
             let (_home, socket, answering) = a_daemon_that_answers_with(&answer);
@@ -2787,5 +2968,228 @@ mod tests {
             shown,
             "logged in to AniList as someone; token does not say when it runs out\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_name_mapped_says_which_entry_it_means() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        let (outcome, shown, complained) = go(mapping("Nisekoi", 900_002), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(complained.is_empty(), "{complained}");
+        assert_eq!(
+            shown,
+            "mapped: \"Nisekoi\" to AniList 900002, \"Nisekoi:\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_mapped_again_says_what_it_meant_before() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(mapping("Nisekoi", 900_001), &daemon.socket).await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+
+        let (outcome, shown, complained) = go(mapping("nisekoi", 900_002), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "mapped: \"nisekoi\" to AniList 900002, \"Nisekoi:\", \
+             in place of AniList 900001, \"Nisekoi\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_mapped_to_an_entry_off_the_list_fails_and_says_why() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        let (outcome, shown, complained) = go(mapping("Nisekoi", 999), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(complained, "benshi: AniList 999 is not on the list\n");
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "nothing is mapped\n");
+    }
+
+    #[tokio::test]
+    async fn the_names_given_are_listed_in_the_order_given() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        for (name, anilist) in [("Nisekoi", 900_002), ("Nisekoi Season 2", 900_001)] {
+            let (outcome, _shown, complained) = go(mapping(name, anilist), &daemon.socket).await;
+            assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        }
+
+        let (outcome, shown, complained) = go(names(), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "\"Nisekoi\" to AniList 900002, \"Nisekoi:\"\n\
+             \"Nisekoi Season 2\" to AniList 900001, \"Nisekoi\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_whose_entry_left_the_list_is_listed_with_why_it_is_not_in_force() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(mapping("Nisekoi", 900_002), &daemon.socket).await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        daemon
+            .store
+            .lock()
+            .expect("the store")
+            .file(BACKEND, &[an_entry(900_001, "Nisekoi")])
+            .expect("the list is filed");
+
+        let (outcome, shown, complained) = go(names(), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "\"Nisekoi\" to \"Nisekoi:\", not in force: its entry is not on the list\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_whose_entry_left_the_list_is_displaced_by_a_name_of_its_key() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(mapping("Nisekoi", 900_002), &daemon.socket).await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        daemon
+            .store
+            .lock()
+            .expect("the store")
+            .file(BACKEND, &[an_entry(900_001, "Nisekoi")])
+            .expect("the list is filed");
+
+        let (outcome, shown, complained) = go(mapping("nisekoi", 900_001), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "mapped: \"nisekoi\" to AniList 900001, \"Nisekoi\", in place of \"Nisekoi:\"\n"
+        );
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "\"nisekoi\" to AniList 900001, \"Nisekoi\"\n");
+    }
+
+    #[tokio::test]
+    async fn a_name_taken_back_is_said_as_it_was_given_and_is_listed_no_more() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(mapping("Nisekoi", 900_002), &daemon.socket).await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+
+        let (outcome, shown, complained) = go(removing("nisekoi"), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(shown, "removed: \"Nisekoi\"\n");
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "nothing is mapped\n");
+    }
+
+    #[tokio::test]
+    async fn taking_back_a_name_never_given_fails_and_says_so() {
+        // A name typed wrong removes nothing, and a script is told.
+        let daemon = Daemon::listening(Vec::new());
+
+        let (outcome, shown, complained) = go(removing("Nisekoi"), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(complained, "benshi: \"Nisekoi\" is not mapped\n");
+    }
+
+    #[tokio::test]
+    async fn a_map_the_daemon_refuses_says_why() {
+        for command in [mapping("Nisekoi", 900_002), removing("Nisekoi"), names()] {
+            let named = format!("{command:?}");
+            let (_home, socket, answering) = a_daemon_that_answers_with(&Response::Error {
+                message: "not today".to_owned(),
+            });
+
+            let (outcome, shown, complained) = timeout(PATIENCE, go(command, &socket))
+                .await
+                .expect("the client ended");
+            answering.abort();
+
+            assert_eq!(outcome, ExitCode::FAILURE, "{named}");
+            assert!(shown.is_empty(), "{named}: {shown}");
+            assert_eq!(complained, "benshi: not today\n", "{named}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_map_that_cannot_be_printed_is_a_failure_that_says_so() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        for (command, said) in [
+            (
+                mapping("Nisekoi", 900_002),
+                "benshi: mapping could not be printed: broken pipe\n",
+            ),
+            (names(), "benshi: names could not be printed: broken pipe\n"),
+            (
+                removing("Nisekoi"),
+                "benshi: removal could not be printed: broken pipe\n",
+            ),
+        ] {
+            let mut err = Shared::default();
+            let outcome = run(command, &daemon.socket, untyped, &mut Unwritable, &mut err).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert_eq!(err.text(), said);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_map_of_neither_kind_asks_nothing_and_says_what_a_map_takes() {
+        // The parser refuses these; a command built in code is refused here.
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        for command in [
+            Command::Map {
+                name: Some("Nisekoi".to_owned()),
+                anilist: None,
+                remove: false,
+            },
+            Command::Map {
+                name: None,
+                anilist: Some(900_002),
+                remove: false,
+            },
+            Command::Map {
+                name: None,
+                anilist: None,
+                remove: true,
+            },
+            Command::Map {
+                name: Some("Nisekoi".to_owned()),
+                anilist: Some(900_002),
+                remove: true,
+            },
+        ] {
+            let named = format!("{command:?}");
+            let (outcome, shown, complained) = go(command, &daemon.socket).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE, "{named}");
+            assert!(shown.is_empty(), "{named}: {shown}");
+            assert_eq!(
+                complained, "benshi: map takes a name with --anilist or --remove, or nothing\n",
+                "{named}"
+            );
+        }
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "nothing is mapped\n");
     }
 }

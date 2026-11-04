@@ -30,6 +30,7 @@ use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
 use crate::ipc::Server;
 use crate::listing::{Listing, Reader, Source, Wakes};
+use crate::mapping::Mapping;
 use crate::recognition::{Current, Decided, Recognizer};
 #[cfg(unix)]
 use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
@@ -48,6 +49,8 @@ pub mod detection;
 pub mod ipc;
 
 pub mod listing;
+
+pub mod mapping;
 
 pub mod panics;
 
@@ -147,6 +150,7 @@ where
         wiring.decided.clone(),
         accounts,
         wiring.wakes.clone(),
+        Mapping::new(Arc::clone(&wiring.store), wiring.recognizer.clone()),
     ));
     let reader = Arc::new(Reader::new(
         list.source,

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use benshi_core::ShowId;
 use benshi_core::list::Entry;
-use benshi_core::recognize::altname::Altnames;
+use benshi_core::recognize::altname::{Altnames, Unnameable};
 use benshi_core::recognize::corpus::Corpus;
 use benshi_core::settle::Facts;
 use benshi_core::token::Token;
@@ -52,7 +52,7 @@ pub const LAST_RETRY: Duration = Duration::from_hours(1);
 const NO_TOKEN: &str = "no AniList token, so no list is read: benshi login keeps one";
 
 /// The backend a list is filed under in the store.
-const BACKEND: &str = ANILIST.backend;
+pub const BACKEND: &str = ANILIST.backend;
 
 /// What wakes the list's task before its time: a name a round decided the
 /// list does not hold, and a token a login kept. Cloning shares them.
@@ -150,25 +150,61 @@ pub struct Listing<S> {
 }
 
 /// A recognizer of these shows of a list and their entries, each filed with
-/// the facts that settle what is recognized as it.
+/// the facts that settle what is recognized as it, and of the names the user
+/// gave them, as [`named`] reads them.
 #[must_use]
-pub fn recognizer_of(listed: &[(ShowId, Entry)]) -> Recognizer {
+pub fn recognizer_of(listed: &[(ShowId, Entry)], assigned: &[(String, ShowId)]) -> Recognizer {
+    let corpus = corpus_of(listed);
+    let (altnames, _not_in_force) = named(&corpus, assigned);
+
+    Recognizer::of(corpus, altnames)
+}
+
+/// The corpus of these shows of a list, each filed with the facts of its
+/// entry.
+#[must_use]
+pub fn corpus_of(listed: &[(ShowId, Entry)]) -> Corpus {
     let mut corpus = Corpus::new();
     for (show, entry) in listed {
         corpus.file(*show, &entry.title, &entry.spellings);
         corpus.file_facts(*show, Facts::from(entry));
     }
-
-    Recognizer::of(corpus, Altnames::new())
+    corpus
 }
 
-/// A recognizer of the list the store holds.
+/// The names the user gave, each made again against `corpus`, and those not
+/// in force with the reason.
+///
+/// A name is not in force where its show has no entry on the list, or where
+/// its text now means one other entry of its own, as
+/// [`Altnames::name`](benshi_core::recognize::altname::Altnames::name) refuses
+/// it as it is made. It stays kept, and is in force again once the list holds
+/// what it was made against.
+#[must_use]
+pub fn named(
+    corpus: &Corpus,
+    assigned: &[(String, ShowId)],
+) -> (Altnames, Vec<(String, ShowId, Unnameable)>) {
+    let mut altnames = Altnames::new();
+    let mut not_in_force = Vec::new();
+    for (spelled, show) in assigned {
+        if let Err(refused) = altnames.name(spelled, *show, corpus) {
+            not_in_force.push((spelled.clone(), *show, refused));
+        }
+    }
+    (altnames, not_in_force)
+}
+
+/// A recognizer of the list the store holds, and of the names kept there.
 ///
 /// # Errors
 ///
-/// What [`Store::listed`] fails with.
+/// What [`Store::listed`] and [`Store::assignments`] fail with.
 pub fn kept(store: &Store) -> Result<Recognizer, benshi_store::Error> {
-    store.listed(BACKEND).map(|listed| recognizer_of(&listed))
+    Ok(recognizer_of(
+        &store.listed(BACKEND)?,
+        &store.assignments()?,
+    ))
 }
 
 /// The list's task: what it reads from, when, and where it puts what it read.
@@ -288,8 +324,7 @@ impl<S: Source + Sync> Reader<S> {
             Ok(entries) => {
                 let count = entries.len();
                 match self.filed(entries).await {
-                    Ok(recognizer) => {
-                        self.current.replace(recognizer);
+                    Ok(()) => {
                         *said = None;
                         let entries = if count == 1 { "entry" } else { "entries" };
                         (self.say)(&format!("AniList list read: {count} {entries}"));
@@ -322,20 +357,23 @@ impl<S: Source + Sync> Reader<S> {
         }
     }
 
-    /// File `entries` as the list, and answer with a recognizer of what the
-    /// store then holds, or with why it could not be kept.
-    async fn filed(&self, entries: Vec<Entry>) -> Result<Recognizer, String> {
+    /// File `entries` as the list and put a recognizer of what the store then
+    /// holds in place, or answer with why it could not be kept.
+    ///
+    /// Built and put in place under the store's lock, as a name the user
+    /// gives is, so neither puts in place what the other has outdated.
+    async fn filed(&self, entries: Vec<Entry>) -> Result<(), String> {
         let store = Arc::clone(&self.store);
+        let current = self.current.clone();
         let filing = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().expect(POISONED_STORE);
             store.file(BACKEND, &entries)?;
-            store.listed(BACKEND)
+            current.replace(kept(&store)?);
+            Ok::<(), benshi_store::Error>(())
         });
 
         match filing.await {
-            Ok(listed) => listed
-                .map(|listed| recognizer_of(&listed))
-                .map_err(|unkept| unkept.to_string()),
+            Ok(filed) => filed.map_err(|unkept| unkept.to_string()),
             // Handed on as it was raised.
             Err(panicked) if panicked.is_panic() => {
                 std::panic::resume_unwind(panicked.into_panic())
@@ -388,7 +426,8 @@ mod tests {
 
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
-    use benshi_core::recognize::Recognition;
+    use benshi_core::recognize::altname::Unnameable;
+    use benshi_core::recognize::{Recognition, Stage};
     use benshi_core::settle::{Fact, Settled};
     use benshi_core::token::Token;
     use benshi_core::{Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId};
@@ -397,7 +436,10 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio::time::Instant;
 
-    use super::{BACKEND, FIRST_RETRY, LAST_RETRY, Reader, Source, Wakes, kept, recognizer_of};
+    use super::{
+        BACKEND, FIRST_RETRY, LAST_RETRY, Reader, Source, Wakes, corpus_of, kept, named,
+        recognizer_of,
+    };
     use crate::config::{Period, Reading};
     use crate::recognition::{Current, Recognizer};
     use crate::secrets;
@@ -631,8 +673,8 @@ mod tests {
         // the entry only where its spellings are filed.
         spelled[0].1.spellings = vec!["Kotonaru Namae".to_owned()];
 
-        let recognizer = recognizer_of(&listed);
-        let spelled = recognizer_of(&spelled);
+        let recognizer = recognizer_of(&listed, &[]);
+        let spelled = recognizer_of(&spelled, &[]);
 
         assert!(recognizes(&recognizer, "Show Title"));
         assert!(recognizes(&recognizer, "Another Show"));
@@ -651,7 +693,7 @@ mod tests {
         // a work that has not been released.
         let mut announced = an_entry(900_001, "Show Title");
         announced.released = false;
-        let recognizer = recognizer_of(&[(ShowId(1), announced)]);
+        let recognizer = recognizer_of(&[(ShowId(1), announced)], &[]);
         let path = RawPath::from_bytes(b"[Group] Show Title - 03.mkv".to_vec());
         let reading = PlayerSnapshot {
             player: PlayerId("mpv".to_owned()),
@@ -670,6 +712,119 @@ mod tests {
                 show: ShowId(1),
                 fact: Fact::NotReleased,
             }
+        );
+    }
+
+    /// Two entries a name cannot tell apart, the second told by a mark.
+    fn two_of_one_name() -> Vec<(ShowId, Entry)> {
+        vec![
+            (ShowId(1), an_entry(900_001, "Nisekoi")),
+            (ShowId(2), an_entry(900_002, "Nisekoi:")),
+        ]
+    }
+
+    /// What `recognizer` answers for a file of the name both entries share.
+    fn answered(recognizer: &Recognizer) -> Recognition {
+        recognizer
+            .decide(&RawPath::from_bytes(b"[Group] Nisekoi - 03.mkv".to_vec()))
+            .1
+    }
+
+    #[test]
+    fn a_recognizer_reads_a_name_the_user_gave_an_entry() {
+        let unnamed = recognizer_of(&two_of_one_name(), &[]);
+        let named = recognizer_of(&two_of_one_name(), &[("Nisekoi".to_owned(), ShowId(2))]);
+
+        assert!(
+            matches!(answered(&unnamed), Recognition::Ambiguous(_)),
+            "{:?}",
+            answered(&unnamed)
+        );
+        assert!(
+            matches!(
+                answered(&named),
+                Recognition::Recognized(found)
+                    if found.show == ShowId(2) && matches!(found.stage, Stage::Altname(_))
+            ),
+            "{:?}",
+            answered(&named)
+        );
+    }
+
+    #[test]
+    fn a_name_given_an_entry_the_list_does_not_hold_is_not_in_force() {
+        let corpus = corpus_of(&two_of_one_name());
+
+        let (altnames, refused) = named(&corpus, &[("Nisekoi".to_owned(), ShowId(3))]);
+
+        assert_eq!(altnames.assignments().count(), 0);
+        assert_eq!(
+            refused,
+            [(
+                "Nisekoi".to_owned(),
+                ShowId(3),
+                Unnameable::NotOnTheList { show: ShowId(3) }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_recognizer_of_the_store_reads_the_names_kept_there() {
+        let home = tempfile::tempdir().expect("a directory of our own");
+        let mut store = Store::open(&home.path().join("benshi.db")).expect("the database opens");
+        let sequel = the_sequel_named(&mut store);
+
+        let recognizer = kept(&store).expect("the list reads");
+
+        assert!(
+            matches!(answered(&recognizer), Recognition::Recognized(found) if found.show == sequel),
+            "{:?}",
+            answered(&recognizer)
+        );
+    }
+
+    /// File [`two_of_one_name`] in `store`, keep that `Nisekoi` means the
+    /// sequel, and answer the sequel's show.
+    fn the_sequel_named(store: &mut Store) -> ShowId {
+        let entries: Vec<Entry> = two_of_one_name()
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        store.file(BACKEND, &entries).expect("the list is filed");
+        let listed = store.listed(BACKEND).expect("the list reads");
+        let (sequel, _) = listed
+            .iter()
+            .find(|(_, entry)| entry.title == "Nisekoi:")
+            .expect("the sequel is filed");
+        store
+            .assign("Nisekoi", *sequel, &[])
+            .expect("the name is kept");
+        *sequel
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_kept_in_the_store_is_in_force_once_the_list_is_read_again() {
+        let home = tempfile::tempdir().expect("a directory of our own");
+        let mut store = Store::open(&home.path().join("benshi.db")).expect("the database opens");
+        let sequel = the_sequel_named(&mut store);
+        let entries = two_of_one_name()
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        let running = running(
+            home,
+            store,
+            Reading::default(),
+            Scripted::new().lists([Ok(entries)]),
+        );
+
+        after(NOW).await;
+
+        assert_eq!(running.said(), ["AniList list read: 2 entries"]);
+        let answer = answered(&running.current.now());
+        assert!(
+            matches!(&answer, Recognition::Recognized(found) if found.show == sequel),
+            "{answer:?}"
         );
     }
 

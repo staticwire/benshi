@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Written by hand rather than computed, so that adding a migration is a
 /// change in two places that a test holds together.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Every migration, in order, each a script of statements.
 ///
@@ -113,6 +113,12 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         part INTEGER
     );
     CREATE UNIQUE INDEX names_by_key ON names (letters, marks, IFNULL(season, -1), IFNULL(part, -1));",
+    // `assignments` holds a name the user gave an entry, as they typed it,
+    // and the show it means; its key is built from the text when it is read.
+    "CREATE TABLE assignments (
+        spelled TEXT NOT NULL UNIQUE,
+        show INTEGER NOT NULL REFERENCES shows(id)
+    );",
 ];
 
 /// Apply every migration the database has not seen, in order.
@@ -353,6 +359,27 @@ mod tests {
         assert_eq!(
             columns(&connection, "names"),
             ["show", "letters", "marks", "season", "part"]
+        );
+    }
+
+    #[test]
+    fn migration_five_creates_the_names_the_user_gave() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+        apply(&mut connection, &MIGRATIONS[..5]).expect("the fifth migration applies");
+        connection
+            .execute_batch("INSERT INTO shows (title) VALUES ('Show Title');")
+            .expect("the show is filed");
+        let a_row = "INSERT INTO assignments (spelled, show) VALUES ('Show Title', 1)";
+        connection
+            .execute(a_row, [])
+            .expect("the first row goes in");
+
+        let again = connection.execute(a_row, []);
+
+        assert_eq!(columns(&connection, "assignments"), ["spelled", "show"]);
+        assert!(
+            refused_by(&again, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            "{again:?}"
         );
     }
 

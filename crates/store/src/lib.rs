@@ -17,6 +17,7 @@
 //! television, where the system may delete it between runs. Which directory
 //! that is belongs to the layer that knows the platform.
 
+mod assignments;
 mod list;
 mod migrate;
 mod names;
@@ -30,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use benshi_core::ShowId;
 use benshi_core::list::EntryId;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub use migrate::SCHEMA_VERSION;
 pub use record::Viewing;
@@ -288,6 +289,24 @@ impl Store {
 
         Ok(ShowId(id))
     }
+
+    /// The title a show is filed under, and nothing where no show is filed
+    /// under that id.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the database cannot be read because another
+    /// connection has it, and [`Error::Write`] when it cannot be read for
+    /// any other reason.
+    pub fn title_of(&self, show: ShowId) -> Result<Option<String>, Error> {
+        let title = self
+            .connection
+            .query_row("SELECT title FROM shows WHERE id = ?1", [show.0], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(title)
+    }
 }
 
 /// Make sure the database's directory exists, private where this call is what
@@ -376,6 +395,19 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("the version is in the header");
         assert_eq!(from_the_file, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_show_is_found_by_its_id_and_an_id_filed_nowhere_is_none() {
+        let (_home, database) = a_home();
+        let store = Store::open(&database).expect("a fresh database opens");
+        let show = store.new_show("Show Title").expect("the show is filed");
+
+        assert_eq!(
+            store.title_of(show).expect("the store answers"),
+            Some("Show Title".to_owned())
+        );
+        assert_eq!(store.title_of(ShowId(42)).expect("the store answers"), None);
     }
 
     #[test]
