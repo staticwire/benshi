@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Written by hand rather than computed, so that adding a migration is a
 /// change in two places that a test holds together.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Every migration, in order, each a script of statements.
 ///
@@ -131,6 +131,24 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         entry_last INTEGER NOT NULL CHECK (entry_last BETWEEN entry_first AND 4294967295),
         CHECK (last - first = entry_last - entry_first),
         UNIQUE (backend, show, first)
+    );",
+    // Where each backend is in the log `sync_queue`: the last operation done, the
+    // write decided and not yet confirmed, as JSON, and what it set aside, and why.
+    "CREATE TABLE cursors (
+        backend TEXT NOT NULL PRIMARY KEY,
+        operation INTEGER NOT NULL REFERENCES sync_queue(id)
+    );
+    CREATE TABLE decided (
+        backend TEXT NOT NULL,
+        operation INTEGER NOT NULL REFERENCES sync_queue(id),
+        write TEXT NOT NULL,
+        PRIMARY KEY (backend, operation)
+    );
+    CREATE TABLE set_aside (
+        backend TEXT NOT NULL,
+        operation INTEGER NOT NULL REFERENCES sync_queue(id),
+        reason TEXT NOT NULL,
+        PRIMARY KEY (backend, operation)
     );",
 ];
 
@@ -443,6 +461,50 @@ mod tests {
             assert!(
                 refused_by(&refused, rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
                 "{not_a_pin:?}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_seven_holds_where_each_backend_is_in_the_log() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+        apply(&mut connection, &MIGRATIONS[..7]).expect("the seventh migration applies");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 INSERT INTO shows (title) VALUES ('Show Title');
+                 INSERT INTO sync_queue (show, kind, payload, created_at)
+                 VALUES (1, 'progress', '{\"episode\":1}', '2026-11-05T00:00:00Z');",
+            )
+            .expect("an operation is queued");
+        let rows = [
+            "INSERT INTO cursors (backend, operation) VALUES (?1, ?2)",
+            "INSERT INTO decided (backend, operation, write) VALUES (?1, ?2, '{}')",
+            "INSERT INTO set_aside (backend, operation, reason) VALUES (?1, ?2, 'a reason')",
+        ];
+
+        assert_eq!(columns(&connection, "cursors"), ["backend", "operation"]);
+        assert_eq!(
+            columns(&connection, "decided"),
+            ["backend", "operation", "write"]
+        );
+        assert_eq!(
+            columns(&connection, "set_aside"),
+            ["backend", "operation", "reason"]
+        );
+        for row in rows {
+            connection
+                .execute(row, rusqlite::params!["anilist", 1])
+                .expect("the first row goes in");
+            let again = connection.execute(row, rusqlite::params!["anilist", 1]);
+            assert!(
+                refused_by(&again, rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
+                "{row}: {again:?}"
+            );
+            let elsewhere = connection.execute(row, rusqlite::params!["another", 2]);
+            assert!(
+                refused_by(&elsewhere, rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                "an operation that is not in the log, {row}: {elsewhere:?}"
             );
         }
     }
