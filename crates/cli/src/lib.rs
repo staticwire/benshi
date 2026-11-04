@@ -11,7 +11,8 @@
 //! by what. `benshi login` has the daemon ask AniList whose a token is and keep
 //! it in the secret store, and `benshi logout` has it removed. `benshi map`
 //! makes a name mean one entry of the list, for a name the list spells for
-//! several entries or for none, and lists the names given.
+//! several entries or for none, and keeps episodes of a show as episodes of
+//! an entry; alone, it lists the names given and the episodes mapped.
 //!
 //! The client renders; it never decides. Anything it shows came from the daemon
 //! in that answer, so two runs of `benshi sources` a second apart can differ and
@@ -110,7 +111,8 @@ pub fn main(arguments: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use crate::commands::{Command, PolicyArgument};
+    use crate::commands::{Command, EntryArgument, Ep, PolicyArgument};
+    use benshi_core::pin::Episodes;
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -186,10 +188,16 @@ mod tests {
             asked.command,
             Command::Map {
                 name: None,
+                ep: None,
+                episodes: None,
                 anilist: None,
                 remove: false,
             }
         );
+    }
+
+    fn run(first: u32, last: u32) -> Episodes {
+        Episodes::new(first, last).expect("a run from its first episode to its last")
     }
 
     #[test]
@@ -201,7 +209,12 @@ mod tests {
             asked.command,
             Command::Map {
                 name: Some("Show Title".to_owned()),
-                anilist: Some(12345),
+                ep: None,
+                episodes: None,
+                anilist: Some(EntryArgument {
+                    entry: 12345,
+                    episodes: None,
+                }),
                 remove: false,
             }
         );
@@ -216,6 +229,82 @@ mod tests {
             asked.command,
             Command::Map {
                 name: Some("Show Title".to_owned()),
+                ep: None,
+                episodes: None,
+                anilist: None,
+                remove: true,
+            }
+        );
+    }
+
+    #[test]
+    fn episodes_of_a_show_are_mapped_after_ep_to_episodes_of_an_entry_after_a_colon() {
+        let asked = Cli::try_parse_from([
+            "benshi",
+            "map",
+            "Show Title",
+            "ep",
+            "14-26",
+            "--anilist",
+            "12345:1-13",
+        ])
+        .expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Map {
+                name: Some("Show Title".to_owned()),
+                ep: Some(Ep::Ep),
+                episodes: Some(run(14, 26)),
+                anilist: Some(EntryArgument {
+                    entry: 12345,
+                    episodes: Some(run(1, 13)),
+                }),
+                remove: false,
+            }
+        );
+    }
+
+    #[test]
+    fn one_episode_is_typed_as_its_number() {
+        let asked = Cli::try_parse_from([
+            "benshi",
+            "map",
+            "Show Title",
+            "ep",
+            "2",
+            "--anilist",
+            "678:1",
+        ])
+        .expect("parses");
+
+        let Command::Map {
+            episodes, anilist, ..
+        } = asked.command
+        else {
+            panic!("expected a map, got {:?}", asked.command);
+        };
+        assert_eq!(episodes, Some(run(2, 2)));
+        assert_eq!(
+            anilist,
+            Some(EntryArgument {
+                entry: 678,
+                episodes: Some(run(1, 1)),
+            })
+        );
+    }
+
+    #[test]
+    fn episodes_mapped_are_taken_back_with_remove() {
+        let asked = Cli::try_parse_from(["benshi", "map", "Show Title", "ep", "14-26", "--remove"])
+            .expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Map {
+                name: Some("Show Title".to_owned()),
+                ep: Some(Ep::Ep),
+                episodes: Some(run(14, 26)),
                 anilist: None,
                 remove: true,
             }
@@ -224,8 +313,8 @@ mod tests {
 
     #[test]
     fn a_map_that_asks_for_no_one_thing_is_refused() {
-        // A name alone could be either of two requests, and an entry or a
-        // removal without a name has nothing to act on.
+        // A name alone could be either request, a flag alone acts on nothing,
+        // and episodes are one number or two joined by a dash, in order.
         for refused in [
             &["benshi", "map", "Show Title"][..],
             &["benshi", "map", "--anilist", "12345"],
@@ -239,6 +328,25 @@ mod tests {
                 "--remove",
             ],
             &["benshi", "map", "Show Title", "--anilist", "soon"],
+            &["benshi", "map", "Show Title", "ep", "14-26"],
+            &["benshi", "map", "Show Title", "ep", "--remove"],
+            &["benshi", "map", "Show Title", "14-26", "--remove"],
+            &["benshi", "map", "Show Title", "ep", "26-14", "--remove"],
+            &["benshi", "map", "Show Title", "ep", "two", "--remove"],
+            &["benshi", "map", "Show Title", "ep", "-2", "--remove"],
+            &["benshi", "map", "Show Title", "--anilist", "12345:13-1"],
+            &["benshi", "map", "Show Title", "--anilist", "12345:"],
+            &["benshi", "map", "Show Title", "--anilist", ":1-13"],
+            &[
+                "benshi",
+                "map",
+                "Show Title",
+                "ep",
+                "14-26",
+                "--anilist",
+                "12345:1-13",
+                "--remove",
+            ],
         ] {
             assert!(Cli::try_parse_from(refused).is_err(), "{refused:?}");
         }

@@ -28,8 +28,8 @@ use crate::accounts::{Accounts, LoggedIn};
 use crate::bus::EventBus;
 use crate::detection::Seen;
 use crate::listing::Wakes;
-use crate::mapping::Mapping;
-use crate::protocol::{Explanation, NameListing, Request, Response, SourceListing};
+use crate::mapping::{Mapping, Refused};
+use crate::protocol::{Explanation, NameListing, PinListing, Request, Response, SourceListing};
 use crate::recognition::Decided;
 use crate::supervisor::TaskError;
 
@@ -427,31 +427,41 @@ impl Server {
                         },
                     }
                 }
-                Ok(Request::Map { spelled, anilist }) => {
-                    match self.mapping.map(spelled, EntryId(anilist)).await {
-                        Ok(mapped) => Response::Mapped {
-                            spelled: mapped.spelled,
-                            anilist: mapped.entry.0,
-                            title: mapped.title,
-                            replaced: mapped.replaced.as_ref().map(NameListing::meant),
-                        },
-                        Err(refused) => Response::Error {
-                            message: refused.to_string(),
-                        },
-                    }
+                Ok(Request::Map { spelled, anilist }) => answered(
+                    self.mapping.map(spelled, EntryId(anilist)).await,
+                    |mapped| Response::Mapped {
+                        spelled: mapped.spelled,
+                        anilist: mapped.entry.0,
+                        title: mapped.title,
+                        replaced: mapped.replaced.as_ref().map(NameListing::meant),
+                    },
+                ),
+                Ok(Request::Unmap { spelled }) => {
+                    answered(self.mapping.unmap(spelled).await, Response::Unmapped)
                 }
-                Ok(Request::Unmap { spelled }) => match self.mapping.unmap(spelled).await {
-                    Ok(taken) => Response::Unmapped(taken),
-                    Err(refused) => Response::Error {
-                        message: refused.to_string(),
+                Ok(Request::Names) => answered(self.mapping.given().await, |given| {
+                    Response::Names(given.iter().map(NameListing::of).collect())
+                }),
+                Ok(Request::Pin {
+                    show,
+                    episodes,
+                    anilist,
+                    entry_episodes,
+                }) => answered(
+                    self.mapping
+                        .pin(show, episodes, EntryId(anilist), entry_episodes)
+                        .await,
+                    |pinning| Response::Pinned {
+                        pinned: PinListing::of(&pinning.made),
+                        replaced: pinning.replaced.as_ref().map(PinListing::of),
                     },
-                },
-                Ok(Request::Names) => match self.mapping.given().await {
-                    Ok(given) => Response::Names(given.iter().map(NameListing::of).collect()),
-                    Err(refused) => Response::Error {
-                        message: refused.to_string(),
-                    },
-                },
+                ),
+                Ok(Request::Unpin { show, episodes }) => {
+                    answered(self.mapping.unpin(show, episodes).await, Response::Unpinned)
+                }
+                Ok(Request::Pins) => answered(self.mapping.pins().await, |pins| {
+                    Response::Pins(pins.iter().map(PinListing::of).collect())
+                }),
                 // A stream rather than an answer, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
@@ -513,6 +523,19 @@ impl Server {
     }
 }
 
+/// The answer to a request carried out, or the error it was refused with.
+fn answered<T>(
+    asked: std::result::Result<T, Refused>,
+    answer: impl FnOnce(T) -> Response,
+) -> Response {
+    match asked {
+        Ok(done) => answer(done),
+        Err(refused) => Response::Error {
+            message: refused.to_string(),
+        },
+    }
+}
+
 /// Write one answer and make sure it has left.
 ///
 /// Flushed per answer rather than per batch: a stream a client is watching is
@@ -544,12 +567,13 @@ mod tests {
     use crate::detection::Seen;
     use crate::listing::Wakes;
     use crate::mapping::Mapping;
-    use crate::protocol::{NameListing, Outcome, Request, Response};
+    use crate::protocol::{NameListing, Outcome, PinListing, Request, Response};
     use crate::recognition::{Current, Decided, Decision, Recognizer};
     use crate::secrets;
     use benshi_core::clock::Timestamp;
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
+    use benshi_core::pin::Episodes;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognize::parse::Episode;
     use benshi_core::settle::Settled;
@@ -975,6 +999,93 @@ mod tests {
             client.answer().await,
             Response::Error {
                 message: "AniList 999 is not on the list".to_owned()
+            }
+        );
+    }
+
+    fn run(first: u32, last: u32) -> Episodes {
+        Episodes::new(first, last).expect("a run from its first episode to its last")
+    }
+
+    #[tokio::test]
+    async fn episodes_pinned_are_answered_with_their_entry_listed_and_taken_back() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+        let listed = PinListing {
+            show: "Nisekoi".to_owned(),
+            episodes: run(13, 24),
+            anilist: 900_002,
+            entry_episodes: run(1, 12),
+            title: Some("Nisekoi:".to_owned()),
+        };
+
+        client
+            .ask(&Request::Pin {
+                show: "Nisekoi".to_owned(),
+                episodes: run(13, 24),
+                anilist: 900_002,
+                entry_episodes: run(1, 12),
+            })
+            .await;
+        let pinned = client.answer().await;
+        client.ask(&Request::Pins).await;
+        let pins = client.answer().await;
+        client
+            .ask(&Request::Unpin {
+                show: "Nisekoi".to_owned(),
+                episodes: run(13, 24),
+            })
+            .await;
+        let taken = client.answer().await;
+        client.ask(&Request::Pins).await;
+        let none = client.answer().await;
+
+        assert_eq!(
+            pinned,
+            Response::Pinned {
+                pinned: listed.clone(),
+                replaced: None,
+            }
+        );
+        assert_eq!(pins, Response::Pins(vec![listed]));
+        assert_eq!(taken, Response::Unpinned(Some("Nisekoi".to_owned())));
+        assert_eq!(none, Response::Pins(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_pin_refused_or_taken_back_from_a_show_no_title_names_is_answered_with_why() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Pin {
+                show: "Nisekoi".to_owned(),
+                episodes: run(13, 24),
+                anilist: 900_002,
+                entry_episodes: run(1, 11),
+            })
+            .await;
+        let pinned = client.answer().await;
+        client
+            .ask(&Request::Unpin {
+                show: "Another Show".to_owned(),
+                episodes: run(13, 24),
+            })
+            .await;
+        let taken = client.answer().await;
+
+        assert_eq!(
+            pinned,
+            Response::Error {
+                message: "episodes 13-24 and episodes 1-11 are not of one length".to_owned()
+            }
+        );
+        assert_eq!(
+            taken,
+            Response::Error {
+                message: "no show is titled \"Another Show\"".to_owned()
             }
         );
     }

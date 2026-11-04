@@ -21,6 +21,7 @@ mod assignments;
 mod list;
 mod migrate;
 mod names;
+mod pins;
 pub mod queue;
 mod record;
 pub mod watching;
@@ -290,6 +291,23 @@ impl Store {
         Ok(ShowId(id))
     }
 
+    /// Every show filed, with its title, in the order they were filed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the database cannot be read because another
+    /// connection has it, and [`Error::Write`] when it cannot be read for
+    /// any other reason.
+    pub fn shows(&self) -> Result<Vec<(ShowId, String)>, Error> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, title FROM shows ORDER BY id")?;
+        let shows = statement
+            .query_map([], |row| Ok((ShowId(row.get(0)?), row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(shows)
+    }
+
     /// The title a show is filed under, and nothing where no show is filed
     /// under that id.
     ///
@@ -408,6 +426,22 @@ mod tests {
             Some("Show Title".to_owned())
         );
         assert_eq!(store.title_of(ShowId(42)).expect("the store answers"), None);
+    }
+
+    #[test]
+    fn every_show_is_read_with_its_title_in_the_order_filed() {
+        // Two shows may share a title, and both are read.
+        let (_home, database) = a_home();
+        let store = Store::open(&database).expect("a fresh database opens");
+        let filed: Vec<(ShowId, String)> = ["Show Title", "Other Title", "Show Title"]
+            .into_iter()
+            .map(|title| {
+                let show = store.new_show(title).expect("the show is filed");
+                (show, title.to_owned())
+            })
+            .collect();
+
+        assert_eq!(store.shows().expect("the store answers"), filed);
     }
 
     #[test]

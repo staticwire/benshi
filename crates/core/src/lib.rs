@@ -9,6 +9,7 @@ pub mod clock;
 pub mod encoding;
 pub mod list;
 pub mod path;
+pub mod pin;
 pub mod policy;
 pub mod recognize;
 pub mod session;

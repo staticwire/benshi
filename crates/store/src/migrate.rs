@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Written by hand rather than computed, so that adding a migration is a
 /// change in two places that a test holds together.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Every migration, in order, each a script of statements.
 ///
@@ -118,6 +118,19 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     "CREATE TABLE assignments (
         spelled TEXT NOT NULL UNIQUE,
         show INTEGER NOT NULL REFERENCES shows(id)
+    );",
+    // `pins` holds episodes of a show the user said are as many episodes of
+    // an entry of a backend: two runs of one length, each first to last.
+    "CREATE TABLE pins (
+        backend TEXT NOT NULL,
+        show INTEGER NOT NULL REFERENCES shows(id),
+        first INTEGER NOT NULL CHECK (first BETWEEN 0 AND 4294967295),
+        last INTEGER NOT NULL CHECK (last BETWEEN first AND 4294967295),
+        entry INTEGER NOT NULL,
+        entry_first INTEGER NOT NULL CHECK (entry_first BETWEEN 1 AND 4294967295),
+        entry_last INTEGER NOT NULL CHECK (entry_last BETWEEN entry_first AND 4294967295),
+        CHECK (last - first = entry_last - entry_first),
+        UNIQUE (backend, show, first)
     );",
 ];
 
@@ -381,6 +394,57 @@ mod tests {
             refused_by(&again, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             "{again:?}"
         );
+    }
+
+    #[test]
+    fn migration_six_holds_a_pin_of_two_runs_of_one_length() {
+        let mut connection = Connection::open_in_memory().expect("memory opens");
+        apply(&mut connection, &MIGRATIONS[..6]).expect("the sixth migration applies");
+        connection
+            .execute_batch("INSERT INTO shows (title) VALUES ('Show Title');")
+            .expect("the show is filed");
+        let pin = |first: i64, last: i64, entry_first: i64, entry_last: i64| {
+            connection.execute(
+                "INSERT INTO pins (backend, show, first, last, entry, entry_first, entry_last) \
+                 VALUES ('anilist', 1, ?1, ?2, 12345, ?3, ?4)",
+                [first, last, entry_first, entry_last],
+            )
+        };
+
+        pin(14, 26, 1, 13).expect("a pin of two runs of one length goes in");
+
+        assert_eq!(
+            columns(&connection, "pins"),
+            [
+                "backend",
+                "show",
+                "first",
+                "last",
+                "entry",
+                "entry_first",
+                "entry_last"
+            ]
+        );
+        let again = pin(14, 20, 1, 7);
+        assert!(
+            refused_by(&again, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            "a second pin from the same episode: {again:?}"
+        );
+        for not_a_pin in [
+            (30, 40, 1, 10),
+            (40, 30, 11, 1),
+            (30, 30, 0, 0),
+            (-1, 0, 1, 2),
+            (4_294_967_296, 4_294_967_296, 1, 1),
+            (30, 30, 4_294_967_296, 4_294_967_296),
+        ] {
+            let (first, last, entry_first, entry_last) = not_a_pin;
+            let refused = pin(first, last, entry_first, entry_last);
+            assert!(
+                refused_by(&refused, rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+                "{not_a_pin:?}: {refused:?}"
+            );
+        }
     }
 
     #[test]

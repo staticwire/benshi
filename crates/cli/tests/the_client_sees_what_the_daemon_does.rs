@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use benshi_cli::commands::{Command, PolicyArgument, run};
+use benshi_cli::commands::{Command, EntryArgument, PolicyArgument, run};
 use benshi_cli::prompt::Typed;
 use benshi_core::clock::Timestamp;
 use benshi_core::list::{Entry, EntryId, Status};
@@ -339,7 +339,12 @@ async fn a_name_mapped_at_the_client_decides_the_rounds_after_it() {
     let (outcome, shown) = daemon
         .ask(Command::Map {
             name: Some("Nisekoi".to_owned()),
-            anilist: Some(900_002),
+            ep: None,
+            episodes: None,
+            anilist: Some(EntryArgument {
+                entry: 900_002,
+                episodes: None,
+            }),
             remove: false,
         })
         .await;

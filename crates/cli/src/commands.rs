@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use benshi_core::pin::Episodes;
 use benshi_core::policy::Policy;
 use benshi_core::token::Token;
 use benshi_core::trace::{TraceHeader, header_line, snapshot_line};
@@ -89,27 +90,83 @@ pub enum Command {
     /// Remove the AniList token from the secret store.
     Logout,
 
-    /// Make a name mean an entry of the list, or take that back.
+    /// Make a name mean an entry of the list, or episodes of a show mean
+    /// episodes of an entry, or take that back.
     ///
     /// With a name and --anilist, a file whose title is that name is
-    /// recognized as that entry from then on. With a name and --remove, the
-    /// name means what the list says again. With no arguments, every name
-    /// given is listed with the entry it means.
+    /// recognized as that entry from then on. With a show, ep and its
+    /// episodes, and --anilist with the entry's episodes after a colon, those
+    /// episodes of the show are kept as those episodes of the entry: ep 14-26
+    /// --anilist 12345:1-13. --remove takes either back. With no arguments,
+    /// every name given and every episode mapped is listed.
     #[command(group(ArgGroup::new("meaning").args(["anilist", "remove"])))]
     Map {
         /// The title as benshi why spells it, in quotes. Where why spells a
         /// season or a part, the name spells it too: "Show Title Season 2".
+        /// Before ep, the show as benshi why names it after recognized.
         #[arg(requires = "meaning")]
         name: Option<String>,
 
-        /// The entry the name means, by its number on AniList.
-        #[arg(long, value_name = "ID", requires = "name")]
-        anilist: Option<i64>,
+        /// The word ep, before the show's episodes.
+        #[arg(value_name = "ep", requires = "episodes", hide_possible_values = true)]
+        ep: Option<Ep>,
 
-        /// Take back what the name was made to mean.
+        /// The show's episodes, as its files number them: 14-26, or 2 for one.
+        #[arg(value_name = "EPISODES", value_parser = episodes_of)]
+        episodes: Option<Episodes>,
+
+        /// The entry, by its number on AniList. After ep, the entry's
+        /// episodes follow a colon: 12345:1-13.
+        #[arg(long, value_name = "ID", value_parser = entry_of, requires = "name")]
+        anilist: Option<EntryArgument>,
+
+        /// Take back what the name or the episodes were made to mean.
         #[arg(long, requires = "name")]
         remove: bool,
     },
+}
+
+/// The word `benshi map` takes before a show's episodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Ep {
+    /// The show's episodes follow.
+    Ep,
+}
+
+/// An entry as `--anilist` is typed: its number, and after a colon its
+/// episodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryArgument {
+    /// The entry, by its number on AniList.
+    pub entry: i64,
+    /// The entry's episodes, where a colon gives them.
+    pub episodes: Option<Episodes>,
+}
+
+/// Episodes as they are typed: `14-26`, or `2` for one.
+fn episodes_of(typed: &str) -> Result<Episodes, String> {
+    let number = |typed: &str| {
+        typed
+            .parse::<u32>()
+            .map_err(|_not_one| format!("{typed:?} is not the number of an episode"))
+    };
+    let (first, last) = match typed.split_once('-') {
+        Some((first, last)) => (number(first)?, number(last)?),
+        None => (number(typed)?, number(typed)?),
+    };
+    Episodes::new(first, last).ok_or_else(|| "the last episode comes before the first".to_owned())
+}
+
+/// An entry as `--anilist` is typed: `12345`, or `12345:1-13`.
+fn entry_of(typed: &str) -> Result<EntryArgument, String> {
+    let (entry, episodes) = match typed.split_once(':') {
+        Some((entry, episodes)) => (entry, Some(episodes_of(episodes)?)),
+        None => (typed, None),
+    };
+    let entry = entry
+        .parse()
+        .map_err(|_not_one| format!("{entry:?} is not the number of a work on AniList"))?;
+    Ok(EntryArgument { entry, episodes })
 }
 
 /// A policy as it is typed on the command line.
@@ -195,19 +252,64 @@ async fn carry_out(
         Command::Logout => logout(&mut daemon, out).await,
         Command::Map {
             name: None,
+            episodes: None,
             anilist: None,
             remove: false,
-        } => names(&mut daemon, out).await,
+            ..
+        } => maps(&mut daemon, out).await,
         Command::Map {
             name: Some(name),
-            anilist: Some(anilist),
+            episodes: None,
+            anilist:
+                Some(EntryArgument {
+                    entry,
+                    episodes: None,
+                }),
             remove: false,
-        } => map(&mut daemon, &name, anilist, out).await,
+            ..
+        } => map(&mut daemon, &name, entry, out).await,
         Command::Map {
             name: Some(name),
+            episodes: None,
             anilist: None,
             remove: true,
+            ..
         } => unmap(&mut daemon, &name, out).await,
+        Command::Map {
+            name: Some(name),
+            episodes: Some(episodes),
+            anilist:
+                Some(EntryArgument {
+                    entry,
+                    episodes: Some(entry_episodes),
+                }),
+            remove: false,
+            ..
+        } => pin(&mut daemon, &name, episodes, entry, entry_episodes, out).await,
+        Command::Map {
+            name: Some(name),
+            episodes: Some(episodes),
+            anilist: None,
+            remove: true,
+            ..
+        } => unpin(&mut daemon, &name, episodes, out).await,
+        Command::Map {
+            episodes: Some(_),
+            anilist: Some(EntryArgument { episodes: None, .. }),
+            ..
+        } => bail!(
+            "after ep, --anilist takes the entry's episodes after a colon: --anilist 12345:1-13"
+        ),
+        Command::Map {
+            episodes: None,
+            anilist: Some(EntryArgument {
+                episodes: Some(_), ..
+            }),
+            ..
+        } => bail!(
+            "--anilist takes the entry's episodes only after ep and the show's: \
+             ep 14-26 --anilist 12345:1-13"
+        ),
         // The parser refuses each of these, so only a command built in code
         // reaches this arm.
         Command::Map { .. } => bail!("map takes a name with --anilist or --remove, or nothing"),
@@ -385,17 +487,77 @@ async fn unmap(daemon: &mut Daemon, spelled: &str, out: &mut impl Write) -> Resu
     }
 }
 
-/// Print every name given and the entry it means.
-async fn names(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
-    daemon.ask(&Request::Names).await?;
+/// Have the daemon make episodes of a show mean episodes of an entry, and say
+/// what they mean now.
+async fn pin(
+    daemon: &mut Daemon,
+    show: &str,
+    episodes: Episodes,
+    anilist: i64,
+    entry_episodes: Episodes,
+    out: &mut impl Write,
+) -> Result<()> {
+    daemon
+        .ask(&Request::Pin {
+            show: show.to_owned(),
+            episodes,
+            anilist,
+            entry_episodes,
+        })
+        .await?;
 
     match daemon.expect_answer().await? {
-        Response::Names(given) => {
-            write!(out, "{}", render::names(&given)).context("names could not be printed")
+        Response::Pinned { pinned, replaced } => {
+            write!(out, "{}", render::pinned(&pinned, replaced.as_ref()))
+                .context("mapping could not be printed")
         }
         Response::Error { message } => bail!("{message}"),
-        unexpected => bail!("daemon answered a listing of names with {unexpected:?}"),
+        unexpected => bail!("daemon answered a mapping of episodes with {unexpected:?}"),
     }
+}
+
+/// Have the daemon take back what episodes of a show were made to mean, and
+/// say so.
+async fn unpin(
+    daemon: &mut Daemon,
+    show: &str,
+    episodes: Episodes,
+    out: &mut impl Write,
+) -> Result<()> {
+    daemon
+        .ask(&Request::Unpin {
+            show: show.to_owned(),
+            episodes,
+        })
+        .await?;
+
+    match daemon.expect_answer().await? {
+        Response::Unpinned(Some(filed)) => write!(out, "{}", render::unpinned(&filed, episodes))
+            .context("removal could not be printed"),
+        Response::Unpinned(None) => bail!("{}", render::not_pinned(show, episodes)),
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a removal of episodes with {unexpected:?}"),
+    }
+}
+
+/// Print every name given and every episode mapped, with what each means.
+///
+/// Two requests on one connection, the names first.
+async fn maps(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::Names).await?;
+    let names = match daemon.expect_answer().await? {
+        Response::Names(given) => given,
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a listing of names with {unexpected:?}"),
+    };
+    daemon.ask(&Request::Pins).await?;
+    let pins = match daemon.expect_answer().await? {
+        Response::Pins(pins) => pins,
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a listing of episodes with {unexpected:?}"),
+    };
+
+    write!(out, "{}", render::maps(&names, &pins)).context("maps could not be printed")
 }
 
 /// Print the daemon's events for as long as the daemon sends them.
@@ -610,12 +772,13 @@ fn append(file: &mut File, line: &str, output: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, run};
+    use super::{Command, EntryArgument, Ep, run};
     use crate::client::DEADLINE;
     use crate::prompt::Typed;
     use benshi_core::clock::{Clock, TestClock};
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
+    use benshi_core::pin::Episodes;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::settle::Settled;
     use benshi_core::token::Token;
@@ -1463,7 +1626,7 @@ mod tests {
     }
 
     /// Every command, with the trace of a recording beside `socket`.
-    fn every_command(socket: &Path) -> [Command; 10] {
+    fn every_command(socket: &Path) -> [Command; 12] {
         [
             Command::Sources,
             Command::Watch,
@@ -1481,6 +1644,8 @@ mod tests {
             mapping("Nisekoi", 900_002),
             removing("Nisekoi"),
             names(),
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            unpinning("Nisekoi", episodes(13, 24)),
         ]
     }
 
@@ -1488,7 +1653,12 @@ mod tests {
     fn mapping(name: &str, anilist: i64) -> Command {
         Command::Map {
             name: Some(name.to_owned()),
-            anilist: Some(anilist),
+            ep: None,
+            episodes: None,
+            anilist: Some(EntryArgument {
+                entry: anilist,
+                episodes: None,
+            }),
             remove: false,
         }
     }
@@ -1497,17 +1667,51 @@ mod tests {
     fn removing(name: &str) -> Command {
         Command::Map {
             name: Some(name.to_owned()),
+            ep: None,
+            episodes: None,
             anilist: None,
             remove: true,
         }
     }
 
-    /// A `map` that lists the names given.
+    /// A `map` that lists the names given and the episodes mapped.
     fn names() -> Command {
         Command::Map {
             name: None,
+            ep: None,
+            episodes: None,
             anilist: None,
             remove: false,
+        }
+    }
+
+    fn episodes(first: u32, last: u32) -> Episodes {
+        Episodes::new(first, last).expect("a run from its first episode to its last")
+    }
+
+    /// A `map` of `episodes` of the show `show` names to `entry_episodes`
+    /// of the entry numbered `anilist`.
+    fn pinning(show: &str, episodes: Episodes, anilist: i64, entry_episodes: Episodes) -> Command {
+        Command::Map {
+            name: Some(show.to_owned()),
+            ep: Some(Ep::Ep),
+            episodes: Some(episodes),
+            anilist: Some(EntryArgument {
+                entry: anilist,
+                episodes: Some(entry_episodes),
+            }),
+            remove: false,
+        }
+    }
+
+    /// A `map` that takes `episodes` of the show `show` names back.
+    fn unpinning(show: &str, episodes: Episodes) -> Command {
+        Command::Map {
+            name: Some(show.to_owned()),
+            ep: Some(Ep::Ep),
+            episodes: Some(episodes),
+            anilist: None,
+            remove: true,
         }
     }
 
@@ -2015,6 +2219,16 @@ mod tests {
                 names(),
                 Response::Ok,
                 "benshi: daemon answered a listing of names with Ok\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+                Response::Ok,
+                "benshi: daemon answered a mapping of episodes with Ok\n",
+            ),
+            (
+                unpinning("Nisekoi", episodes(13, 24)),
+                Response::Ok,
+                "benshi: daemon answered a removal of episodes with Ok\n",
             ),
         ] {
             let (_home, socket, answering) = a_daemon_that_answers_with(&answer);
@@ -3110,7 +3324,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_map_the_daemon_refuses_says_why() {
-        for command in [mapping("Nisekoi", 900_002), removing("Nisekoi"), names()] {
+        for command in [
+            mapping("Nisekoi", 900_002),
+            removing("Nisekoi"),
+            names(),
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            unpinning("Nisekoi", episodes(13, 24)),
+        ] {
             let named = format!("{command:?}");
             let (_home, socket, answering) = a_daemon_that_answers_with(&Response::Error {
                 message: "not today".to_owned(),
@@ -3137,9 +3357,17 @@ mod tests {
                 mapping("Nisekoi", 900_002),
                 "benshi: mapping could not be printed: broken pipe\n",
             ),
-            (names(), "benshi: names could not be printed: broken pipe\n"),
+            (names(), "benshi: maps could not be printed: broken pipe\n"),
             (
                 removing("Nisekoi"),
+                "benshi: removal could not be printed: broken pipe\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+                "benshi: mapping could not be printed: broken pipe\n",
+            ),
+            (
+                unpinning("Nisekoi", episodes(13, 24)),
                 "benshi: removal could not be printed: broken pipe\n",
             ),
         ] {
@@ -3152,31 +3380,315 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn episodes_mapped_say_which_episodes_of_which_entry_they_are() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        let (outcome, shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert!(complained.is_empty(), "{complained}");
+        assert_eq!(
+            shown,
+            "mapped: \"Nisekoi\" episodes 13-24 to AniList 900002 episodes 1-12, \"Nisekoi:\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn episodes_mapped_again_say_what_they_meant_before() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+
+        let (outcome, shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_001, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "mapped: \"Nisekoi\" episodes 13-24 to AniList 900001 episodes 1-12, \"Nisekoi\", \
+             in place of AniList 900002 episodes 1-12, \"Nisekoi:\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn episodes_mapped_are_listed_after_the_names_given() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        for command in [
+            pinning("Nisekoi:", episodes(13, 24), 900_001, episodes(1, 12)),
+            mapping("Nisekoi", 900_002),
+        ] {
+            let (outcome, _shown, complained) = go(command, &daemon.socket).await;
+            assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        }
+
+        let (outcome, shown, complained) = go(names(), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "\"Nisekoi\" to AniList 900002, \"Nisekoi:\"\n\
+             \"Nisekoi:\" episodes 13-24 to AniList 900001 episodes 1-12, \"Nisekoi\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn episodes_taken_back_are_said_and_are_listed_no_more() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+
+        let (outcome, shown, complained) =
+            go(unpinning("nisekoi", episodes(13, 24)), &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(shown, "removed: \"Nisekoi\" episodes 13-24\n");
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "nothing is mapped\n");
+    }
+
+    #[tokio::test]
+    async fn episodes_never_mapped_taken_back_fail_and_say_so() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        for (asked, said) in [
+            (
+                episodes(13, 24),
+                "benshi: \"Nisekoi\" episodes 13-24 are not mapped\n",
+            ),
+            (
+                episodes(2, 2),
+                "benshi: \"Nisekoi\" episode 2 is not mapped\n",
+            ),
+        ] {
+            let (outcome, shown, complained) =
+                go(unpinning("Nisekoi", asked), &daemon.socket).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE);
+            assert!(shown.is_empty(), "{shown}");
+            assert_eq!(complained, said);
+        }
+    }
+
+    #[tokio::test]
+    async fn episodes_the_daemon_will_not_map_fail_and_say_why() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        let (outcome, _shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+
+        for (command, said) in [
+            (
+                pinning("Nisekoi", episodes(25, 36), 900_002, episodes(1, 11)),
+                "benshi: episodes 25-36 and episodes 1-11 are not of one length\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(25, 36), 900_002, episodes(0, 11)),
+                "benshi: AniList numbers the episodes of an entry from 1\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(25, 36), 999, episodes(1, 12)),
+                "benshi: AniList 999 is not on the list\n",
+            ),
+            (
+                pinning("Another Show", episodes(1, 12), 900_002, episodes(1, 12)),
+                "benshi: no show is titled \"Another Show\"\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(20, 30), 900_001, episodes(1, 11)),
+                "benshi: \"Nisekoi\" episodes 20-30 overlap episodes 13-24, \
+                 mapped to AniList 900002 episodes 1-12\n",
+            ),
+            (
+                pinning("Nisekoi", episodes(24, 24), 900_001, episodes(1, 1)),
+                "benshi: \"Nisekoi\" episode 24 overlaps episodes 13-24, \
+                 mapped to AniList 900002 episodes 1-12\n",
+            ),
+        ] {
+            let named = format!("{command:?}");
+            let (outcome, shown, complained) = go(command, &daemon.socket).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE, "{named}");
+            assert!(shown.is_empty(), "{named}: {shown}");
+            assert_eq!(complained, said, "{named}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_shows_of_one_title_fail_with_both_named() {
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+        daemon
+            .store
+            .lock()
+            .expect("the store")
+            .new_show("Nisekoi")
+            .expect("the show is filed");
+
+        let (outcome, shown, complained) = go(
+            pinning("Nisekoi", episodes(13, 24), 900_002, episodes(1, 12)),
+            &daemon.socket,
+        )
+        .await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(
+            complained,
+            "benshi: \"Nisekoi\" names more than one show: \"Nisekoi\" (AniList 900001), \
+             \"Nisekoi\" (not on the list)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn episodes_and_an_entry_without_its_episodes_are_refused_and_so_is_the_reverse() {
+        // The parser cannot see what a value holds, so these reach the client.
+        let daemon = Daemon::listening(Vec::new());
+        daemon.has_two_of_one_name();
+
+        for (command, said) in [
+            (
+                Command::Map {
+                    name: Some("Nisekoi".to_owned()),
+                    ep: Some(Ep::Ep),
+                    episodes: Some(episodes(13, 24)),
+                    anilist: Some(EntryArgument {
+                        entry: 900_002,
+                        episodes: None,
+                    }),
+                    remove: false,
+                },
+                "benshi: after ep, --anilist takes the entry's episodes after a colon: \
+                 --anilist 12345:1-13\n",
+            ),
+            (
+                Command::Map {
+                    name: Some("Nisekoi".to_owned()),
+                    ep: None,
+                    episodes: None,
+                    anilist: Some(EntryArgument {
+                        entry: 900_002,
+                        episodes: Some(episodes(1, 12)),
+                    }),
+                    remove: false,
+                },
+                "benshi: --anilist takes the entry's episodes only after ep and the show's: \
+                 ep 14-26 --anilist 12345:1-13\n",
+            ),
+        ] {
+            let named = format!("{command:?}");
+            let (outcome, shown, complained) = go(command, &daemon.socket).await;
+
+            assert_eq!(outcome, ExitCode::FAILURE, "{named}");
+            assert!(shown.is_empty(), "{named}: {shown}");
+            assert_eq!(complained, said, "{named}");
+        }
+        let (_outcome, listed, _complained) = go(names(), &daemon.socket).await;
+        assert_eq!(listed, "nothing is mapped\n");
+    }
+
+    #[tokio::test]
+    async fn a_listing_whose_episodes_are_answered_with_another_kind_of_answer_says_so() {
+        let names_answered = line_of(&Response::Names(Vec::new()));
+        let pins_answered = line_of(&Response::Ok);
+        let (_home, socket, answering) = a_daemon_that_answers(move |request| {
+            match serde_json::from_str(request).expect("a request") {
+                Request::Names => names_answered.clone(),
+                Request::Pins => pins_answered.clone(),
+                other => panic!("{other:?} is asked by no listing of maps"),
+            }
+        });
+
+        let (outcome, shown, complained) = timeout(PATIENCE, go(names(), &socket))
+            .await
+            .expect("the client ended");
+        answering.abort();
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert!(shown.is_empty(), "{shown}");
+        assert_eq!(
+            complained,
+            "benshi: daemon answered a listing of episodes with Ok\n"
+        );
+    }
+
+    #[tokio::test]
     async fn a_map_of_neither_kind_asks_nothing_and_says_what_a_map_takes() {
         // The parser refuses these; a command built in code is refused here.
         let daemon = Daemon::listening(Vec::new());
         daemon.has_two_of_one_name();
 
+        let entry = |run: Option<Episodes>| {
+            Some(EntryArgument {
+                entry: 900_002,
+                episodes: run,
+            })
+        };
         for command in [
             Command::Map {
                 name: Some("Nisekoi".to_owned()),
+                ep: None,
+                episodes: None,
                 anilist: None,
                 remove: false,
             },
             Command::Map {
                 name: None,
-                anilist: Some(900_002),
+                ep: None,
+                episodes: None,
+                anilist: entry(None),
                 remove: false,
             },
             Command::Map {
                 name: None,
+                ep: None,
+                episodes: None,
                 anilist: None,
                 remove: true,
             },
             Command::Map {
                 name: Some("Nisekoi".to_owned()),
-                anilist: Some(900_002),
+                ep: None,
+                episodes: None,
+                anilist: entry(None),
                 remove: true,
+            },
+            Command::Map {
+                name: None,
+                ep: Some(Ep::Ep),
+                episodes: Some(episodes(13, 24)),
+                anilist: entry(Some(episodes(1, 12))),
+                remove: false,
+            },
+            Command::Map {
+                name: Some("Nisekoi".to_owned()),
+                ep: Some(Ep::Ep),
+                episodes: Some(episodes(13, 24)),
+                anilist: None,
+                remove: false,
             },
         ] {
             let named = format!("{command:?}");
