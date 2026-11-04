@@ -21,6 +21,7 @@ use benshi_detect::SourceInfo;
 use serde::{Deserialize, Serialize};
 
 use crate::bus::BusEvent;
+use crate::mapping::{Given, Meant};
 use crate::recognition::Decision;
 
 /// One request from a client.
@@ -71,6 +72,66 @@ pub enum Request {
     /// Answered twice, as [`Request::Login`] is: with [`Response::Ok`], and
     /// with [`Response::LoggedOut`] or [`Response::Error`].
     Logout,
+
+    /// Make a name mean an entry of the list from then on.
+    ///
+    /// Answered with [`Response::Mapped`] or [`Response::Error`].
+    Map {
+        /// The name, as `benshi why` spells it.
+        spelled: String,
+        /// The entry, by AniList's number for the work.
+        anilist: i64,
+    },
+
+    /// Take back what a name was made to mean.
+    ///
+    /// Answered with [`Response::Unmapped`] or [`Response::Error`].
+    Unmap {
+        /// The name, as it was given or in any spelling of the same key.
+        spelled: String,
+    },
+
+    /// Every name the user gave, in the order given.
+    ///
+    /// Answered with [`Response::Names`] or [`Response::Error`].
+    Names,
+}
+
+/// A name the user gave, and the entry it means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameListing {
+    /// The name, as it was given.
+    pub spelled: String,
+    /// The entry, by AniList's number for the work, and none where the list
+    /// holds no entry of its show.
+    pub anilist: Option<i64>,
+    /// The title the list gives the entry, and the show's own where the list
+    /// holds none.
+    pub title: String,
+    /// Why the name is not in force, where it is not.
+    pub not_in_force: Option<String>,
+}
+
+impl NameListing {
+    /// A name given, and whether it is in force.
+    #[must_use]
+    pub fn of(given: &Given) -> Self {
+        Self {
+            not_in_force: given.not_in_force.clone(),
+            ..Self::meant(&given.meant)
+        }
+    }
+
+    /// What a name meant, with nothing said of whether it is in force.
+    #[must_use]
+    pub fn meant(meant: &Meant) -> Self {
+        Self {
+            spelled: meant.spelled.clone(),
+            anilist: meant.entry.map(|entry| entry.0),
+            title: meant.title.clone(),
+            not_in_force: None,
+        }
+    }
 }
 
 /// One source as a listing shows it.
@@ -157,6 +218,25 @@ pub enum Response {
 
     /// The token is no longer kept, in answer to [`Request::Logout`].
     LoggedOut,
+
+    /// A name means an entry from now on, in answer to [`Request::Map`].
+    Mapped {
+        /// The name, as it was given.
+        spelled: String,
+        /// The entry, by AniList's number for the work.
+        anilist: i64,
+        /// The title the list gives the entry.
+        title: String,
+        /// What a name of its key meant before, where it meant another entry.
+        replaced: Option<NameListing>,
+    },
+
+    /// The name taken back, as it was given, in answer to
+    /// [`Request::Unmap`], and none where no name of its key was given.
+    Unmapped(Option<String>),
+
+    /// Every name given, in answer to [`Request::Names`].
+    Names(Vec<NameListing>),
 }
 
 /// The most recent decision, as a client is told it.
@@ -317,7 +397,7 @@ impl DecidedBy {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecidedBy, Explanation, Outcome, Request, Response, SourceListing};
+    use super::{DecidedBy, Explanation, NameListing, Outcome, Request, Response, SourceListing};
     use crate::bus::BusEvent;
     use crate::recognition::{Decision, Recognizer};
     use benshi_core::clock::Timestamp;
@@ -496,6 +576,40 @@ mod tests {
                 expires: None,
             },
             Response::LoggedOut,
+            Response::Mapped {
+                spelled: "Show Title".to_owned(),
+                anilist: 900_002,
+                title: "Show Title:".to_owned(),
+                replaced: None,
+            },
+            Response::Mapped {
+                spelled: "Show Title".to_owned(),
+                anilist: 900_002,
+                title: "Show Title:".to_owned(),
+                replaced: Some(NameListing {
+                    spelled: "show title".to_owned(),
+                    anilist: Some(900_001),
+                    title: "Show Title".to_owned(),
+                    not_in_force: None,
+                }),
+            },
+            Response::Unmapped(Some("Show Title".to_owned())),
+            Response::Unmapped(None),
+            Response::Names(vec![
+                NameListing {
+                    spelled: "Show Title".to_owned(),
+                    anilist: Some(900_002),
+                    title: "Show Title:".to_owned(),
+                    not_in_force: None,
+                },
+                NameListing {
+                    spelled: "Old Name".to_owned(),
+                    anilist: None,
+                    title: "A Show That Left".to_owned(),
+                    not_in_force: Some("its entry is not on the list".to_owned()),
+                },
+            ]),
+            Response::Names(Vec::new()),
         ];
         responses.extend(
             every_recognition()
@@ -551,6 +665,14 @@ mod tests {
                 token: Token::new("header.payload.signature"),
             },
             Request::Logout,
+            Request::Map {
+                spelled: "Show Title".to_owned(),
+                anilist: 900_002,
+            },
+            Request::Unmap {
+                spelled: "Show Title".to_owned(),
+            },
+            Request::Names,
         ]
     }
 

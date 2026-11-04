@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime};
 use benshi_cli::commands::{Command, PolicyArgument, run};
 use benshi_cli::prompt::Typed;
 use benshi_core::clock::Timestamp;
+use benshi_core::list::{Entry, EntryId, Status};
 use benshi_core::path::RawPath;
 use benshi_core::policy::PolicyTable;
 use benshi_core::token::Token;
@@ -30,8 +31,9 @@ use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::{BusEvent, EventBus};
 use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
-use benshi_daemon::listing::Wakes;
-use benshi_daemon::recognition::{Current, Decided, Recognizer};
+use benshi_daemon::listing::{self, BACKEND, Wakes};
+use benshi_daemon::mapping::Mapping;
+use benshi_daemon::recognition::{Current, Decided};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use tempfile::TempDir;
@@ -66,15 +68,29 @@ const PERIOD: Duration = Duration::from_millis(5);
 /// The identity the fake platform reports.
 const PLAYER: &str = "mpv.instance1701";
 
-/// A platform with one player on it, which counts how often it was read.
+/// The file the player has open, unless a test opens another.
+const PLAYING: &str = "/anime/ep 03.mkv";
+
+/// A platform with one player on it, which has `file` open and counts how
+/// often it was read.
 ///
 /// The count is what lets a test say "several more rounds have happened"
 /// without sleeping for them, which is the difference between a test that is
 /// deterministic and one that usually passes.
-#[derive(Clone, Default)]
-struct OnePlayer(Arc<AtomicUsize>);
+#[derive(Clone)]
+struct OnePlayer {
+    rounds: Arc<AtomicUsize>,
+    file: &'static str,
+}
 
 impl OnePlayer {
+    fn playing(file: &'static str) -> Self {
+        Self {
+            rounds: Arc::default(),
+            file,
+        }
+    }
+
     fn source() -> SourceInfo {
         SourceInfo {
             player: PlayerId(PLAYER.to_owned()),
@@ -90,7 +106,7 @@ impl OnePlayer {
     }
 
     fn rounds(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.rounds.load(Ordering::Relaxed)
     }
 
     /// Wait until at least `wanted` rounds have been taken.
@@ -111,13 +127,13 @@ impl PlayerWatcher for OnePlayer {
     }
 
     async fn poll(&mut self) -> Result<PollOutcome, WatchError> {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.rounds.fetch_add(1, Ordering::Relaxed);
         let source = Self::source();
 
         Ok(PollOutcome {
             snapshots: vec![PlayerSnapshot {
                 player: source.player.clone(),
-                media: MediaRef::LocalFile(RawPath::from_bytes(b"/anime/ep 03.mkv".to_vec())),
+                media: MediaRef::LocalFile(RawPath::from_bytes(self.file.as_bytes().to_vec())),
                 state: source.state,
                 position: Known::Value(Duration::from_secs(5)),
                 duration: Known::Value(Duration::from_mins(23)),
@@ -139,14 +155,23 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
-        let platform = OnePlayer::default();
+        Self::listing(PLAYING, &[])
+    }
+
+    /// A daemon whose player has `file` open, with `listed` filed in its
+    /// store as a list read files it.
+    fn listing(file: &'static str, listed: &[Entry]) -> Self {
+        let platform = OnePlayer::playing(file);
         let bus = Arc::new(EventBus::new());
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
         let seen = Seen::new();
         let decided = Decided::new();
         let home = tempfile::tempdir().expect("a directory of our own");
         let database = home.path().join("data").join("benshi.db");
-        let store = Store::open(&database).expect("the database opens");
+        let mut store = Store::open(&database).expect("the database opens");
+        store.file(BACKEND, listed).expect("the list is filed");
+        let recognizer = Current::new(listing::kept(&store).expect("the list reads"));
+        let store = Arc::new(Mutex::new(store));
 
         let mut detection = Detection::new(
             platform.clone(),
@@ -154,10 +179,10 @@ impl Daemon {
                 bus: Arc::clone(&bus),
                 policy: Arc::clone(&policy),
                 seen: seen.clone(),
-                recognizer: Current::new(Recognizer::empty()),
+                recognizer: recognizer.clone(),
                 wakes: Wakes::new(),
                 decided: decided.clone(),
-                store: Arc::new(Mutex::new(store)),
+                store: Arc::clone(&store),
                 now: SystemTime::now,
                 period: PERIOD,
             },
@@ -173,6 +198,7 @@ impl Daemon {
             decided,
             Arc::new(NoLogins),
             Wakes::new(),
+            Mapping::new(store, recognizer),
         ));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 
@@ -277,5 +303,63 @@ async fn a_deny_typed_at_the_client_silences_the_source_without_a_restart() {
     assert!(
         readings(&mut events).is_empty(),
         "a denied source kept publishing after the policy changed"
+    );
+}
+
+/// An entry of the list, as a list read files one.
+fn an_entry(id: i64, title: &str) -> Entry {
+    Entry {
+        id: EntryId(id),
+        title: title.to_owned(),
+        spellings: Vec::new(),
+        format: None,
+        episodes: Some(12),
+        episode_length: None,
+        year: None,
+        released: true,
+        status: Status::Watching,
+        progress: 0,
+        rewatches: 0,
+        score: None,
+    }
+}
+
+#[tokio::test]
+async fn a_name_mapped_at_the_client_decides_the_rounds_after_it() {
+    // A file of either entry is named so, and a round can choose neither
+    // until the name is given one of them.
+    let daemon = Daemon::listing(
+        "/anime/Nisekoi - 03.mkv",
+        &[an_entry(900_001, "Nisekoi"), an_entry(900_002, "Nisekoi:")],
+    );
+    daemon.platform.after(2).await;
+    let (_outcome, before) = daemon.ask(Command::Why).await;
+    assert!(before.contains("ambiguous:"), "{before}");
+
+    let (outcome, shown) = daemon
+        .ask(Command::Map {
+            name: Some("Nisekoi".to_owned()),
+            anilist: Some(900_002),
+            remove: false,
+        })
+        .await;
+    assert_eq!(outcome, ExitCode::SUCCESS);
+    assert_eq!(
+        shown,
+        "mapped: \"Nisekoi\" to AniList 900002, \"Nisekoi:\"\n"
+    );
+
+    // A round that starts after the answer decides against what it put in
+    // place, and the one after it starting says that round finished.
+    let answered_at = daemon.platform.rounds();
+    daemon.platform.after(answered_at + 2).await;
+    let (_outcome, after) = daemon.ask(Command::Why).await;
+    assert!(
+        after.contains("recognized: \"Nisekoi:\", episode 3"),
+        "{after}"
+    );
+    assert!(
+        after.contains("stage: altname, assigned \"Nisekoi\""),
+        "{after}"
     );
 }

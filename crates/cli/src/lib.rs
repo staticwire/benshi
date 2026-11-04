@@ -9,7 +9,9 @@
 //! occasion. `benshi why` prints the most recent recognition decision: what the
 //! name spelled, what was answered, and for a match which stage decided it and
 //! by what. `benshi login` has the daemon ask AniList whose a token is and keep
-//! it in the secret store, and `benshi logout` has it removed.
+//! it in the secret store, and `benshi logout` has it removed. `benshi map`
+//! makes a name mean one entry of the list, for a name the list spells for
+//! several entries or for none, and lists the names given.
 //!
 //! The client renders; it never decides. Anything it shows came from the daemon
 //! in that answer, so two runs of `benshi sources` a second apart can differ and
@@ -174,6 +176,72 @@ mod tests {
         assert_eq!(logout.command, Command::Logout);
         assert!(Cli::try_parse_from(["benshi", "login", "a.pasted.token"]).is_err());
         assert!(Cli::try_parse_from(["benshi", "logout", "anilist"]).is_err());
+    }
+
+    #[test]
+    fn map_alone_lists_the_names_given() {
+        let asked = Cli::try_parse_from(["benshi", "map"]).expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Map {
+                name: None,
+                anilist: None,
+                remove: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_is_mapped_to_an_entry_by_its_number_on_anilist() {
+        let asked = Cli::try_parse_from(["benshi", "map", "Show Title", "--anilist", "12345"])
+            .expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Map {
+                name: Some("Show Title".to_owned()),
+                anilist: Some(12345),
+                remove: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_is_taken_back_with_remove() {
+        let asked =
+            Cli::try_parse_from(["benshi", "map", "Show Title", "--remove"]).expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Map {
+                name: Some("Show Title".to_owned()),
+                anilist: None,
+                remove: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_map_that_asks_for_no_one_thing_is_refused() {
+        // A name alone could be either of two requests, and an entry or a
+        // removal without a name has nothing to act on.
+        for refused in [
+            &["benshi", "map", "Show Title"][..],
+            &["benshi", "map", "--anilist", "12345"],
+            &["benshi", "map", "--remove"],
+            &[
+                "benshi",
+                "map",
+                "Show Title",
+                "--anilist",
+                "12345",
+                "--remove",
+            ],
+            &["benshi", "map", "Show Title", "--anilist", "soon"],
+        ] {
+            assert!(Cli::try_parse_from(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

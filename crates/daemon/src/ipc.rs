@@ -16,6 +16,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use benshi_core::list::EntryId;
 use benshi_core::policy::PolicyTable;
 use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -27,7 +28,8 @@ use crate::accounts::{Accounts, LoggedIn};
 use crate::bus::EventBus;
 use crate::detection::Seen;
 use crate::listing::Wakes;
-use crate::protocol::{Explanation, Request, Response, SourceListing};
+use crate::mapping::Mapping;
+use crate::protocol::{Explanation, NameListing, Request, Response, SourceListing};
 use crate::recognition::Decided;
 use crate::supervisor::TaskError;
 
@@ -271,13 +273,15 @@ pub struct Server {
     decided: Decided,
     accounts: Arc<dyn Accounts>,
     wakes: Wakes,
+    mapping: Mapping,
 }
 
 impl Server {
     /// A server over the bus a `Watch` streams, the table a listing reads and a
     /// policy is set in, the two records each detection round leaves behind,
     /// what it saw and what it last decided, what a login and a logout are
-    /// carried out by, and the list's task, which a login wakes.
+    /// carried out by, the list's task, which a login wakes, and where the
+    /// names the user gives are kept.
     #[must_use]
     pub fn new(
         bus: Arc<EventBus>,
@@ -286,6 +290,7 @@ impl Server {
         decided: Decided,
         accounts: Arc<dyn Accounts>,
         wakes: Wakes,
+        mapping: Mapping,
     ) -> Self {
         Self {
             bus,
@@ -294,6 +299,7 @@ impl Server {
             decided,
             accounts,
             wakes,
+            mapping,
         }
     }
 
@@ -421,6 +427,31 @@ impl Server {
                         },
                     }
                 }
+                Ok(Request::Map { spelled, anilist }) => {
+                    match self.mapping.map(spelled, EntryId(anilist)).await {
+                        Ok(mapped) => Response::Mapped {
+                            spelled: mapped.spelled,
+                            anilist: mapped.entry.0,
+                            title: mapped.title,
+                            replaced: mapped.replaced.as_ref().map(NameListing::meant),
+                        },
+                        Err(refused) => Response::Error {
+                            message: refused.to_string(),
+                        },
+                    }
+                }
+                Ok(Request::Unmap { spelled }) => match self.mapping.unmap(spelled).await {
+                    Ok(taken) => Response::Unmapped(taken),
+                    Err(refused) => Response::Error {
+                        message: refused.to_string(),
+                    },
+                },
+                Ok(Request::Names) => match self.mapping.given().await {
+                    Ok(given) => Response::Names(given.iter().map(NameListing::of).collect()),
+                    Err(refused) => Response::Error {
+                        message: refused.to_string(),
+                    },
+                },
                 // A stream rather than an answer, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
@@ -512,10 +543,12 @@ mod tests {
     use crate::bus::{BusEvent, EventBus};
     use crate::detection::Seen;
     use crate::listing::Wakes;
-    use crate::protocol::{Outcome, Request, Response};
-    use crate::recognition::{Decided, Decision, Recognizer};
+    use crate::mapping::Mapping;
+    use crate::protocol::{NameListing, Outcome, Request, Response};
+    use crate::recognition::{Current, Decided, Decision, Recognizer};
     use crate::secrets;
     use benshi_core::clock::Timestamp;
+    use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::policy::{Policy, PolicyTable};
     use benshi_core::recognize::parse::Episode;
@@ -525,6 +558,7 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot,
     };
     use benshi_detect::SourceInfo;
+    use benshi_store::Store;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -532,6 +566,7 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock, mpsc};
     use std::thread;
     use std::time::Duration;
+    use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
     use tokio::net::UnixStream;
     use tokio::runtime::Handle;
@@ -671,6 +706,8 @@ mod tests {
         decided: Decided,
         accounts: Arc<Scripted>,
         wakes: Wakes,
+        store: Arc<Mutex<Store>>,
+        _home: TempDir,
     }
 
     impl Daemon {
@@ -697,6 +734,11 @@ mod tests {
             let accounts = Arc::new(accounts);
             let wakes = Wakes::new();
 
+            let home = tempfile::tempdir().expect("a directory of our own");
+            let store = Arc::new(Mutex::new(
+                Store::open(&home.path().join("benshi.db")).expect("the database opens"),
+            ));
+            let mapping = Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty()));
             Self {
                 server: Arc::new(Server::new(
                     Arc::clone(&bus),
@@ -705,13 +747,29 @@ mod tests {
                     decided.clone(),
                     Arc::clone(&accounts) as Arc<dyn Accounts>,
                     wakes.clone(),
+                    mapping,
                 )),
                 bus,
                 policy,
                 decided,
                 accounts,
                 wakes,
+                store,
+                _home: home,
             }
+        }
+
+        /// File two entries a name cannot tell apart, as the list's task
+        /// would.
+        fn has_two_of_one_name(&self) {
+            self.store
+                .lock()
+                .expect("the store")
+                .file(
+                    crate::listing::BACKEND,
+                    &[an_entry(900_001, "Nisekoi"), an_entry(900_002, "Nisekoi:")],
+                )
+                .expect("the list is filed");
         }
 
         /// Leave behind a decision about the file [`a_snapshot`] has open, as
@@ -834,6 +892,90 @@ mod tests {
             listed[1].policy,
             Policy::Deny,
             "a browser is denied by default and the listing has to say so"
+        );
+    }
+
+    /// An entry of a list, under a number of a work no list of the user's
+    /// holds.
+    fn an_entry(id: i64, title: &str) -> Entry {
+        Entry {
+            id: EntryId(id),
+            title: title.to_owned(),
+            spellings: Vec::new(),
+            format: None,
+            episodes: Some(12),
+            episode_length: None,
+            year: None,
+            released: true,
+            status: Status::Watching,
+            progress: 0,
+            rewatches: 0,
+            score: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_mapped_is_answered_with_its_entry_listed_and_taken_back() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+        let listed = NameListing {
+            spelled: "Nisekoi".to_owned(),
+            anilist: Some(900_002),
+            title: "Nisekoi:".to_owned(),
+            not_in_force: None,
+        };
+
+        client
+            .ask(&Request::Map {
+                spelled: "Nisekoi".to_owned(),
+                anilist: 900_002,
+            })
+            .await;
+        let mapped = client.answer().await;
+        client.ask(&Request::Names).await;
+        let names = client.answer().await;
+        client
+            .ask(&Request::Unmap {
+                spelled: "Nisekoi".to_owned(),
+            })
+            .await;
+        let taken = client.answer().await;
+        client.ask(&Request::Names).await;
+        let none = client.answer().await;
+
+        assert_eq!(
+            mapped,
+            Response::Mapped {
+                spelled: "Nisekoi".to_owned(),
+                anilist: 900_002,
+                title: "Nisekoi:".to_owned(),
+                replaced: None,
+            }
+        );
+        assert_eq!(names, Response::Names(vec![listed]));
+        assert_eq!(taken, Response::Unmapped(Some("Nisekoi".to_owned())));
+        assert_eq!(none, Response::Names(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_name_mapped_to_an_entry_off_the_list_is_answered_with_why() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Map {
+                spelled: "Nisekoi".to_owned(),
+                anilist: 999,
+            })
+            .await;
+
+        assert_eq!(
+            client.answer().await,
+            Response::Error {
+                message: "AniList 999 is not on the list".to_owned()
+            }
         );
     }
 
