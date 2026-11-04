@@ -44,9 +44,10 @@
 //! open, and one policy stopped admitting.
 //!
 //! **A task that stops closes nothing.** Its session goes with it, and an
-//! episode open in it that had registered keeps its marked total in the
-//! store. The next sitting of that episode goes on from that total and
-//! records nothing.
+//! episode open in it that had registered keeps its mark in the store. The
+//! next sitting of that episode is another viewing where it begins near the
+//! start of the file, and goes on with the one that registered where it
+//! begins further in.
 //!
 //! **A store that refuses a call stops the task for good.** Detecting on
 //! while nothing is recorded looks the same as working. The supervisor tells
@@ -73,7 +74,7 @@ use benshi_core::settle::Settled;
 use benshi_core::timeline::WatchedPolicy;
 use benshi_core::{MediaRef, PlayerId, PlayerSnapshot};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
-use benshi_store::watching::Total;
+use benshi_store::watching::{Kept, Total};
 use benshi_store::{Store, Viewing};
 use tokio::time::MissedTickBehavior;
 
@@ -546,9 +547,9 @@ impl<W: PlayerWatcher> Detection<W> {
                     .await?;
                     self.session.resumed(
                         question,
-                        kept.map(|kept| Resumed {
-                            watched: kept.watched,
-                            registered: kept.registered,
+                        kept.map(|kept| match kept {
+                            Kept::Watching { watched, .. } => Resumed::Watching(watched),
+                            Kept::Registered => Resumed::Registered,
                         }),
                     );
                 }
@@ -973,8 +974,8 @@ mod tests {
 
     /// A reading of this file being played, this many steps into a test.
     ///
-    /// No position, because nothing here is about one: watched time is
-    /// counted from the instants and the states.
+    /// No position: watched time is counted from the instants and the
+    /// states. [`watching_from`] gives its readings one.
     fn playing(source: &SourceInfo, name: &str, steps: u32) -> PlayerSnapshot {
         PlayerSnapshot {
             player: source.player.clone(),
@@ -984,6 +985,25 @@ mod tests {
             duration: Known::Value(LENGTH),
             observed_at: after(steps),
         }
+    }
+
+    /// Rounds of one source playing this file from the position `from`, one
+    /// for each step, the position moving a step a step.
+    fn watching_from(
+        source: &SourceInfo,
+        name: &str,
+        from: Duration,
+        steps: RangeInclusive<u32>,
+    ) -> Vec<Result<PollOutcome, WatchError>> {
+        steps
+            .map(|step| {
+                let reading = PlayerSnapshot {
+                    position: Known::Value(from + STEP * step),
+                    ..playing(source, name, step)
+                };
+                Ok(a_round_of(&[source], vec![reading]))
+            })
+            .collect()
     }
 
     /// A round that described these sources and took these readings.
@@ -1729,11 +1749,10 @@ mod tests {
     const NOTHING_SEEN: [Viewed; 0] = [];
 
     /// The third episode as the store holds it once `watched` of it is kept.
-    fn the_third(watched: Duration, registered: bool) -> Kept {
-        Kept {
+    fn the_third(watched: Duration) -> Kept {
+        Kept::Watching {
             media: a_path(THIRD),
             watched,
-            registered,
         }
     }
 
@@ -1880,10 +1899,7 @@ mod tests {
 
         rounds(&mut detection, 4).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * 3, false))
-        );
+        assert_eq!(database.kept(SERIES, Some(3)), Some(the_third(STEP * 3)));
         assert_eq!(
             database.rows("SELECT updated_at FROM watching", |row| row
                 .get::<_, String>(0)),
@@ -1941,7 +1957,7 @@ mod tests {
         drop(first);
         assert_eq!(
             database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * half_way, false))
+            Some(the_third(STEP * half_way))
         );
 
         // The first reading of the second adds nothing, so `half_way` readings
@@ -1957,42 +1973,87 @@ mod tests {
 
         rounds(&mut second, 1).await;
         assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true))
-        );
+        assert_eq!(database.kept(SERIES, Some(3)), Some(Kept::Registered));
     }
 
     #[tokio::test]
-    async fn an_episode_the_store_holds_as_registered_is_not_recorded_again() {
+    async fn a_sitting_begun_further_in_of_an_episode_the_store_holds_as_registered_records_nothing()
+     {
         let database = Database::new();
-        {
-            let mut store = database.store.lock().expect("the store");
-            store
-                .keep(&Total {
-                    show: show_of(SERIES),
-                    episode: Some(3),
-                    media: a_path(THIRD),
-                    watched: STEP * HALF_AT,
-                    at: the_time(),
-                })
-                .expect("the total is kept");
-            store
-                .record(&Viewing {
-                    show: show_of(SERIES),
-                    episode: Some(3),
-                    media: a_path(THIRD),
-                    at: the_time(),
-                })
-                .expect("the episode is recorded");
-        }
+        registered_by_a_task_that_stopped(&database);
         let mpv = a_source("mpv", "mpv");
-        let watcher = ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT));
+        let resumed = Duration::from_secs(100);
+        let watcher = ScriptedWatcher::of(watching_from(&mpv, THIRD, resumed, 0..=HALF_AT));
         let mut detection = recording(watcher, &database);
 
         rounds(&mut detection, HALF_AT + 1).await;
 
         assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
+        assert_eq!(database.queued().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sitting_begun_near_the_start_of_an_episode_the_store_holds_as_registered_is_recorded()
+     {
+        let database = Database::new();
+        registered_by_a_task_that_stopped(&database);
+        let mpv = a_source("mpv", "mpv");
+        let start = Duration::from_millis(500);
+        let watcher = ScriptedWatcher::of(watching_from(&mpv, THIRD, start, 0..=HALF_AT));
+        let mut detection = recording(watcher, &database);
+
+        rounds(&mut detection, HALF_AT).await;
+        assert_eq!(database.seen().len(), 1, "recorded a reading short of half");
+
+        rounds(&mut detection, 1).await;
+        assert_eq!(database.seen().len(), 2, "{:?}", database.seen());
+        assert_eq!(database.queued().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_episode_watched_in_two_sittings_of_half_each_is_recorded_once() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let mut first_half = watching(&mpv, THIRD, 0..=HALF_AT);
+        first_half.push(Ok(a_round_of(&[], Vec::new())));
+        let mut first = recording(ScriptedWatcher::of(first_half), &database);
+        rounds(&mut first, HALF_AT + 2).await;
+        drop(first);
+        assert_eq!(
+            database.count_of("watching"),
+            [0],
+            "the first sitting closed"
+        );
+
+        let second_half = watching_from(&mpv, THIRD, STEP * HALF_AT, 0..=HALF_AT);
+        let mut second = recording(ScriptedWatcher::of(second_half), &database);
+        rounds(&mut second, HALF_AT + 1).await;
+
+        assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
+        assert_eq!(database.queued().len(), 1);
+    }
+
+    /// Leave in `database` what a task that stopped after the third episode
+    /// registered leaves: the episode recorded and its total marked.
+    fn registered_by_a_task_that_stopped(database: &Database) {
+        let mut store = database.store.lock().expect("the store");
+        store
+            .keep(&Total {
+                show: show_of(SERIES),
+                episode: Some(3),
+                media: a_path(THIRD),
+                watched: STEP * HALF_AT,
+                at: the_time(),
+            })
+            .expect("the total is kept");
+        store
+            .record(&Viewing {
+                show: show_of(SERIES),
+                episode: Some(3),
+                media: a_path(THIRD),
+                at: the_time(),
+            })
+            .expect("the episode is recorded");
     }
 
     /// Detection in which `source` has watched the third episode to where it
@@ -2014,8 +2075,13 @@ mod tests {
         rounds(&mut detection, HALF_AT + 1).await;
         assert_eq!(
             database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true)),
+            Some(Kept::Registered),
             "the episode registered before the round under test"
+        );
+        assert_eq!(
+            database.count_of("watching"),
+            [1],
+            "the marked total is there"
         );
 
         detection
@@ -2042,7 +2108,7 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(database.kept(SERIES, Some(3)), None);
+        assert_eq!(database.count_of("watching"), [0]);
     }
 
     #[tokio::test]
@@ -2055,10 +2121,7 @@ mod tests {
 
         rounds(&mut detection, 5).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * 3, false))
-        );
+        assert_eq!(database.kept(SERIES, Some(3)), Some(the_third(STEP * 3)));
     }
 
     #[tokio::test]
@@ -2072,7 +2135,7 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(database.kept(SERIES, Some(3)), None);
+        assert_eq!(database.count_of("watching"), [0]);
     }
 
     #[tokio::test]
@@ -2086,17 +2149,13 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true))
-        );
+        assert_eq!(database.count_of("watching"), [1]);
     }
 
     #[tokio::test]
     async fn a_reading_without_a_description_keeps_its_player_in() {
-        // The round cannot tell what that player has open. Closed here, an
-        // episode that registered would lose its total and be recorded a
-        // second time.
+        // The round cannot tell what that player has open, so the sitting
+        // it is in stays open.
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
         let undescribed = a_round_of(&[], vec![playing(&mpv, THIRD, HALF_AT + 1)]);
@@ -2104,28 +2163,24 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true))
-        );
+        assert_eq!(database.count_of("watching"), [1]);
     }
 
     #[tokio::test]
     async fn a_player_kept_in_by_a_round_is_let_go_by_the_first_that_hears_nothing_of_it() {
-        // Neither round that kept the player in lists it, so a rule that let
-        // go of whoever the round before listed would hold its episode open
-        // for good.
-        let database = Database::new();
+        // Neither round that kept the player in lists it: a rule that let go of
+        // whoever the round before listed would hold the episode open for good.
         let mpv = a_source("mpv", "mpv");
         for kept_in_by in [
             a_round_of(&[], vec![playing(&mpv, THIRD, HALF_AT + 1)]),
             a_round_without_an_answer_from(&mpv),
         ] {
+            let database = Database::new();
             let mut detection = registered(&database, &mpv, kept_in_by).await;
 
             rounds(&mut detection, 2).await;
 
-            assert_eq!(database.kept(SERIES, Some(3)), None);
+            assert_eq!(database.count_of("watching"), [0]);
         }
     }
 
@@ -2159,7 +2214,7 @@ mod tests {
             .set(&app("mpv"), Policy::Deny);
         rounds(&mut detection, 1).await;
 
-        assert_eq!(database.kept(SERIES, Some(3)), None);
+        assert_eq!(database.count_of("watching"), [0]);
     }
 
     #[tokio::test]
@@ -2171,7 +2226,7 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(database.kept(SERIES, Some(3)), None);
+        assert_eq!(database.count_of("watching"), [0]);
     }
 
     #[tokio::test]
@@ -2191,7 +2246,7 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(database.kept(SERIES, Some(3)), None);
+        assert_eq!(database.count_of("watching"), [0]);
     }
 
     #[tokio::test]
@@ -2207,10 +2262,8 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true))
-        );
+        assert_eq!(database.count_of("watching"), [1]);
+        assert_eq!(database.kept(SERIES, Some(3)), Some(Kept::Registered));
     }
 
     #[tokio::test]
@@ -2232,18 +2285,14 @@ mod tests {
 
         rounds(&mut detection, 1).await;
 
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * HALF_AT, true))
-        );
+        assert_eq!(database.count_of("watching"), [1]);
+        assert_eq!(database.kept(SERIES, Some(3)), Some(Kept::Registered));
     }
 
     #[tokio::test]
     async fn a_total_is_kept_before_its_episode_is_recorded() {
-        // A file of ten seconds is watched at its second reading, so the
-        // total kept there is the first the store holds of it. Recording
-        // marks the total the store holds, and marks nothing where it holds
-        // none.
+        // A file of ten seconds is watched at its second reading, so the total
+        // kept there is the first the store holds, and the record marks it.
         let database = Database::new();
         let mpv = a_source("mpv", "mpv");
         let short = |steps| PlayerSnapshot {
@@ -2259,10 +2308,8 @@ mod tests {
         rounds(&mut detection, 2).await;
 
         assert_eq!(database.seen().len(), 1, "{:?}", database.seen());
-        assert_eq!(
-            database.kept(SERIES, Some(3)),
-            Some(the_third(STEP * 2, true))
-        );
+        assert_eq!(database.count_of("watching"), [1]);
+        assert_eq!(database.kept(SERIES, Some(3)), Some(Kept::Registered));
     }
 
     #[tokio::test]
