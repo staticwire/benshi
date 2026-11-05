@@ -21,11 +21,13 @@ use std::time::{Duration, SystemTime};
 use benshi_core::policy::PolicyTable;
 use benshi_detect::{PlayerWatcher, WatchError};
 use benshi_store::Store;
+use jiff::tz::TimeZone;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
 use crate::accounts::Accounts;
 use crate::bus::EventBus;
+use crate::delivery::Delivery;
 use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
 use crate::ipc::Server;
@@ -42,6 +44,8 @@ pub mod bus;
 pub mod config;
 
 pub mod day;
+
+pub mod delivery;
 
 pub mod detection;
 
@@ -151,6 +155,7 @@ where
         accounts,
         wiring.wakes.clone(),
         Mapping::new(Arc::clone(&wiring.store), wiring.recognizer.clone()),
+        Delivery::new(Arc::clone(&wiring.store), TimeZone::system()),
     ));
     let reader = Arc::new(Reader::new(
         list.source,

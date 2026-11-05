@@ -18,8 +18,10 @@
 //! it is written, which is what allows a delivery to be repeated when nobody
 //! can tell whether the first one arrived.
 
-use benshi_core::ShowId;
+use std::time::SystemTime;
+
 use benshi_core::list::{Rating, Status};
+use benshi_core::{BoxError, ShowId};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -85,6 +87,9 @@ pub struct Operation {
     pub title: String,
     /// What a list is to be told.
     pub kind: Kind,
+    /// When it was queued. A viewing queues its progress at the instant the
+    /// episode registered as watched.
+    pub at: SystemTime,
 }
 
 impl Store {
@@ -113,8 +118,8 @@ impl Store {
 
 /// The columns an operation is read from, as [`read_operation`] reads them,
 /// over [`LOG`].
-pub(crate) const OPERATION: &str =
-    "sync_queue.id, sync_queue.show, shows.title, sync_queue.kind, sync_queue.payload";
+pub(crate) const OPERATION: &str = "sync_queue.id, sync_queue.show, shows.title, \
+     sync_queue.kind, sync_queue.payload, sync_queue.created_at";
 
 /// The log, with the title of each operation's show where the show is there.
 pub(crate) const LOG: &str = "sync_queue LEFT JOIN shows ON shows.id = sync_queue.show";
@@ -122,7 +127,7 @@ pub(crate) const LOG: &str = "sync_queue LEFT JOIN shows ON shows.id = sync_queu
 /// The `id` of a row that starts with the columns [`OPERATION`] names, and
 /// the operation the row holds or why it holds none: [`Error::Orphan`] where
 /// the show is not there, and [`Error::Operation`] where the kind and the
-/// payload make no operation.
+/// payload make no operation or the instant is not RFC 3339 in UTC.
 ///
 /// Each column of text is read as [`text_bytes`] reads it, so that a row
 /// written by hand is answered with its `id` whatever its columns hold.
@@ -139,15 +144,28 @@ pub(crate) fn read_operation(
     else {
         return Ok((id, Err(Error::Orphan { id })));
     };
-    let operation = Kind::from_columns(text_bytes(row.get_ref(3)?), text_bytes(row.get_ref(4)?))
-        .map(|kind| Operation {
-            id,
-            show: ShowId(show),
-            title: String::from_utf8_lossy(text_bytes(title)).into_owned(),
-            kind,
+    let kind = Kind::from_columns(text_bytes(row.get_ref(3)?), text_bytes(row.get_ref(4)?));
+    let at = queued_at(text_bytes(row.get_ref(5)?));
+    let operation = kind
+        .map_err(BoxError::from)
+        .and_then(|kind| {
+            Ok(Operation {
+                id,
+                show: ShowId(show),
+                title: String::from_utf8_lossy(text_bytes(title)).into_owned(),
+                kind,
+                at: at?,
+            })
         })
         .map_err(|cause| Error::Operation { id, cause });
     Ok((id, operation))
+}
+
+/// The instant a column holds as RFC 3339 text, as the store writes one.
+fn queued_at(text: &[u8]) -> Result<SystemTime, BoxError> {
+    let text = String::from_utf8_lossy(text);
+    humantime::parse_rfc3339(&text)
+        .map_err(|refused| format!("created_at {text:?}: {refused}").into())
 }
 
 /// The bytes a column of text holds, a blob there read as the text it
@@ -372,6 +390,7 @@ mod tests {
                 show: SHOW,
                 title: "Show Title".to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
+                at: a_viewing().at,
             }]
         );
     }
@@ -564,6 +583,29 @@ mod tests {
             matches!(refused, Err(Error::Orphan { id: 2 })),
             "got {refused:?}"
         );
+    }
+
+    #[test]
+    fn an_operation_queued_at_no_instant_is_refused_and_the_row_is_named() {
+        let (_home, store) = a_store();
+        queue(&store, "Show Title", &Kind::Progress { episode: Some(3) });
+        store
+            .connection
+            .execute(
+                "INSERT INTO sync_queue (show, kind, payload, created_at) \
+                 VALUES (1, 'progress', '{\"episode\":4}', 'yesterday')",
+                [],
+            )
+            .expect("the row goes in");
+
+        let refused = store.queued();
+
+        assert!(
+            matches!(refused, Err(Error::Operation { id: 2, .. })),
+            "got {refused:?}"
+        );
+        let said = refused.expect_err("refused").to_string();
+        assert!(said.contains("\"yesterday\""), "{said}");
     }
 
     #[test]

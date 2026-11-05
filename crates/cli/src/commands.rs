@@ -1,7 +1,7 @@
 //! What each command does, and what the process should exit with.
 //!
 //! A command opens a connection, sends a request and renders what comes back:
-//! one answer for `sources`, `policy`, `why` and `map`, and a stream for `watch` until
+//! one answer for `sources`, `policy`, `why`, `map` and `sync`, and a stream for `watch` until
 //! the daemon or the user ends it. `record` wants both an answer and a stream, so
 //! it takes a second connection for the answer: a stream is the last thing a
 //! connection carries. What it records goes to a file, and only a summary of
@@ -123,6 +123,28 @@ pub enum Command {
         /// Take back what the name or the episodes were made to mean.
         #[arg(long, requires = "name")]
         remove: bool,
+    },
+
+    /// Show what sending to the list would write.
+    Sync {
+        /// When to send.
+        #[command(subcommand)]
+        sending: Sending,
+    },
+}
+
+/// When `benshi sync` sends.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum Sending {
+    /// Show every viewing that waits to be sent, the episode of the entry it
+    /// goes to, and what sending it would write.
+    ///
+    /// Uses the list as the daemon last read it. This build does not send, so
+    /// --dry-run is required.
+    Now {
+        /// Print what sending would write, and send nothing.
+        #[arg(long, required = true)]
+        dry_run: bool,
     },
 }
 
@@ -313,6 +335,26 @@ async fn carry_out(
         // The parser refuses each of these, so only a command built in code
         // reaches this arm.
         Command::Map { .. } => bail!("map takes a name with --anilist or --remove, or nothing"),
+        Command::Sync {
+            sending: Sending::Now { dry_run: true },
+        } => rehearse(&mut daemon, out).await,
+        // The parser refuses it, so only a command built in code reaches this arm.
+        Command::Sync {
+            sending: Sending::Now { dry_run: false },
+        } => bail!("this build does not send: sync now takes --dry-run"),
+    }
+}
+
+/// Print what sending every operation that waits would write.
+async fn rehearse(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::DryRun).await?;
+
+    match daemon.expect_answer().await? {
+        Response::DryRun(rehearsal) => {
+            write!(out, "{}", render::dry_run(&rehearsal)).context("dry run could not be printed")
+        }
+        Response::Error { message } => bail!("{message}"),
+        unexpected => bail!("daemon answered a dry run with {unexpected:?}"),
     }
 }
 
@@ -789,6 +831,7 @@ mod tests {
     };
     use benshi_daemon::accounts::{self, Accounts, Done, LoggedIn};
     use benshi_daemon::bus::{BusEvent, EventBus};
+    use benshi_daemon::delivery::Delivery;
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
     use benshi_daemon::listing::{BACKEND, Wakes};
@@ -798,6 +841,7 @@ mod tests {
     use benshi_daemon::secrets;
     use benshi_daemon::supervisor::TaskError;
     use benshi_store::Store;
+    use jiff::tz::TimeZone;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1086,6 +1130,7 @@ mod tests {
                 Arc::clone(&accounts) as Arc<dyn Accounts>,
                 Wakes::new(),
                 Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty())),
+                Delivery::new(Arc::clone(&store), TimeZone::UTC),
             ));
 
             Self {

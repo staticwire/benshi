@@ -13,15 +13,19 @@ use std::fmt::Write as _;
 use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
+use benshi_core::list::Status;
 use benshi_core::pin::Episodes;
 use benshi_core::policy::Policy;
 use benshi_core::recognize::parse::{Episode, Kind, Parsed};
 use benshi_core::settle::Fact;
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
+use benshi_daemon::delivery::{Action, Destination, DryRun, Rehearsed, Unsent};
 use benshi_daemon::protocol::{
     DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
 };
+use benshi_sync::plan::{Day, Standing, Why};
+use benshi_sync::resolve::{By, Unresolved};
 use humantime::format_rfc3339_seconds;
 
 /// What is shown for a source that cannot name what it opened.
@@ -47,6 +51,9 @@ const NOTHING_DECIDED: &str = "nothing has been decided yet\n";
 
 /// What is shown when nothing has been mapped.
 const NOTHING_MAPPED: &str = "nothing is mapped\n";
+
+/// What a dry run shows where no operation is past the cursor.
+const NOTHING_WAITS: &str = "nothing waits to be sent\n";
 
 /// What a source is able to report, and what that leaves recognition to work
 /// from.
@@ -527,13 +534,251 @@ fn meaning(anilist: Option<i64>, title: &str) -> String {
     }
 }
 
+/// What sending every operation that waits would write, under the size of
+/// the list it is decided by and over a count of each outcome.
+///
+/// An operation takes two lines: what was watched and the episode of the
+/// entry it goes to, then what would be written, why nothing would be, or
+/// why it cannot be sent. A write says the entry before and after it, or
+/// that it adds an entry no list holds, and of the dates and the rewatches
+/// only what it changes.
+#[must_use]
+pub fn dry_run(of: &DryRun) -> String {
+    let mut shown = format!("AniList, list as last read: {}\n\n", entries(of.entries));
+    if of.operations.is_empty() {
+        shown.push_str(NOTHING_WAITS);
+        return shown;
+    }
+
+    for operation in &of.operations {
+        writeln!(
+            shown,
+            "{}\n    {}",
+            rehearsed(operation),
+            outcome(operation)
+        )
+        .expect("a String accepts every write");
+    }
+    writeln!(shown, "\n{}", tally(&of.operations)).expect("a String accepts every write");
+    shown
+}
+
+/// What an operation says was watched, and the episode of the entry it goes
+/// to and what decided it, where it goes to one.
+fn rehearsed(of: &Rehearsed) -> String {
+    let Some(watched) = &of.watched else {
+        return format!("#{} cannot be read", of.id);
+    };
+    let mut shown = format!(
+        "#{} {} \"{}\" {}",
+        of.id,
+        day(watched.day),
+        watched.title,
+        watched.episode.map_or_else(
+            || "no episode".to_owned(),
+            |episode| format!("episode {episode}")
+        )
+    );
+    let (to, off_the_list) = match &of.action {
+        Action::Write { to, .. } | Action::Nothing { to, .. } => (Some(to), !to.listed),
+        Action::CannotSend { to, .. } => (to.as_ref(), false),
+    };
+    if let Some(to) = to {
+        write!(shown, " -> AniList {}", to.entry.0).expect("a String accepts every write");
+        if let Some(title) = &to.title {
+            write!(shown, " \"{title}\"").expect("a String accepts every write");
+        }
+        write!(shown, " episode {}", to.episode).expect("a String accepts every write");
+        shown.push_str(match to.by {
+            By::Entry => "",
+            By::Rule => ", by anime-relations",
+            By::Pin => ", by benshi map",
+        });
+        if off_the_list {
+            shown.push_str(", not on the list");
+        }
+    }
+    shown
+}
+
+/// What would be written, why nothing would be, or why the operation cannot
+/// be sent.
+fn outcome(of: &Rehearsed) -> String {
+    match &of.action {
+        Action::Write {
+            to,
+            before,
+            after,
+            undated,
+        } => written(to, before.as_ref(), after, *undated),
+        Action::Nothing { to, why } => format!("nothing to write: {}", nothing(to, *why)),
+        Action::CannotSend { why, .. } => format!(
+            "cannot send: {}",
+            unsent(why, of.watched.as_ref().and_then(|watched| watched.episode))
+        ),
+    }
+}
+
+/// The entry before a write and after it, and the dates and the rewatches
+/// the write changes.
+fn written(to: &Destination, before: Option<&Standing>, after: &Standing, undated: bool) -> String {
+    let mut shown = match before {
+        Some(before) => format!(
+            "{} -> {}",
+            standing(before, to.episodes),
+            standing(after, to.episodes)
+        ),
+        None => format!("adds it: {}", standing(after, to.episodes)),
+    };
+    let (started, completed, rewatches) = before.map_or((None, None, 0), |before| {
+        (before.started, before.completed, before.rewatches)
+    });
+    if after.started != started
+        && let Some(begun) = after.started
+    {
+        write!(shown, ", started {}", day(begun)).expect("a String accepts every write");
+        if undated {
+            shown.push_str(" if list has none");
+        }
+    }
+    if after.completed != completed
+        && let Some(ended) = after.completed
+    {
+        write!(shown, ", completed {}", day(ended)).expect("a String accepts every write");
+    }
+    if after.rewatches != rewatches {
+        write!(shown, ", rewatches {rewatches} -> {}", after.rewatches)
+            .expect("a String accepts every write");
+    }
+    shown
+}
+
+/// Why a viewing writes nothing to the entry it goes to.
+fn nothing(to: &Destination, why: Why) -> String {
+    match why {
+        Why::Conflict { progress } => {
+            format!("list already at {progress}/{}", count(to.episodes))
+        }
+        Why::Completed => "completed, rewatch begins at episode 1".to_owned(),
+        Why::PastCount { episodes } => format!("entry has {}", episodes_of(episodes)),
+        Why::EpisodeZero => "progress counts from episode 1".to_owned(),
+    }
+}
+
+/// Why an operation cannot be sent, with the episode it says was watched.
+fn unsent(why: &Unsent, episode: Option<u32>) -> String {
+    let number = episode.map_or_else(|| "no episode".to_owned(), |episode| episode.to_string());
+    match why {
+        Unsent::Unresolved(Unresolved::NotListed) => "not on the list".to_owned(),
+        Unsent::Unresolved(Unresolved::NoEpisode { episodes }) => format!(
+            "name spells no episode, entry has {}",
+            episodes.map_or_else(|| "no episode count".to_owned(), episodes_of)
+        ),
+        Unsent::Unresolved(Unresolved::Outside {
+            episodes: Some(episodes),
+        }) => format!(
+            "entry has {}, no rule takes episode {number}",
+            episodes_of(*episodes)
+        ),
+        Unsent::Unresolved(Unresolved::Outside { episodes: None }) => {
+            format!("no rule takes episode {number}")
+        }
+        Unsent::Unresolved(Unresolved::LaterSeason { season, episode }) => format!(
+            "{number} reads as season {season} episode {episode}; benshi map can name its entry"
+        ),
+        Unsent::Unresolved(Unresolved::Unnumbered) => {
+            format!("anime-relations gives no number for episode {number}")
+        }
+        Unsent::Departed => "no longer on the list, though it was".to_owned(),
+        Unsent::Unread(why) => why.clone(),
+    }
+}
+
+/// How many operations would write, how many would write nothing and how
+/// many cannot be sent, each where there are any.
+fn tally(operations: &[Rehearsed]) -> String {
+    let (mut writes, mut nothing, mut unsent) = (0, 0, 0);
+    for operation in operations {
+        match operation.action {
+            Action::Write { .. } => writes += 1,
+            Action::Nothing { .. } => nothing += 1,
+            Action::CannotSend { .. } => unsent += 1,
+        }
+    }
+
+    let mut counted = Vec::new();
+    if writes > 0 {
+        counted.push(counted_as(writes, "write", "writes"));
+    }
+    if nothing > 0 {
+        counted.push(format!("{nothing} nothing to write"));
+    }
+    if unsent > 0 {
+        counted.push(format!("{unsent} cannot send"));
+    }
+    format!(
+        "{}: {}; dry run, nothing sent",
+        counted_as(operations.len(), "operation", "operations"),
+        counted.join(", ")
+    )
+}
+
+/// Where the account stands on an entry: the status, and the progress out
+/// of the count, or out of `?` where the list holds no count.
+fn standing(of: &Standing, episodes: Option<u32>) -> String {
+    let status = match of.status {
+        Status::Planned => "planned",
+        Status::Watching => "watching",
+        Status::Rewatching => "rewatching",
+        Status::Completed => "completed",
+        Status::OnHold => "on hold",
+        Status::Dropped => "dropped",
+    };
+    format!("{status} {}/{}", of.progress, count(episodes))
+}
+
+/// A count of episodes, or `?` where the list holds none.
+fn count(episodes: Option<u32>) -> String {
+    episodes.map_or_else(|| "?".to_owned(), |episodes| episodes.to_string())
+}
+
+/// How many episodes, in words.
+fn episodes_of(episodes: u32) -> String {
+    counted_as(episodes, "episode", "episodes")
+}
+
+/// How many entries the list holds, in words.
+fn entries(of: usize) -> String {
+    if of == 0 {
+        "no entries".to_owned()
+    } else {
+        counted_as(of, "entry", "entries")
+    }
+}
+
+/// A count and the word for what it counts, in the singular for one.
+fn counted_as<T: Copy + std::fmt::Display + PartialEq + From<u8>>(
+    count: T,
+    one: &str,
+    several: &str,
+) -> String {
+    let word = if count == T::from(1) { one } else { several };
+    format!("{count} {word}")
+}
+
+/// A day as RFC 3339 writes a date.
+fn day(of: Day) -> String {
+    format!("{:04}-{:02}-{:02}", of.year, of.month, of.day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        capabilities, event, explanation, listing, logged_in, mapped, maps, moment, not_pinned,
-        pinned, removed, state, unpinned, why,
+        capabilities, dry_run, event, explanation, listing, logged_in, mapped, maps, moment,
+        not_pinned, pinned, removed, state, unpinned, why,
     };
     use benshi_core::clock::Timestamp;
+    use benshi_core::list::{EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::pin::Episodes;
     use benshi_core::policy::Policy;
@@ -544,10 +789,13 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_daemon::bus::BusEvent;
+    use benshi_daemon::delivery::{Action, Destination, DryRun, Rehearsed, Unsent, Watched};
     use benshi_daemon::protocol::{
         DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
     };
     use benshi_daemon::recognition::Recognizer;
+    use benshi_sync::plan::{Day, Standing, Why};
+    use benshi_sync::resolve::{By, Unresolved};
     // The reason a failure carries comes from here in the daemon, so the tests
     // that check how one reads take it from here too rather than writing one.
     use benshi_detect::WatchError;
@@ -1465,6 +1713,454 @@ mod tests {
             "\"Show Title\" to AniList 12345, \"Show Title Season 2\"\n\
              \"Show Title\" episodes 14-26 to AniList 12345 episodes 1-13, \"Show Title Season 2\"\n\
              \"Other Title\" episode 2 to AniList 678 episode 1, not on the list\n"
+        );
+    }
+
+    const fn november(day: u8) -> Day {
+        Day {
+            year: 2026,
+            month: 11,
+            day,
+        }
+    }
+
+    const fn standing(
+        status: Status,
+        progress: u32,
+        rewatches: u32,
+        started: Option<Day>,
+        completed: Option<Day>,
+    ) -> Standing {
+        Standing {
+            status,
+            progress,
+            rewatches,
+            started,
+            completed,
+        }
+    }
+
+    /// An operation of `Show Title` on this day of November.
+    fn rehearsed(id: i64, episode: Option<u32>, day: u8, action: Action) -> Rehearsed {
+        Rehearsed {
+            id,
+            watched: Some(Watched {
+                day: november(day),
+                title: "Show Title".to_owned(),
+                episode,
+            }),
+            action,
+        }
+    }
+
+    /// This episode of AniList 12345, a show's own entry of twelve episodes.
+    fn of_its_entry(episode: u32) -> Destination {
+        Destination {
+            entry: EntryId(12345),
+            episode,
+            by: By::Entry,
+            title: None,
+            episodes: Some(12),
+            listed: true,
+        }
+    }
+
+    /// A dry run of these operations over a list of 410 entries.
+    fn over_the_list(operations: Vec<Rehearsed>) -> String {
+        dry_run(&DryRun {
+            entries: 410,
+            operations,
+        })
+    }
+
+    /// The lines a dry run of one operation says of it.
+    fn said_of(operation: Rehearsed) -> Vec<String> {
+        over_the_list(vec![operation])
+            .lines()
+            .skip(2)
+            .take(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_dry_run_says_each_operation_under_the_list_it_reads_and_over_a_count() {
+        let said = over_the_list(vec![
+            rehearsed(
+                41,
+                Some(3),
+                1,
+                Action::Write {
+                    to: of_its_entry(3),
+                    before: Some(standing(Status::Planned, 0, 0, None, None)),
+                    after: standing(Status::Watching, 3, 0, Some(november(1)), None),
+                    undated: true,
+                },
+            ),
+            rehearsed(
+                42,
+                Some(3),
+                2,
+                Action::Nothing {
+                    to: of_its_entry(3),
+                    why: Why::Conflict { progress: 3 },
+                },
+            ),
+            rehearsed(
+                43,
+                Some(12),
+                2,
+                Action::Write {
+                    to: of_its_entry(12),
+                    before: Some(standing(Status::Watching, 3, 0, Some(november(1)), None)),
+                    after: standing(
+                        Status::Completed,
+                        12,
+                        0,
+                        Some(november(1)),
+                        Some(november(2)),
+                    ),
+                    undated: false,
+                },
+            ),
+            rehearsed(
+                44,
+                Some(14),
+                3,
+                Action::Write {
+                    to: Destination {
+                        entry: EntryId(900_001),
+                        episode: 1,
+                        by: By::Rule,
+                        title: None,
+                        episodes: None,
+                        listed: false,
+                    },
+                    before: None,
+                    after: standing(Status::Watching, 1, 0, Some(november(3)), None),
+                    undated: false,
+                },
+            ),
+            Rehearsed {
+                id: 45,
+                watched: Some(Watched {
+                    day: november(4),
+                    title: "Unlisted Show".to_owned(),
+                    episode: Some(2),
+                }),
+                action: Action::CannotSend {
+                    to: None,
+                    why: Unsent::Unresolved(Unresolved::NotListed),
+                },
+            },
+        ]);
+
+        assert_eq!(
+            said,
+            [
+                "AniList, list as last read: 410 entries",
+                "",
+                "#41 2026-11-01 \"Show Title\" episode 3 -> AniList 12345 episode 3",
+                "    planned 0/12 -> watching 3/12, started 2026-11-01 if list has none",
+                "#42 2026-11-02 \"Show Title\" episode 3 -> AniList 12345 episode 3",
+                "    nothing to write: list already at 3/12",
+                "#43 2026-11-02 \"Show Title\" episode 12 -> AniList 12345 episode 12",
+                "    watching 3/12 -> completed 12/12, completed 2026-11-02",
+                "#44 2026-11-03 \"Show Title\" episode 14 -> AniList 900001 episode 1, \
+                 by anime-relations, not on the list",
+                "    adds it: watching 1/?, started 2026-11-03",
+                "#45 2026-11-04 \"Unlisted Show\" episode 2",
+                "    cannot send: not on the list",
+                "",
+                "5 operations: 3 writes, 1 nothing to write, 1 cannot send; dry run, nothing sent",
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_dry_run_with_nothing_past_the_cursor_says_nothing_waits() {
+        assert_eq!(
+            over_the_list(Vec::new()),
+            "AniList, list as last read: 410 entries\n\nnothing waits to be sent\n"
+        );
+    }
+
+    #[test]
+    fn a_list_of_one_entry_or_none_is_counted_in_words() {
+        for (entries, header) in [
+            (0, "AniList, list as last read: no entries"),
+            (1, "AniList, list as last read: 1 entry"),
+        ] {
+            let said = dry_run(&DryRun {
+                entries,
+                operations: Vec::new(),
+            });
+
+            assert_eq!(said.lines().next(), Some(header));
+        }
+    }
+
+    #[test]
+    fn a_count_of_one_is_said_in_the_singular_and_a_count_of_none_not_at_all() {
+        let said = over_the_list(vec![rehearsed(
+            41,
+            Some(3),
+            1,
+            Action::Write {
+                to: of_its_entry(3),
+                before: Some(standing(Status::Watching, 2, 0, Some(november(1)), None)),
+                after: standing(Status::Watching, 3, 0, Some(november(1)), None),
+                undated: false,
+            },
+        )]);
+
+        assert_eq!(
+            said.lines().last(),
+            Some("1 operation: 1 write; dry run, nothing sent")
+        );
+    }
+
+    #[test]
+    fn every_write_says_what_changes_and_no_more() {
+        let film = Destination {
+            episodes: Some(1),
+            ..of_its_entry(1)
+        };
+        for (to, before, after, written) in [
+            (
+                of_its_entry(1),
+                standing(
+                    Status::Completed,
+                    12,
+                    0,
+                    Some(november(1)),
+                    Some(november(1)),
+                ),
+                standing(
+                    Status::Rewatching,
+                    1,
+                    0,
+                    Some(november(1)),
+                    Some(november(1)),
+                ),
+                "completed 12/12 -> rewatching 1/12",
+            ),
+            (
+                of_its_entry(12),
+                standing(Status::Rewatching, 11, 1, None, None),
+                standing(Status::Completed, 12, 2, None, None),
+                "rewatching 11/12 -> completed 12/12, rewatches 1 -> 2",
+            ),
+            (
+                film,
+                standing(Status::Completed, 1, 0, None, None),
+                standing(Status::Completed, 1, 1, None, None),
+                "completed 1/1 -> completed 1/1, rewatches 0 -> 1",
+            ),
+            (
+                of_its_entry(5),
+                standing(Status::OnHold, 4, 0, None, None),
+                standing(Status::Watching, 5, 0, Some(november(1)), None),
+                "on hold 4/12 -> watching 5/12, started 2026-11-01 if list has none",
+            ),
+            (
+                of_its_entry(12),
+                standing(Status::Dropped, 4, 0, None, None),
+                standing(
+                    Status::Completed,
+                    12,
+                    0,
+                    Some(november(1)),
+                    Some(november(1)),
+                ),
+                "dropped 4/12 -> completed 12/12, started 2026-11-01 if list has none, \
+                 completed 2026-11-01",
+            ),
+        ] {
+            let said = said_of(rehearsed(
+                41,
+                Some(to.episode),
+                1,
+                Action::Write {
+                    to,
+                    before: Some(before),
+                    after,
+                    undated: true,
+                },
+            ));
+
+            assert_eq!(said[1], format!("    {written}"));
+        }
+    }
+
+    #[test]
+    fn every_reason_to_write_nothing_is_said() {
+        for (why, said) in [
+            (
+                Why::Completed,
+                "nothing to write: completed, rewatch begins at episode 1",
+            ),
+            (
+                Why::PastCount { episodes: 13 },
+                "nothing to write: entry has 13 episodes",
+            ),
+            (
+                Why::PastCount { episodes: 1 },
+                "nothing to write: entry has 1 episode",
+            ),
+            (
+                Why::EpisodeZero,
+                "nothing to write: progress counts from episode 1",
+            ),
+        ] {
+            let lines = said_of(rehearsed(
+                41,
+                Some(14),
+                1,
+                Action::Nothing {
+                    to: of_its_entry(14),
+                    why,
+                },
+            ));
+
+            assert_eq!(lines[1], format!("    {said}"));
+        }
+    }
+
+    #[test]
+    fn every_reason_an_operation_cannot_be_sent_is_said() {
+        for (episode, why, said) in [
+            (
+                Some(4),
+                Unsent::Departed,
+                "cannot send: no longer on the list, though it was",
+            ),
+            (
+                None,
+                Unsent::Unresolved(Unresolved::NoEpisode { episodes: Some(12) }),
+                "cannot send: name spells no episode, entry has 12 episodes",
+            ),
+            (
+                None,
+                Unsent::Unresolved(Unresolved::NoEpisode { episodes: None }),
+                "cannot send: name spells no episode, entry has no episode count",
+            ),
+            (
+                Some(14),
+                Unsent::Unresolved(Unresolved::Outside { episodes: Some(13) }),
+                "cannot send: entry has 13 episodes, no rule takes episode 14",
+            ),
+            (
+                Some(0),
+                Unsent::Unresolved(Unresolved::Outside { episodes: None }),
+                "cannot send: no rule takes episode 0",
+            ),
+            (
+                Some(201),
+                Unsent::Unresolved(Unresolved::LaterSeason {
+                    season: 2,
+                    episode: 1,
+                }),
+                "cannot send: 201 reads as season 2 episode 1; benshi map can name its entry",
+            ),
+            (
+                Some(14),
+                Unsent::Unresolved(Unresolved::Unnumbered),
+                "cannot send: anime-relations gives no number for episode 14",
+            ),
+        ] {
+            let lines = said_of(rehearsed(
+                41,
+                episode,
+                1,
+                Action::CannotSend { to: None, why },
+            ));
+
+            assert_eq!(lines[1], format!("    {said}"));
+        }
+    }
+
+    #[test]
+    fn where_an_operation_goes_is_said_with_what_decided_it() {
+        let season_two = |by| Destination {
+            entry: EntryId(900_002),
+            episode: 3,
+            by,
+            title: Some("Show Title Season 2".to_owned()),
+            episodes: Some(12),
+            listed: true,
+        };
+        for (episode, action, said) in [
+            (
+                Some(203),
+                Action::Nothing {
+                    to: season_two(By::Pin),
+                    why: Why::Conflict { progress: 3 },
+                },
+                "#41 2026-11-01 \"Show Title\" episode 203 -> AniList 900002 \
+                 \"Show Title Season 2\" episode 3, by benshi map",
+            ),
+            (
+                Some(15),
+                Action::Nothing {
+                    to: season_two(By::Rule),
+                    why: Why::Conflict { progress: 3 },
+                },
+                "#41 2026-11-01 \"Show Title\" episode 15 -> AniList 900002 \
+                 \"Show Title Season 2\" episode 3, by anime-relations",
+            ),
+            (
+                None,
+                Action::Nothing {
+                    to: Destination {
+                        entry: EntryId(678),
+                        episodes: Some(1),
+                        ..of_its_entry(1)
+                    },
+                    why: Why::Completed,
+                },
+                "#41 2026-11-01 \"Show Title\" no episode -> AniList 678 episode 1",
+            ),
+            (
+                Some(4),
+                Action::CannotSend {
+                    to: Some(Destination {
+                        episodes: None,
+                        listed: false,
+                        ..of_its_entry(4)
+                    }),
+                    why: Unsent::Departed,
+                },
+                "#41 2026-11-01 \"Show Title\" episode 4 -> AniList 12345 episode 4",
+            ),
+        ] {
+            let lines = said_of(rehearsed(41, episode, 1, action));
+
+            assert_eq!(lines[0], said);
+        }
+    }
+
+    #[test]
+    fn a_row_that_holds_no_operation_is_said_with_why() {
+        let lines = said_of(Rehearsed {
+            id: 48,
+            watched: None,
+            action: Action::CannotSend {
+                to: None,
+                why: Unsent::Unread(
+                    "queued operation 48 is for a show that is not there".to_owned(),
+                ),
+            },
+        });
+
+        assert_eq!(
+            lines,
+            [
+                "#48 cannot be read",
+                "    cannot send: queued operation 48 is for a show that is not there",
+            ]
         );
     }
 }

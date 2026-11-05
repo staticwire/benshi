@@ -22,6 +22,7 @@ use benshi_detect::SourceInfo;
 use serde::{Deserialize, Serialize};
 
 use crate::bus::BusEvent;
+use crate::delivery::DryRun;
 use crate::mapping::{Given, Meant, Pinned};
 use crate::recognition::Decision;
 
@@ -125,6 +126,12 @@ pub enum Request {
     ///
     /// Answered with [`Response::Pins`] or [`Response::Error`].
     Pins,
+
+    /// What sending every operation past the cursor would write, by the list
+    /// as the store last filed it, sending nothing.
+    ///
+    /// Answered with [`Response::DryRun`] or [`Response::Error`].
+    DryRun,
 }
 
 /// A name the user gave, and the entry it means.
@@ -314,6 +321,9 @@ pub enum Response {
 
     /// Every pin made, in answer to [`Request::Pins`].
     Pins(Vec<PinListing>),
+
+    /// What sending would write, in answer to [`Request::DryRun`].
+    DryRun(DryRun),
 }
 
 /// The most recent decision, as a client is told it.

@@ -32,10 +32,11 @@
 //! it has no place for episode 0.
 
 use benshi_core::list::Status;
+use serde::{Deserialize, Serialize};
 
 /// A day of the calendar, as a list keeps the day an entry was begun or
 /// completed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Day {
     /// The year.
     pub year: u16,
@@ -47,7 +48,7 @@ pub struct Day {
 
 /// Where the account stands on a work, as its list holds it, or as a write
 /// leaves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Standing {
     /// The status.
     pub status: Status,
@@ -62,7 +63,7 @@ pub struct Standing {
 }
 
 /// Why a viewing writes nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Why {
     /// The episode is at or below the progress the list holds.
     Conflict {

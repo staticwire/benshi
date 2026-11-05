@@ -1788,6 +1788,7 @@ mod tests {
                 show: show_of(SERIES),
                 title: SERIES.to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
+                at: the_time(),
             }]
         );
     }
@@ -2357,6 +2358,7 @@ mod tests {
                 show: ShowId(4),
                 title: "Some Other Show".to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
+                at: the_time(),
             }]
         );
         assert_eq!(database.count_of("names"), [1]);
@@ -2413,6 +2415,7 @@ mod tests {
                 show,
                 title: "Departed Show".to_owned(),
                 kind: Kind::Progress { episode: Some(3) },
+                at: the_time(),
             }]
         );
     }

@@ -34,6 +34,7 @@
 
 use benshi_core::ShowId;
 use benshi_core::list::EntryId;
+use serde::{Deserialize, Serialize};
 
 use crate::relations::{Redirect, Relations, Service};
 
@@ -69,7 +70,7 @@ pub struct Listed {
 }
 
 /// What decided where an episode goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum By {
     /// A pin the user made.
     Pin,
@@ -80,7 +81,7 @@ pub enum By {
 }
 
 /// Why an episode was not resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unresolved {
     /// No pin names the episode, and the list links the show to no entry.
     NotListed,

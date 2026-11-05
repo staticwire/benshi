@@ -84,7 +84,7 @@ impl Store {
         ))?;
         statement
             .query_map([backend], |row| {
-                let reason = String::from_utf8_lossy(text_bytes(row.get_ref(5)?)).into_owned();
+                let reason = String::from_utf8_lossy(text_bytes(row.get_ref(6)?)).into_owned();
                 Ok((read_operation(row)?, reason))
             })?
             .map(|row| {
@@ -591,6 +591,29 @@ mod tests {
             );
         }
         assert!(pending[2].operation.is_ok(), "{pending:?}");
+    }
+
+    #[test]
+    fn a_row_queued_at_no_instant_is_answered_in_its_place() {
+        let (_home, store, operations) = a_log_of(2);
+        store
+            .connection
+            .execute(
+                "UPDATE sync_queue SET created_at = 'yesterday' WHERE id = ?1",
+                [operations[0]],
+            )
+            .expect("the row is changed");
+
+        let pending = store.pending(ANILIST).expect("the log reads");
+
+        assert!(
+            matches!(
+                &pending[0].operation,
+                Err(Error::Operation { id, .. }) if *id == operations[0]
+            ),
+            "{pending:?}"
+        );
+        assert!(pending[1].operation.is_ok(), "{pending:?}");
     }
 
     #[test]
