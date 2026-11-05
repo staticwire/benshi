@@ -111,7 +111,7 @@ pub fn main(arguments: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use crate::commands::{Command, EntryArgument, Ep, PolicyArgument};
+    use crate::commands::{Command, EntryArgument, Ep, PolicyArgument, Sending};
     use benshi_core::pin::Episodes;
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
@@ -178,6 +178,31 @@ mod tests {
         assert_eq!(logout.command, Command::Logout);
         assert!(Cli::try_parse_from(["benshi", "login", "a.pasted.token"]).is_err());
         assert!(Cli::try_parse_from(["benshi", "logout", "anilist"]).is_err());
+    }
+
+    #[test]
+    fn sync_now_takes_dry_run() {
+        let asked = Cli::try_parse_from(["benshi", "sync", "now", "--dry-run"]).expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Sync {
+                sending: Sending::Now { dry_run: true },
+            }
+        );
+    }
+
+    #[test]
+    fn sync_takes_now_and_dry_run_and_nothing_else() {
+        // This build sends nothing, so the one run it takes is the dry run.
+        for refused in [
+            &["benshi", "sync"][..],
+            &["benshi", "sync", "now"],
+            &["benshi", "sync", "--dry-run"],
+            &["benshi", "sync", "now", "--dry-run", "anilist"],
+        ] {
+            assert!(Cli::try_parse_from(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

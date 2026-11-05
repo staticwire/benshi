@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use benshi_cli::commands::{Command, EntryArgument, PolicyArgument, run};
+use benshi_cli::commands::{Command, EntryArgument, PolicyArgument, Sending, run};
 use benshi_cli::prompt::Typed;
 use benshi_core::clock::Timestamp;
 use benshi_core::list::{Entry, EntryId, Status};
@@ -29,13 +29,15 @@ use benshi_core::token::Token;
 use benshi_core::{AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot};
 use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::{BusEvent, EventBus};
+use benshi_daemon::delivery::Delivery;
 use benshi_daemon::detection::{Detection, Seen, Wiring};
 use benshi_daemon::ipc::{Server, bind};
 use benshi_daemon::listing::{self, BACKEND, Wakes};
 use benshi_daemon::mapping::Mapping;
 use benshi_daemon::recognition::{Current, Decided};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
-use benshi_store::Store;
+use benshi_store::{Store, Viewing};
+use jiff::tz::TimeZone;
 use tempfile::TempDir;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::timeout;
@@ -161,6 +163,12 @@ impl Daemon {
     /// A daemon whose player has `file` open, with `listed` filed in its
     /// store as a list read files it.
     fn listing(file: &'static str, listed: &[Entry]) -> Self {
+        Self::having_seen(file, listed, &[])
+    }
+
+    /// [`Daemon::listing`], with these episodes of the first entry of
+    /// `listed` recorded as seen at noon, UTC, on November 1, 2026.
+    fn having_seen(file: &'static str, listed: &[Entry], episodes: &[u32]) -> Self {
         let platform = OnePlayer::playing(file);
         let bus = Arc::new(EventBus::new());
         let policy = Arc::new(RwLock::new(PolicyTable::allowing_video_players()));
@@ -170,6 +178,9 @@ impl Daemon {
         let database = home.path().join("data").join("benshi.db");
         let mut store = Store::open(&database).expect("the database opens");
         store.file(BACKEND, listed).expect("the list is filed");
+        if let Some(first) = listed.first() {
+            record_seen(&mut store, first.id, episodes);
+        }
         let recognizer = Current::new(listing::kept(&store).expect("the list reads"));
         let store = Arc::new(Mutex::new(store));
 
@@ -198,7 +209,8 @@ impl Daemon {
             decided,
             Arc::new(NoLogins),
             Wakes::new(),
-            Mapping::new(store, recognizer),
+            Mapping::new(Arc::clone(&store), recognizer),
+            Delivery::new(store, TimeZone::UTC),
         ));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 
@@ -222,6 +234,32 @@ impl Daemon {
         );
 
         (outcome, String::from_utf8(out).expect("valid utf-8"))
+    }
+}
+
+/// Record these episodes of the show `entry` is filed under as seen at
+/// noon, UTC, on November 1, 2026.
+fn record_seen(store: &mut Store, entry: EntryId, episodes: &[u32]) {
+    let show = store
+        .listed(BACKEND)
+        .expect("the list reads")
+        .into_iter()
+        .find(|(_, listed)| listed.id == entry)
+        .map(|(show, _)| show)
+        .expect("the entry is filed");
+    for &episode in episodes {
+        store
+            .record(&Viewing {
+                show,
+                episode: Some(episode),
+                media: RawPath::from_bytes(format!("/anime/Show - {episode:02}.mkv").into_bytes()),
+                at: SystemTime::from(
+                    "2026-11-01T12:00:00Z"
+                        .parse::<jiff::Timestamp>()
+                        .expect("an instant"),
+                ),
+            })
+            .expect("the viewing is recorded");
     }
 }
 
@@ -366,5 +404,31 @@ async fn a_name_mapped_at_the_client_decides_the_rounds_after_it() {
     assert!(
         after.contains("stage: altname, assigned \"Nisekoi\""),
         "{after}"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_at_the_client_says_what_sending_would_write() {
+    let daemon = Daemon::having_seen(PLAYING, &[an_entry(900_001, "Nisekoi")], &[3]);
+
+    let (outcome, shown) = daemon
+        .ask(Command::Sync {
+            sending: Sending::Now { dry_run: true },
+        })
+        .await;
+
+    assert_eq!(outcome, ExitCode::SUCCESS);
+    assert_eq!(
+        shown,
+        [
+            "AniList, list as last read: 1 entry",
+            "",
+            "#1 2026-11-01 \"Nisekoi\" episode 3 -> AniList 900001 episode 3",
+            "    watching 0/12 -> watching 3/12, started 2026-11-01 if list has none",
+            "",
+            "1 operation: 1 write; dry run, nothing sent",
+        ]
+        .map(|line| format!("{line}\n"))
+        .concat()
     );
 }

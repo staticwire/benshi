@@ -26,9 +26,10 @@ use tokio::task::JoinSet;
 
 use crate::accounts::{Accounts, LoggedIn};
 use crate::bus::EventBus;
+use crate::delivery::Delivery;
 use crate::detection::Seen;
 use crate::listing::Wakes;
-use crate::mapping::{Mapping, Refused};
+use crate::mapping::Mapping;
 use crate::protocol::{Explanation, NameListing, PinListing, Request, Response, SourceListing};
 use crate::recognition::Decided;
 use crate::supervisor::TaskError;
@@ -274,15 +275,20 @@ pub struct Server {
     accounts: Arc<dyn Accounts>,
     wakes: Wakes,
     mapping: Mapping,
+    delivery: Delivery,
 }
 
 impl Server {
     /// A server over the bus a `Watch` streams, the table a listing reads and a
     /// policy is set in, the two records each detection round leaves behind,
     /// what it saw and what it last decided, what a login and a logout are
-    /// carried out by, the list's task, which a login wakes, and where the
-    /// names the user gives are kept.
+    /// carried out by, the list's task, which a login wakes, where the names
+    /// the user gives are kept, and what a dry run of delivery reads.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each part is built by the caller, so that a test can give its own"
+    )]
     pub fn new(
         bus: Arc<EventBus>,
         policy: Arc<RwLock<PolicyTable>>,
@@ -291,6 +297,7 @@ impl Server {
         accounts: Arc<dyn Accounts>,
         wakes: Wakes,
         mapping: Mapping,
+        delivery: Delivery,
     ) -> Self {
         Self {
             bus,
@@ -300,6 +307,7 @@ impl Server {
             accounts,
             wakes,
             mapping,
+            delivery,
         }
     }
 
@@ -462,6 +470,7 @@ impl Server {
                 Ok(Request::Pins) => answered(self.mapping.pins().await, |pins| {
                     Response::Pins(pins.iter().map(PinListing::of).collect())
                 }),
+                Ok(Request::DryRun) => answered(self.delivery.dry_run().await, Response::DryRun),
                 // A stream rather than an answer, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
@@ -524,8 +533,8 @@ impl Server {
 }
 
 /// The answer to a request carried out, or the error it was refused with.
-fn answered<T>(
-    asked: std::result::Result<T, Refused>,
+fn answered<T, E: fmt::Display>(
+    asked: std::result::Result<T, E>,
     answer: impl FnOnce(T) -> Response,
 ) -> Response {
     match asked {
@@ -564,6 +573,7 @@ mod tests {
     use super::{Fallback, NoRuntimeDirectory, Server, bind, fallback_from, socket_path_from};
     use crate::accounts::{self, Accounts, Done, LoggedIn};
     use crate::bus::{BusEvent, EventBus};
+    use crate::delivery::{Delivery, DryRun};
     use crate::detection::Seen;
     use crate::listing::Wakes;
     use crate::mapping::Mapping;
@@ -583,6 +593,7 @@ mod tests {
     };
     use benshi_detect::SourceInfo;
     use benshi_store::Store;
+    use jiff::tz::TimeZone;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -763,6 +774,7 @@ mod tests {
                 Store::open(&home.path().join("benshi.db")).expect("the database opens"),
             ));
             let mapping = Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty()));
+            let delivery = Delivery::new(Arc::clone(&store), TimeZone::UTC);
             Self {
                 server: Arc::new(Server::new(
                     Arc::clone(&bus),
@@ -772,6 +784,7 @@ mod tests {
                     Arc::clone(&accounts) as Arc<dyn Accounts>,
                     wakes.clone(),
                     mapping,
+                    delivery,
                 )),
                 bus,
                 policy,
@@ -1051,6 +1064,23 @@ mod tests {
         assert_eq!(pins, Response::Pins(vec![listed]));
         assert_eq!(taken, Response::Unpinned(Some("Nisekoi".to_owned())));
         assert_eq!(none, Response::Pins(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_is_answered_by_what_the_store_holds() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::DryRun).await;
+
+        assert_eq!(
+            client.answer().await,
+            Response::DryRun(DryRun {
+                entries: 2,
+                operations: Vec::new(),
+            })
+        );
     }
 
     #[tokio::test]

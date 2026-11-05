@@ -103,6 +103,32 @@ impl Store {
             .query_and_then([backend], |row| read(backend, row))?
             .collect()
     }
+
+    /// Every show of a backend whose entry left the list, with that entry,
+    /// lowest show first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the database cannot be read because another
+    /// connection has it, and [`Error::Write`] when it cannot be read for any
+    /// other reason.
+    pub fn departed(&self, backend: &str) -> Result<Vec<(ShowId, EntryId)>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT show, entry FROM backend_ids \
+             WHERE backend = ?1 AND NOT EXISTS ( \
+                 SELECT 1 FROM list_entries \
+                 WHERE list_entries.backend = backend_ids.backend \
+                   AND list_entries.entry = backend_ids.entry) \
+             ORDER BY show",
+        )?;
+
+        let departed = statement
+            .query_map([backend], |row| {
+                Ok((ShowId(row.get(0)?), EntryId(row.get(1)?)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(departed)
+    }
 }
 
 /// Keep the names of every entry linked on the backend that `entries` does
@@ -440,6 +466,75 @@ mod tests {
 
         assert_eq!(store.listed(BACKEND).expect("the list is read"), first);
         assert_eq!(count(&store, "shows"), 2);
+    }
+
+    #[test]
+    fn a_show_whose_entry_left_the_list_has_departed_with_that_entry() {
+        // The second entry is numbered above the third, so the order of the
+        // shows is not the order of the entries.
+        let (_home, mut store) = a_store();
+        store
+            .file(
+                BACKEND,
+                &[
+                    a_series(21, "Show Title"),
+                    a_film(112_151),
+                    a_series(999, "Another Show"),
+                ],
+            )
+            .expect("the list is filed");
+
+        store
+            .file(BACKEND, &[a_series(21, "Show Title")])
+            .expect("the list is filed with the first entry alone");
+
+        assert_eq!(
+            store.departed(BACKEND).expect("the links are read"),
+            [(ShowId(2), EntryId(112_151)), (ShowId(3), EntryId(999))]
+        );
+    }
+
+    #[test]
+    fn an_entry_that_comes_back_to_the_list_has_not_departed() {
+        let (_home, mut store) = a_store();
+        let list = [a_series(21, "Show Title"), a_film(112_151)];
+        store.file(BACKEND, &list).expect("the list is filed");
+        store
+            .file(BACKEND, &list[..1])
+            .expect("the list is filed without the film");
+
+        store
+            .file(BACKEND, &list)
+            .expect("the list is filed with the film again");
+
+        assert_eq!(
+            store.departed(BACKEND).expect("the links are read"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn an_entry_that_left_the_list_of_another_backend_has_not_departed_from_this_one() {
+        let (_home, mut store) = a_store();
+        store
+            .file(BACKEND, &[a_series(21, "Show Title")])
+            .expect("one list is filed");
+        store
+            .file("another", &[a_series(21, "Another Show")])
+            .expect("the other list is filed");
+
+        store
+            .file("another", &[])
+            .expect("the other list is filed empty");
+
+        assert_eq!(
+            store.departed(BACKEND).expect("the links are read"),
+            Vec::new()
+        );
+        assert_eq!(
+            store.departed("another").expect("the links are read"),
+            [(ShowId(2), EntryId(21))]
+        );
     }
 
     /// The show a name is kept as, by the key of its spelling.

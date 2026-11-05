@@ -539,6 +539,7 @@ async fn a_running_daemon_records_what_its_detection_watched() {
             show: THE_SHOW,
             title: "Show".to_owned(),
             kind: Kind::Progress { episode: Some(3) },
+            at: the_time(),
         }]
     );
     let seen_at: String = rusqlite::Connection::open(the_database(&home))
@@ -637,6 +638,7 @@ fn the_episode_queued(store: &Arc<Mutex<Store>>) -> [Operation; 1] {
         show,
         title: "Show".to_owned(),
         kind: Kind::Progress { episode: Some(3) },
+        at: the_time(),
     }]
 }
 
@@ -933,6 +935,7 @@ async fn a_daemon_whose_database_was_in_use_records_once_it_is_free() {
             show: THE_SHOW,
             title: "Show".to_owned(),
             kind: Kind::Progress { episode: Some(3) },
+            at: the_time(),
         }]
     );
     let stopped: Vec<Notice> = told

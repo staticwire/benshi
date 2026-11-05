@@ -32,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use benshi_core::ShowId;
 use benshi_core::list::EntryId;
+use benshi_core::{BoxError, ShowId};
 use rusqlite::{Connection, OptionalExtension};
 
 pub use migrate::SCHEMA_VERSION;
@@ -105,9 +105,9 @@ pub enum Error {
     Operation {
         /// The row's `id` in `sync_queue`.
         id: i64,
-        /// What the kind or the payload failed on.
+        /// What the kind, the payload or the instant failed on.
         #[source]
-        cause: serde_json::Error,
+        cause: BoxError,
     },
     /// A row of `decided` that cannot be read as a write.
     #[error("write {backend} decided for operation {operation} cannot be read: {cause}")]
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(
             Error::Operation {
                 id: 7,
-                cause: unread()
+                cause: unread().into()
             }
             .to_string(),
             format!("queued operation 7 cannot be read: {}", unread())
