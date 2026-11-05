@@ -1,4 +1,7 @@
-//! The operations waiting to be delivered to a list.
+//! The log of operations to deliver to the lists.
+//!
+//! Nothing deletes from the log: each backend keeps its own place in it, as
+//! [`delivery`](crate::delivery) holds it.
 //!
 //! An operation is one row of `sync_queue`: the show it is about, its kind,
 //! a payload whose shape the kind decides, and the instant it was queued. The
@@ -17,6 +20,7 @@
 
 use benshi_core::ShowId;
 use benshi_core::list::{Rating, Status};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -97,35 +101,62 @@ impl Store {
     /// an operation, each naming the row: the reading fails whole rather
     /// than answering without it.
     pub fn queued(&self) -> Result<Vec<Operation>, Error> {
-        let mut statement = self.connection.prepare(
-            "SELECT sync_queue.id, sync_queue.show, shows.title, sync_queue.kind, \
-             sync_queue.payload \
-             FROM sync_queue LEFT JOIN shows ON shows.id = sync_queue.show \
-             ORDER BY sync_queue.id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {OPERATION} FROM {LOG} ORDER BY sync_queue.id"
+        ))?;
+        statement
+            .query_map([], read_operation)?
+            .map(|row| row?.1)
+            .collect()
+    }
+}
 
-        rows.map(|row| {
-            let (id, show, title, kind, payload) = row?;
-            let title = title.ok_or(Error::Orphan { id })?;
-            let kind = Kind::from_columns(&kind, &payload)
-                .map_err(|cause| Error::Operation { id, cause })?;
-            Ok(Operation {
-                id,
-                show: ShowId(show),
-                title,
-                kind,
-            })
+/// The columns an operation is read from, as [`read_operation`] reads them,
+/// over [`LOG`].
+pub(crate) const OPERATION: &str =
+    "sync_queue.id, sync_queue.show, shows.title, sync_queue.kind, sync_queue.payload";
+
+/// The log, with the title of each operation's show where the show is there.
+pub(crate) const LOG: &str = "sync_queue LEFT JOIN shows ON shows.id = sync_queue.show";
+
+/// The `id` of a row that starts with the columns [`OPERATION`] names, and
+/// the operation the row holds or why it holds none: [`Error::Orphan`] where
+/// the show is not there, and [`Error::Operation`] where the kind and the
+/// payload make no operation.
+///
+/// Each column of text is read as [`text_bytes`] reads it, so that a row
+/// written by hand is answered with its `id` whatever its columns hold.
+///
+/// # Errors
+///
+/// A [`rusqlite::Error`] where the row does not start with those columns.
+pub(crate) fn read_operation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, Result<Operation, Error>)> {
+    let id = row.get(0)?;
+    let (ValueRef::Integer(show), title @ (ValueRef::Text(_) | ValueRef::Blob(_))) =
+        (row.get_ref(1)?, row.get_ref(2)?)
+    else {
+        return Ok((id, Err(Error::Orphan { id })));
+    };
+    let operation = Kind::from_columns(text_bytes(row.get_ref(3)?), text_bytes(row.get_ref(4)?))
+        .map(|kind| Operation {
+            id,
+            show: ShowId(show),
+            title: String::from_utf8_lossy(text_bytes(title)).into_owned(),
+            kind,
         })
-        .collect()
+        .map_err(|cause| Error::Operation { id, cause });
+    Ok((id, operation))
+}
+
+/// The bytes a column of text holds, a blob there read as the text it
+/// holds, as SQLite reads one. SQLite keeps a number written there as text,
+/// and `NULL` reads as empty.
+pub(crate) fn text_bytes(value: ValueRef<'_>) -> &[u8] {
+    match value {
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
+        ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => &[],
     }
 }
 
@@ -149,11 +180,12 @@ impl Kind {
         Ok((kind, payload.get().to_owned()))
     }
 
-    /// The kind that two columns hold.
-    fn from_columns(kind: &str, payload: &str) -> serde_json::Result<Self> {
+    /// The kind that two columns hold, each as the bytes of its text.
+    fn from_columns(kind: &[u8], payload: &[u8]) -> serde_json::Result<Self> {
         let columns = Columns {
-            kind: kind.to_owned(),
-            payload: serde_json::from_str(payload)?,
+            // A byte that is not UTF-8 reads as U+FFFD, which no kind has in its name.
+            kind: String::from_utf8_lossy(kind).into_owned(),
+            payload: serde_json::from_slice(payload)?,
         };
         serde_json::from_str(&serde_json::to_string(&columns)?)
     }

@@ -183,6 +183,7 @@ fn refused(error: benshi_store::Error) -> TaskError {
         | Error::FromTheFuture { .. }
         | Error::Write(_)
         | Error::Operation { .. }
+        | Error::Decided { .. }
         | Error::Orphan { .. }
         | Error::Entry { .. }
         | Error::Showless { .. }

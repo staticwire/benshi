@@ -1,8 +1,9 @@
 //! The canonical local store.
 //!
 //! One SQLite database holds what was watched, what is being watched, the
-//! operations still to be delivered to a list, and what each list held when it
-//! was last read. Migrations are numbered and each has a test.
+//! log of operations to deliver to the lists, where each backend is in that
+//! log, and what each list held when it was last read. Migrations are numbered
+//! and each has a test.
 //!
 //! Recording an episode does not depend on a list being reachable. A network
 //! problem, a dead API or an expired token is a delivery problem, so marking an
@@ -18,6 +19,7 @@
 //! that is belongs to the layer that knows the platform.
 
 mod assignments;
+pub mod delivery;
 mod list;
 mod migrate;
 mod names;
@@ -104,6 +106,17 @@ pub enum Error {
         /// The row's `id` in `sync_queue`.
         id: i64,
         /// What the kind or the payload failed on.
+        #[source]
+        cause: serde_json::Error,
+    },
+    /// A row of `decided` that cannot be read as a write.
+    #[error("write {backend} decided for operation {operation} cannot be read: {cause}")]
+    Decided {
+        /// The backend that decided it.
+        backend: String,
+        /// The `id` in `sync_queue` of the operation it was decided for.
+        operation: i64,
+        /// What the write failed on.
         #[source]
         cause: serde_json::Error,
     },
@@ -815,6 +828,18 @@ mod tests {
         assert_eq!(
             Error::Orphan { id: 7 }.to_string(),
             "queued operation 7 is for a show that is not there"
+        );
+        assert_eq!(
+            Error::Decided {
+                backend: "anilist".to_owned(),
+                operation: 7,
+                cause: unread()
+            }
+            .to_string(),
+            format!(
+                "write anilist decided for operation 7 cannot be read: {}",
+                unread()
+            )
         );
         assert_eq!(
             Error::Entry {

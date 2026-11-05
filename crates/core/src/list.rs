@@ -51,7 +51,7 @@ pub struct Entry {
 /// Where an account stands on one work, as a write tells a list.
 ///
 /// The score is not in it: a write leaves the score as the list holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Write {
     /// The work.
     pub id: EntryId,
@@ -144,7 +144,7 @@ impl<'de> Deserialize<'de> for Rating {
 
 #[cfg(test)]
 mod tests {
-    use super::Rating;
+    use super::{EntryId, Rating, Status, Write};
 
     #[test]
     fn a_rating_is_from_one_to_a_hundred() {
@@ -173,6 +173,28 @@ mod tests {
                 .map(Rating::points)
                 .ok(),
             Some(80)
+        );
+    }
+
+    #[test]
+    fn a_write_reads_back_as_it_was_written() {
+        // The store keeps the write a backend decided as this text.
+        let write = Write {
+            id: EntryId(12345),
+            status: Status::Rewatching,
+            progress: 3,
+            rewatches: 2,
+        };
+
+        let written = serde_json::to_string(&write).expect("serialize");
+
+        assert_eq!(
+            written,
+            r#"{"id":12345,"status":"rewatching","progress":3,"rewatches":2}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Write>(&written).expect("deserialize"),
+            write
         );
     }
 }
