@@ -10,13 +10,18 @@
 //!
 //! Every property this adapter reads arrives in a single `GetAll` per source,
 //! so a listing costs one round trip per player and the whole translation below
-//! is pure and testable without a bus. A reading of a source whose answer names
-//! neither a path nor an address goes two steps further: it asks the bus which
-//! process owns the source's name, and reads that process's descriptors in
-//! `/proc` for the file it plays. A reading of a local file is held to the
-//! length the file's own header records, read once and kept while the readings
-//! of each round name the file: a reading that carries no length takes it, and
-//! one whose length is a thousandth of it is read in milliseconds.
+//! is pure and testable without a bus. Readings of a source whose answer names
+//! no address go two steps further: they ask the bus which process owns the
+//! source's name, and read that process's descriptors in `/proc` for the file
+//! it plays. That file is the media where the answer names none, and where it
+//! names another local file, since players that move to the next file of their
+//! playlist by themselves can go on naming the file before. Whether the named
+//! file is another is asked of its device and inode, since the descriptors name
+//! a file by its real path and a player by the path it was given. Readings of a
+//! local file are held to the length the file's own header records, read once
+//! and kept while the readings of each round name the file: that length
+//! outranks the one the player reports, and the position is read in
+//! milliseconds where the reported length is a thousandth of it.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -31,6 +36,7 @@ use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
 
+use crate::inode::Inodes;
 use crate::length::Lengths;
 use crate::{PlayerWatcher, PollOutcome, SourceInfo, WatchError, opened};
 
@@ -78,9 +84,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// round is two steps deep, the listing and then every reading together, and
 /// each is bounded separately, so a round costs twice the deadline at worst. A
 /// reading is one step however many calls it makes: the look for the file a
-/// source's process holds and the read of the length of a file share that
-/// source's deadline. Half the interval is the largest deadline that keeps a
-/// whole round inside one interval.
+/// source's process holds, the look at whether a file it names is that one, and
+/// the read of the length of a file share that source's deadline. Half the
+/// interval is the largest deadline that keeps a whole round inside one
+/// interval.
 ///
 /// Nothing is given up to get it. On one desktop machine a listing and a
 /// reading across three players cost about ten milliseconds together over
@@ -383,13 +390,19 @@ fn metadata_of(player: &Properties) -> Properties {
         .unwrap_or_default()
 }
 
-/// Whether a source's answer names neither a path nor an address. The file
-/// its process holds is looked for only in that case.
-fn names_no_location(player: &Properties) -> bool {
-    matches!(
-        media_from(&metadata_of(player)),
-        None | Some(MediaRef::Title(_))
-    )
+/// Whether the file a source's process holds can be what its reading carries:
+/// everywhere but where its answer names an address, which [`observe`] ranks
+/// above that file.
+fn may_play_a_held_file(player: &Properties) -> bool {
+    !matches!(media_from(&metadata_of(player)), Some(MediaRef::Remote(_)))
+}
+
+/// The local file a source's answer names, where it names one.
+fn named_file(player: &Properties) -> Option<RawPath> {
+    match media_from(&metadata_of(player)) {
+        Some(MediaRef::LocalFile(file)) => Some(file),
+        Some(MediaRef::Remote(_) | MediaRef::Title(_)) | None => None,
+    }
 }
 
 /// What a source is, as its own properties describe it.
@@ -414,16 +427,22 @@ struct Observation {
 }
 
 /// Describe a source and read it, from one answer and, where that answer
-/// names no location, the file the source's process holds.
+/// names no address, the file the source's process holds.
 ///
 /// The metadata is decoded once and the reading takes its capabilities and
 /// playback state from the description, so a round cannot publish a description
 /// that contradicts the reading beside it. A reading of the file the process
 /// holds is described as naming what is open, for the same reason.
 ///
-/// A path or an address the source names is what its reading carries. Where
-/// it names neither, the file its process holds is read in its place, and a
-/// title it names is kept where no such file is found.
+/// Paths and addresses the source names are what its reading carries, but for
+/// a local file other than the one file its process holds. Players that move to
+/// the next file of their playlist by themselves can go on naming the file
+/// before, as mpc-qt 26.07 does, so the held file is read in its place, without
+/// the length the source reports, which is the other file's. Where the two
+/// paths differ, `read` hands the held file over only where `Inodes::same`
+/// finds that they are not one file. Where the source names neither, the held
+/// file is read as well, and a title it names is kept where no such file is
+/// found.
 fn observe(
     identity: &PlayerId,
     player: &Properties,
@@ -433,13 +452,16 @@ fn observe(
     let metadata = metadata_of(player);
     let mut source = describe(identity, player, &metadata);
 
-    let media = match (media_from(&metadata), opened) {
-        (Some(location @ (MediaRef::LocalFile(_) | MediaRef::Remote(_))), _) => location,
+    let (media, reported_length_is_its_own) = match (media_from(&metadata), opened) {
+        (Some(MediaRef::LocalFile(named)), Some(held)) if held != named => {
+            (MediaRef::LocalFile(held), false)
+        }
+        (Some(location @ (MediaRef::LocalFile(_) | MediaRef::Remote(_))), _) => (location, true),
         (_, Some(held)) => {
             source.capabilities.location = true;
-            MediaRef::LocalFile(held)
+            (MediaRef::LocalFile(held), true)
         }
-        (Some(title), None) => title,
+        (Some(title), None) => (title, true),
         (None, None) => {
             return Observation {
                 source,
@@ -449,12 +471,17 @@ fn observe(
     };
 
     let position = position_of(player, source.capabilities.position);
+    let duration = if reported_length_is_its_own {
+        duration_of(&metadata, position, source.capabilities.duration)
+    } else {
+        Known::NotReported
+    };
     let snapshot = PlayerSnapshot {
         player: source.player.clone(),
         media,
         state: source.state,
         position,
-        duration: duration_of(&metadata, position, source.capabilities.duration),
+        duration,
         observed_at: at,
     };
 
@@ -473,11 +500,11 @@ fn file_to_measure(reading: &PlayerSnapshot) -> Option<&RawPath> {
     }
 }
 
-/// A reading that carries no length, given the length its file's header
-/// records. A length the player reported is kept, and the length of the file is
-/// held to the position as a reported one is.
+/// The reading with the length its file's header records, held to the position
+/// as a reported length is. The header outranks the player, which can go on
+/// reporting the length of the file it played before, as mpc-qt 26.07 does.
 fn with_length_of_file(mut reading: PlayerSnapshot, length: Option<Duration>) -> PlayerSnapshot {
-    if let (Known::NotReported, Some(length)) = (reading.duration, length) {
+    if let Some(length) = length {
         reading.duration = length_beside(length, reading.position);
     }
 
@@ -489,14 +516,16 @@ fn with_length_of_file(mut reading: PlayerSnapshot, length: Option<Duration>) ->
 ///
 /// Dragon Player 26.08 reports its length and position in milliseconds where
 /// MPRIS asks microseconds, and its length to the millisecond: a file whose
-/// header records 600.002 s is reported as 600002. A player that reports
-/// microseconds reports a length near the file's, which multiplied by a
-/// thousand misses it by far more than this.
+/// header records 600.002 s is reported as 600002. Players that report
+/// microseconds report a length near their file's or, as mpc-qt 26.07 does,
+/// near the length of the file before it, and either multiplied by a thousand
+/// misses their file's by far more than this.
 const MILLISECONDS_MATCH: Duration = Duration::from_secs(1);
 
-/// A reading whose length is a thousandth of its file's, read in milliseconds:
-/// its length and its position multiplied by a thousand. Any other reading is
-/// kept as it is.
+/// The reading with its position read in milliseconds, multiplied by a
+/// thousand, where its length is a thousandth of its file's. Any other reading
+/// is kept as it is, and the length is left for [`with_length_of_file`] to
+/// replace.
 fn with_milliseconds_read(mut reading: PlayerSnapshot, file: Option<Duration>) -> PlayerSnapshot {
     let (Known::Value(reported), Some(file)) = (reading.duration, file) else {
         return reading;
@@ -506,19 +535,15 @@ fn with_milliseconds_read(mut reading: PlayerSnapshot, file: Option<Duration>) -
         return reading;
     }
 
-    // `duration_of` held the reported length to the position in the same
-    // unit, so the two stay in order once both are multiplied.
     if let Known::Value(position) = reading.position {
         reading.position = Known::Value(position.saturating_mul(1000));
     }
-    reading.duration = Known::Value(length);
 
     reading
 }
 
-/// A reading held to the length its file's header records: one that carries
-/// no length takes it, and one whose length is a thousandth of it is read in
-/// milliseconds.
+/// The reading held to the length its file's header records, with its position
+/// read in milliseconds where the length it reports is a thousandth of that one.
 fn held_to_its_file(reading: PlayerSnapshot, length: Option<Duration>) -> PlayerSnapshot {
     with_length_of_file(with_milliseconds_read(reading, length), length)
 }
@@ -532,6 +557,9 @@ pub struct MprisWatcher<C> {
     /// The lengths of the files sources play, which their readings are held
     /// to.
     lengths: Lengths,
+    /// Which files the paths sources name and hold are, so that a file named
+    /// by another path than the one its process holds is read as named.
+    inodes: Inodes,
 }
 
 impl<C: Clock> MprisWatcher<C> {
@@ -543,9 +571,10 @@ impl<C: Clock> MprisWatcher<C> {
     /// The deadline applies separately to this call, to the listing of bus
     /// names in each round, to each source's `GetAll` when sources are listed,
     /// and to each source's reading: its `GetAll`, the look for the file its
-    /// process holds where that names no location, and the read of the header
-    /// of the local file a reading names. It bounds one of those rather than
-    /// one round.
+    /// process holds where that names no address, the look at whether a file it
+    /// names is the held one where their paths differ, and the read of the
+    /// header of the local file a reading names. It bounds one of those rather
+    /// than one round.
     ///
     /// # Errors
     ///
@@ -559,6 +588,7 @@ impl<C: Clock> MprisWatcher<C> {
             clock,
             deadline,
             lengths: Lengths::default(),
+            inodes: Inodes::default(),
         })
     }
 
@@ -578,11 +608,11 @@ impl<C: Clock> MprisWatcher<C> {
     /// The identity returned here is the one a [`WatchError`] was built from,
     /// so the two halves of a reported failure cannot name different players.
     ///
-    /// The whole reading stays inside one deadline, the look for the file the
-    /// process holds and the read of the length of a file included. Both come
-    /// after the source has answered. One that runs out of time leaves out
-    /// what it looked for, a file or a length, and the source does not count
-    /// as failed.
+    /// The whole reading stays inside one deadline: the look for the file the
+    /// process holds, the look at whether a file the source names is that file,
+    /// and the read of the length of a file. All three come after the source
+    /// has answered. Looks that run out of time leave the reading as it would
+    /// be without them, and the source does not count as failed.
     async fn read(&self, identity: PlayerId) -> (PlayerId, Result<Observation, WatchError>) {
         let until = Instant::now() + self.deadline;
         let player = match self.player_properties(&identity, until).await {
@@ -592,10 +622,19 @@ impl<C: Clock> MprisWatcher<C> {
         // The moment of the answer, which is the moment its position was the
         // player's.
         let at = self.clock.now();
-        let opened = if names_no_location(&player) {
+        let held = if may_play_a_held_file(&player) {
             self.held_by(&identity, until).await
         } else {
             None
+        };
+        let opened = match (named_file(&player), held) {
+            // Read as named where the held file is that file by another path,
+            // or where that is not known yet.
+            (Some(named), Some(held)) if named != held => {
+                let another = self.inodes.same(&named, &held, until).await == Some(false);
+                another.then_some(held)
+            }
+            (_, held) => held,
         };
         let observed = observe(&identity, &player, opened, at);
         let observed = self.measured(observed, until).await;
@@ -733,6 +772,7 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
         // A file no source plays any more is read again when one opens it.
         self.lengths
             .keep_only(snapshots.iter().filter_map(file_to_measure));
+        self.inodes.end_round();
 
         Ok(PollOutcome {
             sources,
@@ -746,8 +786,9 @@ impl<C: Clock> PlayerWatcher for MprisWatcher<C> {
 mod tests {
     use super::{
         BusTimeout, PLAYER_INTERFACE, Properties, app_from_identity, declare_capabilities,
-        duration_of, file_to_measure, held_to_its_file, identity_from_bus_name, media_from,
-        names_no_location, observe, percent_decode, play_state, position_of, with_length_of_file,
+        duration_of, file_to_measure, held_to_its_file, identity_from_bus_name,
+        may_play_a_held_file, media_from, named_file, observe, percent_decode, play_state,
+        position_of, with_length_of_file,
     };
     use benshi_core::clock::{Clock, TestClock, Timestamp};
     use benshi_core::path::RawPath;
@@ -1071,27 +1112,83 @@ mod tests {
     }
 
     #[test]
-    fn a_location_a_source_names_outranks_the_file_its_process_holds() {
-        let local = a_player(
-            vec![],
-            vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
-        );
+    fn an_address_a_source_names_outranks_the_file_its_process_holds() {
         let remote = a_player(
             vec![],
             vec![("xesam:url", a_string("https://example.invalid/s.m3u8"))],
         );
 
-        let by_path = observe(&id("mpv"), &local, Some(held()), Timestamp::epoch());
-        let by_address = observe(&id("vlc"), &remote, Some(held()), Timestamp::epoch());
+        let observed = observe(&id("vlc"), &remote, Some(held()), Timestamp::epoch());
 
         assert_eq!(
-            by_path.reading.expect("a reading").media,
-            MediaRef::LocalFile(RawPath::from_bytes(b"/anime/ep.mkv".to_vec()))
-        );
-        assert_eq!(
-            by_address.reading.expect("a reading").media,
+            observed.reading.expect("a reading").media,
             MediaRef::Remote("https://example.invalid/s.m3u8".to_owned())
         );
+    }
+
+    /// What mpc-qt 26.07 answers after it moved to the next file of its
+    /// playlist by itself: the file before, with that file's length.
+    fn a_player_naming_the_file_before() -> Properties {
+        a_player(
+            vec![
+                ("PlaybackStatus", a_string("Playing")),
+                ("Position", OwnedValue::from(17_000_000_i64)),
+            ],
+            vec![
+                ("xesam:url", a_string("file:///anime/ep.mkv")),
+                ("mpris:length", OwnedValue::from(108_000_000_i64)),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_local_file_the_process_does_not_hold_gives_way_to_the_one_it_holds() {
+        let observed = observe(
+            &id("MpcQt"),
+            &a_player_naming_the_file_before(),
+            Some(held()),
+            Timestamp::epoch(),
+        );
+
+        let snapshot = observed.reading.expect("a reading");
+        assert_eq!(snapshot.media, MediaRef::LocalFile(held()));
+        assert_eq!(snapshot.state, PlayState::Playing);
+        assert_eq!(snapshot.position, Known::Value(Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn the_length_of_a_file_the_process_does_not_hold_is_dropped() {
+        let observed = observe(
+            &id("MpcQt"),
+            &a_player_naming_the_file_before(),
+            Some(held()),
+            Timestamp::epoch(),
+        );
+
+        assert_eq!(
+            observed.reading.expect("a reading").duration,
+            Known::NotReported
+        );
+    }
+
+    #[test]
+    fn a_local_file_the_process_holds_is_read_as_it_is_named() {
+        let path = std::str::from_utf8(held().as_bytes())
+            .expect("the path is UTF-8")
+            .to_owned();
+        let player = a_player(
+            vec![("Position", OwnedValue::from(17_000_000_i64))],
+            vec![
+                ("xesam:url", a_string(&path)),
+                ("mpris:length", OwnedValue::from(108_000_000_i64)),
+            ],
+        );
+
+        let observed = observe(&id("mpv"), &player, Some(held()), Timestamp::epoch());
+
+        let snapshot = observed.reading.expect("a reading");
+        assert_eq!(snapshot.media, MediaRef::LocalFile(held()));
+        assert_eq!(snapshot.duration, Known::Value(Duration::from_secs(108)));
     }
 
     #[test]
@@ -1127,7 +1224,31 @@ mod tests {
     }
 
     #[test]
-    fn the_process_is_asked_only_where_the_answer_names_no_location() {
+    fn the_named_file_is_a_local_file_the_answer_names_and_nothing_else() {
+        let local = a_player(
+            vec![],
+            vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
+        );
+        let remote = a_player(
+            vec![],
+            vec![("xesam:url", a_string("https://example.invalid/s.m3u8"))],
+        );
+        let titled = a_player(
+            vec![],
+            vec![("xesam:title", a_string("Some Streaming Site"))],
+        );
+
+        assert_eq!(
+            named_file(&local),
+            Some(RawPath::from_bytes(b"/anime/ep.mkv".to_vec()))
+        );
+        assert_eq!(named_file(&remote), None);
+        assert_eq!(named_file(&titled), None);
+        assert_eq!(named_file(&a_player_naming_nothing()), None);
+    }
+
+    #[test]
+    fn the_process_is_asked_unless_the_answer_names_an_address() {
         let local = a_player(
             vec![],
             vec![("xesam:url", a_string("file:///anime/ep.mkv"))],
@@ -1145,11 +1266,11 @@ mod tests {
             vec![("xesam:url", a_string("")), ("xesam:title", a_string(""))],
         );
 
-        assert!(!names_no_location(&local));
-        assert!(!names_no_location(&remote));
-        assert!(names_no_location(&titled));
-        assert!(names_no_location(&a_player_naming_nothing()));
-        assert!(names_no_location(&blank));
+        assert!(may_play_a_held_file(&local));
+        assert!(!may_play_a_held_file(&remote));
+        assert!(may_play_a_held_file(&titled));
+        assert!(may_play_a_held_file(&a_player_naming_nothing()));
+        assert!(may_play_a_held_file(&blank));
     }
 
     #[test]
@@ -1503,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_length_outranks_the_length_of_the_file() {
+    fn the_length_of_the_file_outranks_a_reported_length() {
         let reading = observe(
             &id("totem"),
             &a_player_naming_nothing(),
@@ -1515,7 +1636,7 @@ mod tests {
 
         let measured = with_length_of_file(reading, Some(Duration::from_mins(2)));
 
-        assert_eq!(measured.duration, Known::Value(Duration::from_mins(24)));
+        assert_eq!(measured.duration, Known::Value(Duration::from_mins(2)));
     }
 
     /// The length the header of the file Dragon Player plays in these tests
@@ -1562,17 +1683,17 @@ mod tests {
 
         let read = held_to_its_file(a_reading_in_milliseconds(Some(42_000)), Some(file));
 
-        assert_eq!(read.duration, Known::Value(DRAGONS_FILE));
+        assert_eq!(read.duration, Known::Value(file));
         assert_eq!(read.position, Known::Value(Duration::from_secs(42)));
     }
 
     #[test]
-    fn a_length_further_from_a_thousandth_of_the_file_s_is_kept() {
+    fn a_length_further_from_a_thousandth_of_the_file_s_leaves_the_position_as_it_is() {
         let file = DRAGONS_FILE + Duration::from_millis(1_001);
 
         let read = held_to_its_file(a_reading_in_milliseconds(Some(42_000)), Some(file));
 
-        assert_eq!(read.duration, Known::Value(Duration::from_micros(600_002)));
+        assert_eq!(read.duration, Known::Value(file));
         assert_eq!(read.position, Known::Value(Duration::from_millis(42)));
     }
 
@@ -1594,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_in_milliseconds_with_no_position_is_read_all_the_same() {
+    fn a_reading_in_milliseconds_with_no_position_is_left_without_one() {
         let read = held_to_its_file(a_reading_in_milliseconds(None), Some(DRAGONS_FILE));
 
         assert_eq!(read.duration, Known::Value(DRAGONS_FILE));
