@@ -12,6 +12,8 @@
 #[cfg(target_os = "linux")]
 pub mod both;
 #[cfg(target_os = "linux")]
+mod inode;
+#[cfg(target_os = "linux")]
 pub mod kodi;
 #[cfg(target_os = "linux")]
 mod length;
