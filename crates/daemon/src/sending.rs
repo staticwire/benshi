@@ -41,7 +41,7 @@ use humantime::format_duration;
 use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::Instant;
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::bus::{BusEvent, EventBus};
 use crate::config::{Sending, When};
@@ -597,28 +597,48 @@ pub struct Sends<A> {
 /// What asks a sending task for a pass at once, as `benshi sync now` does.
 /// Cloning shares it.
 #[derive(Debug, Clone)]
-pub struct SendNow(mpsc::UnboundedSender<mpsc::UnboundedSender<Heard>>);
+pub struct SendNow(mpsc::UnboundedSender<Ask>);
 
 impl SendNow {
     /// Ask for a pass at once, and hear what it does as it goes, the last
     /// thing heard being what it came to. None where no task takes asks.
     #[must_use]
     pub fn ask(&self) -> Option<mpsc::UnboundedReceiver<Heard>> {
+        self.asking(false)
+    }
+
+    /// Ask for the last pass, made as the daemon stops: [`SendNow::ask`],
+    /// where a failure is said with no time to try again, even where it was
+    /// said before.
+    #[must_use]
+    pub fn last(&self) -> Option<mpsc::UnboundedReceiver<Heard>> {
+        self.asking(true)
+    }
+
+    fn asking(&self, last: bool) -> Option<mpsc::UnboundedReceiver<Heard>> {
         let (heard, hearing) = mpsc::unbounded_channel();
-        self.0.send(heard).ok()?;
+        self.0.send(Ask { heard, last }).ok()?;
         Some(hearing)
     }
 }
 
+/// One ask for a pass at once: where what the pass does is told, and whether
+/// it is the last, made as the daemon stops.
+#[derive(Debug)]
+struct Ask {
+    heard: mpsc::UnboundedSender<Heard>,
+    last: bool,
+}
+
 /// The asks a sending task takes from its [`SendNow`].
 #[derive(Debug)]
-pub struct Asked(tokio::sync::Mutex<mpsc::UnboundedReceiver<mpsc::UnboundedSender<Heard>>>);
+pub struct Asked(tokio::sync::Mutex<mpsc::UnboundedReceiver<Ask>>);
 
 impl Asked {
     /// The next ask, where what it does is told, and none once no
     /// [`SendNow`] is left to ask.
     pub async fn next(&self) -> Option<mpsc::UnboundedSender<Heard>> {
-        self.0.lock().await.recv().await
+        self.0.lock().await.recv().await.map(|ask| ask.heard)
     }
 }
 
@@ -680,31 +700,37 @@ impl<A: Account + Sync> SendTask<A> {
 
     /// Send at the times the settings name, for ever.
     ///
+    /// Passes are made at the start where `at_start` asks, and at
+    /// `benshi sync now`, which is attempted at once whatever came before.
+    /// Beside those, `each` sends a viewing as it is recorded, `close` what
+    /// waits as an episode closes, and `interval` what waits at the end of
+    /// each interval from the start of the task; `manual` sends at nothing
+    /// else.
+    ///
     /// Attempts that fail are made again after [`FIRST_RETRY`], and after
     /// twice as long each time they fail again, up to [`LAST_RETRY`], or after
     /// the wait the service asked for. Tokens the service refuses, and tokens
-    /// not found or that cannot be read, wait for a login. Viewings recorded
-    /// meanwhile wait with the rest, and `benshi sync now` is attempted at
-    /// once whatever came before. What was set aside is tried again at the
-    /// start, at `benshi sync now`, and when the list is read or a name or a
-    /// pin is given or taken back.
+    /// not found or that cannot be read, wait for a login, and a login makes
+    /// an attempt only where one waits. Viewings recorded meanwhile wait with
+    /// the rest. What was set aside is tried again at the start, at
+    /// `benshi sync now`, and once the list is read or a name or a pin is
+    /// given or taken back: at once with `each`, and at the next pass with
+    /// the others.
     ///
     /// # Errors
     ///
     /// None: every failure of an attempt is said, and the task goes on. The
     /// result is the supervisor's.
     pub async fn run(&self) -> Result<(), TaskError> {
-        let each = match self.sending.when {
-            When::Each => true,
-            When::Manual => false,
-            When::Close | When::Interval => {
-                (self.say)(
-                    "send when \"close\" and \"interval\" are not built yet: each viewing is sent \
-                     as it is recorded",
-                );
-                true
-            }
-        };
+        let when = self.sending.when;
+        let mut ticker = (when == When::Interval).then(|| {
+            let mut ticker = tokio::time::interval_at(
+                Instant::now() + self.sending.interval,
+                self.sending.interval,
+            );
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker
+        });
         let mut asks = self.asked.0.lock().await;
         let mut wait = FIRST_RETRY;
         let mut said = None;
@@ -713,29 +739,35 @@ impl<A: Account + Sync> SendTask<A> {
         let mut retrying = self.sending.at_start;
 
         loop {
-            let asker = tokio::select! {
+            let ask = tokio::select! {
                 () = until(due) => None,
-                () = self.wakes.recorded.notified(), if each && !held => None,
+                () = self.wakes.recorded.notified(), if when == When::Each && !held => None,
+                () = self.wakes.closed.notified(), if when == When::Close && !held => None,
+                () = ticked(ticker.as_mut()), if !held => None,
                 () = self.wakes.resolvable.notified(), if !held => {
                     retrying = true;
+                    if when != When::Each {
+                        continue;
+                    }
                     None
                 }
                 () = self.wakes.sending_logged_in.notified() => {
                     said = None;
+                    if !held {
+                        continue;
+                    }
                     None
                 }
-                Some(asker) = asks.recv() => {
+                Some(ask) = asks.recv() => {
                     retrying = true;
-                    Some(asker)
+                    Some(ask)
                 }
             };
 
-            let (ending, next) = self
-                .attempt(&mut said, wait, asker.as_ref(), retrying)
-                .await;
-            if let Some(asker) = &asker {
+            let (ending, next) = self.attempt(&mut said, wait, ask.as_ref(), retrying).await;
+            if let Some(ask) = ask {
                 // Clients that stopped listening are no failure of sending.
-                drop(asker.send(Heard::Ended(ending)));
+                drop(ask.heard.send(Heard::Ended(ending)));
             }
             (held, due) = match next {
                 Next::Idle => {
@@ -755,16 +787,19 @@ impl<A: Account + Sync> SendTask<A> {
     }
 
     /// Read the token, send what waits, what was set aside first where
-    /// `retrying`, and say what failed, telling each event to `asker` as well
+    /// `retrying`, and say what failed, telling each event to `ask` as well
     /// where one asked. `wait` is how long a failure waits before the attempt
-    /// is made again, where the service asked for no wait of its own.
+    /// is made again, where the service asked for no wait of its own; the
+    /// failure of the last pass, made as the daemon stops, is said with no
+    /// time to try again, even where it was said before.
     async fn attempt(
         &self,
         said: &mut Option<String>,
         wait: Duration,
-        asker: Option<&mpsc::UnboundedSender<Heard>>,
+        ask: Option<&Ask>,
         retrying: bool,
     ) -> (Ending, Next) {
+        let last = ask.is_some_and(|ask| ask.last);
         let token = match self.account.token().await {
             Ok(Some(token)) => token,
             Ok(None) => {
@@ -781,39 +816,19 @@ impl<A: Account + Sync> SendTask<A> {
             Ok(backend) => backend,
             Err(unbuilt) => {
                 let failed = format!("AniList {unbuilt}");
-                return self.failed(said, Tally::default(), &failed, None, 0, wait);
+                let ending =
+                    self.failed(said, Tally::default(), &failed, 0, (!last).then_some(wait));
+                return (
+                    ending,
+                    Next::Retry {
+                        after: wait,
+                        grows: true,
+                    },
+                );
             }
         };
 
-        let tell = |event: BusEvent| {
-            if let Some(asker) = asker {
-                // Clients that stopped listening are no failure of sending.
-                drop(asker.send(Heard::Event(event.clone())));
-            }
-            self.bus.publish(event);
-        };
-        let retried = if retrying {
-            self.sender.retry(&backend, &tell).await
-        } else {
-            Passed {
-                tally: Tally::default(),
-                stopped: None,
-            }
-        };
-        let passed = if let Some((stop, _aside)) = retried.stopped {
-            // What was set aside waits for the user, and what is past the
-            // cursor for the service.
-            Passed {
-                tally: retried.tally,
-                stopped: Some((stop, self.sender.past_the_cursor().await)),
-            }
-        } else {
-            let passed = self.sender.pass(&backend, &tell).await;
-            Passed {
-                tally: retried.tally + passed.tally,
-                ..passed
-            }
-        };
+        let passed = self.pass_through(&backend, ask, retrying).await;
         match passed.stopped {
             None => {
                 *said = None;
@@ -841,39 +856,93 @@ impl<A: Account + Sync> SendTask<A> {
                     asked,
                 },
                 waiting,
-            )) => self.failed(said, passed.tally, &failed, asked, waiting, wait),
+            )) => {
+                let after = asked.unwrap_or(wait);
+                let ending = self.failed(
+                    said,
+                    passed.tally,
+                    &failed,
+                    waiting,
+                    (!last).then_some(after),
+                );
+                (
+                    ending,
+                    Next::Retry {
+                        after,
+                        grows: asked.is_none(),
+                    },
+                )
+            }
         }
     }
 
-    /// What a failure comes to, said where its reason is not what was said
-    /// last.
+    /// Send what waits through `backend`, what was set aside first where
+    /// `retrying`, telling each event to `ask` as well where one asked.
+    async fn pass_through<B: ListBackend + Sync>(
+        &self,
+        backend: &B,
+        ask: Option<&Ask>,
+        retrying: bool,
+    ) -> Passed {
+        let tell = |event: BusEvent| {
+            if let Some(ask) = ask {
+                // Clients that stopped listening are no failure of sending.
+                drop(ask.heard.send(Heard::Event(event.clone())));
+            }
+            self.bus.publish(event);
+        };
+        let retried = if retrying {
+            self.sender.retry(backend, &tell).await
+        } else {
+            Passed {
+                tally: Tally::default(),
+                stopped: None,
+            }
+        };
+        if let Some((stop, _aside)) = retried.stopped {
+            // What was set aside waits for the user, and what is past the
+            // cursor for the service.
+            Passed {
+                tally: retried.tally,
+                stopped: Some((stop, self.sender.past_the_cursor().await)),
+            }
+        } else {
+            let passed = self.sender.pass(backend, &tell).await;
+            Passed {
+                tally: retried.tally + passed.tally,
+                ..passed
+            }
+        }
+    }
+
+    /// What a failure comes to, with how many operations wait and, where
+    /// `retry` says, when the attempt is made again. Said where its reason is
+    /// not what was said last, and always where no attempt follows.
     fn failed(
         &self,
         said: &mut Option<String>,
         tally: Tally,
         failed: &str,
-        asked: Option<Duration>,
         waiting: usize,
-        wait: Duration,
-    ) -> (Ending, Next) {
-        let after = asked.unwrap_or(wait);
-        let line = if waiting == 0 {
-            format!("{failed}; tried again in {}", format_duration(after))
-        } else {
-            format!(
-                "{failed}; {}, tried again in {}",
+        retry: Option<Duration>,
+    ) -> Ending {
+        let tail = match (waiting, retry) {
+            (0, None) => String::new(),
+            (0, Some(after)) => format!("; tried again in {}", format_duration(after)),
+            (_, None) => format!("; {}", waits(waiting)),
+            (_, Some(after)) => format!(
+                "; {}, tried again in {}",
                 waits(waiting),
                 format_duration(after)
-            )
+            ),
         };
+        let line = format!("{failed}{tail}");
+        if retry.is_none() {
+            // What was said last of the same failure promised an attempt.
+            *said = None;
+        }
         self.tell(said, failed, &line);
-        (
-            Ending::Stopped { tally, line },
-            Next::Retry {
-                after,
-                grows: asked.is_none(),
-            },
-        )
+        Ending::Stopped { tally, line }
     }
 
     /// Say `line` where `reason` is not what was said last.
@@ -882,6 +951,48 @@ impl<A: Account + Sync> SendTask<A> {
             (self.say)(line);
             *said = Some(reason.to_owned());
         }
+    }
+}
+
+/// How long a daemon that stops waits for the pass `at_stop` asks for.
+pub const AT_STOP: Duration = Duration::from_secs(5);
+
+/// Ask the task of `now` for the pass made as the daemon stops, and wait for
+/// its end [`AT_STOP`] at the most, saying through `say` where it did not
+/// end: by then, or at all, since the task stopped before it. Where the task
+/// takes no asks, nothing is waited for.
+pub async fn at_stop(now: &SendNow, say: &Say) {
+    let Some(mut hearing) = now.last() else {
+        return;
+    };
+    let heard_the_end = tokio::time::timeout(AT_STOP, async {
+        while let Some(heard) = hearing.recv().await {
+            if matches!(heard, Heard::Ended(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    match heard_the_end {
+        Ok(true) => {}
+        Ok(false) => {
+            say("send task stopped before the pass at stop ended; what it did not send waits");
+        }
+        Err(_late) => say(&format!(
+            "sending to AniList at stop did not end within {}; what it did not send waits",
+            format_duration(AT_STOP)
+        )),
+    }
+}
+
+/// The next tick of `ticker`, and never where there is none.
+async fn ticked(ticker: Option<&mut Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -918,12 +1029,13 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        Account, Ending, Heard, NO_TOKEN, Passed, SendNow, SendTask, Sender, Stop, Tally, send_now,
+        Account, Ending, Heard, NO_TOKEN, Passed, SendNow, SendTask, Sender, Stop, Tally, at_stop,
+        send_now,
     };
     use crate::bus::{BusEvent, EventBus};
     use crate::config::{Sending, When};
     use crate::delivery::{Destination, Unsent, Watched};
-    use crate::listing::Wakes;
+    use crate::listing::{Say, Wakes};
     use crate::secrets;
     use crate::supervisor::TaskError;
 
@@ -1754,6 +1866,8 @@ mod tests {
         list: Arc<Memory>,
         down: Arc<AtomicBool>,
         refusing: Arc<AtomicBool>,
+        hangs: Arc<AtomicBool>,
+        panics: Arc<AtomicBool>,
         waits: Arc<Mutex<Option<Duration>>>,
         asked: Arc<Mutex<Vec<Instant>>>,
     }
@@ -1805,9 +1919,13 @@ mod tests {
                 asked.push(Instant::now());
                 asked.len()
             };
-            if asked > FUSE {
+            if asked > FUSE || self.hangs.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
+            assert!(
+                !self.panics.load(Ordering::SeqCst),
+                "a read of an entry panicked"
+            );
             match self.failing() {
                 Some(failed) => Err(failed),
                 None => self.list.entry(id).await,
@@ -1895,6 +2013,16 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
+
+        /// What says a line among the task's own.
+        fn saying(&self) -> Say {
+            let said = Arc::clone(&self.said);
+            Arc::new(move |line: &str| {
+                said.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(line.to_owned());
+            })
+        }
     }
 
     /// Run a sending task at the times `sending` names, with `token` found,
@@ -1913,6 +2041,8 @@ mod tests {
             list: Arc::clone(&list),
             down: Arc::default(),
             refusing: Arc::default(),
+            hangs: Arc::default(),
+            panics: Arc::default(),
             waits: Arc::default(),
             asked: Arc::default(),
         };
@@ -2292,25 +2422,297 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn close_and_interval_send_each_viewing_until_they_are_built() {
-        for when in [When::Close, When::Interval] {
-            let mut running = running(Sending { when, ..EACH }, Some(a_token()), &[]);
+    async fn with_close_a_viewing_waits_for_an_episode_to_close() {
+        let mut running = running(
+            Sending {
+                when: When::Close,
+                ..EACH
+            },
+            Some(a_token()),
+            &[],
+        );
+        running.record(3);
+        running.wakes.recorded();
 
-            running.record(3);
-            running.wakes.recorded();
+        tokio::time::sleep(Duration::from_hours(2)).await;
+        let waited = running.reached.asked();
+        running.wakes.closed();
+        let sent = running.next_event().await;
 
-            assert!(
-                matches!(running.next_event().await, BusEvent::Sent { .. }),
-                "{when:?}"
-            );
-            assert_eq!(
-                running.said(),
+        assert_eq!(waited, Vec::<Instant>::new());
+        assert!(matches!(sent, BusEvent::Sent { id: 1, .. }), "{sent:?}");
+        assert_eq!(running.said(), Vec::<String>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_interval_what_waits_is_sent_at_the_end_of_each_interval() {
+        let started = Instant::now();
+        let mut running = running(
+            Sending {
+                when: When::Interval,
+                interval: Duration::from_mins(15),
+                ..EACH
+            },
+            Some(a_token()),
+            &[],
+        );
+        running.record(3);
+        running.wakes.recorded();
+
+        let first = running.next_event().await;
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        running.record(4);
+        running.wakes.recorded();
+        let second = running.next_event().await;
+
+        let asked: Vec<Duration> = running
+            .reached
+            .asked()
+            .iter()
+            .map(|at| *at - started)
+            .collect();
+        assert_eq!(asked, [Duration::from_mins(15), Duration::from_mins(30)]);
+        assert!(matches!(first, BusEvent::Sent { id: 1, .. }), "{first:?}");
+        assert!(matches!(second, BusEvent::Sent { id: 2, .. }), "{second:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_interval_a_tick_while_a_failure_waits_makes_no_attempt() {
+        let started = Instant::now();
+        let running = running(
+            Sending {
+                when: When::Interval,
+                interval: Duration::from_mins(10),
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.down.store(true, Ordering::SeqCst);
+
+        running.asked_for(6).await;
+
+        let asked: Vec<Duration> = running
+            .reached
+            .asked()
+            .iter()
+            .map(|at| *at - started)
+            .collect();
+        assert_eq!(asked, [10, 11, 13, 17, 25, 41].map(Duration::from_mins));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_close_a_close_while_a_failure_waits_makes_no_attempt() {
+        let running = running(
+            Sending {
+                when: When::Close,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.down.store(true, Ordering::SeqCst);
+        running.wakes.closed();
+        running.asked_for(1).await;
+        let failed = running.reached.asked()[0];
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        running.wakes.closed();
+        running.asked_for(2).await;
+
+        assert_eq!(running.reached.asked()[1] - failed, Duration::from_mins(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_manual_neither_a_list_read_nor_a_login_sends() {
+        let running = running(
+            Sending {
+                when: When::Manual,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+
+        running.wakes.resolvable();
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        running.wakes.logged_in();
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        let waited = running.reached.asked();
+        let heard = heard(&running.now).await;
+
+        assert_eq!(waited, Vec::<Instant>::new());
+        assert!(
+            matches!(
+                heard.as_slice(),
                 [
-                    "send when \"close\" and \"interval\" are not built yet: each viewing is sent \
-                  as it is recorded"
-                ],
-                "{when:?}"
-            );
-        }
+                    Heard::Event(BusEvent::Sent { id: 1, .. }),
+                    Heard::Ended(Ending::Done(Tally { sent: 1, .. }))
+                ]
+            ),
+            "{heard:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_close_what_was_set_aside_and_may_go_somewhere_waits_for_the_next_close() {
+        let mut running = running(
+            Sending {
+                when: When::Close,
+                ..EACH
+            },
+            Some(a_token()),
+            &[],
+        );
+        running.record(14);
+        running.wakes.closed();
+        let set_aside = running.next_event().await;
+        pin_the_second_season(&running.store);
+
+        running.wakes.resolvable();
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        let waited = running.reached.asked();
+        running.wakes.closed();
+        let sent = running.next_event().await;
+
+        assert!(
+            matches!(set_aside, BusEvent::SetAside { id: 1, .. }),
+            "{set_aside:?}"
+        );
+        assert_eq!(waited, Vec::<Instant>::new());
+        assert!(matches!(sent, BusEvent::Sent { id: 1, .. }), "{sent:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_stop_what_waits_is_sent_before_the_stop_goes_on() {
+        let running = running(
+            Sending {
+                when: When::Manual,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3, 4],
+        );
+
+        at_stop(&running.now, &running.saying()).await;
+        running.task.abort();
+
+        let written = held(running.list.as_ref(), ENTRY)
+            .await
+            .expect("it is held");
+        assert_eq!(written.entry.progress, 4);
+        assert_eq!(running.said(), Vec::<String>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_at_stop_is_cut_after_five_seconds_and_said() {
+        let running = running(
+            Sending {
+                when: When::Manual,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.hangs.store(true, Ordering::SeqCst);
+        let stopping = Instant::now();
+
+        at_stop(&running.now, &running.saying()).await;
+
+        assert_eq!(Instant::now() - stopping, Duration::from_secs(5));
+        assert_eq!(
+            running.said(),
+            ["sending to AniList at stop did not end within 5s; what it did not send waits"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_at_stop_that_stops_before_its_end_is_said() {
+        let running = running(
+            Sending {
+                when: When::Manual,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.panics.store(true, Ordering::SeqCst);
+
+        at_stop(&running.now, &running.saying()).await;
+
+        assert_eq!(
+            running.said(),
+            ["send task stopped before the pass at stop ended; what it did not send waits"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_at_stop_is_said_where_the_same_failure_was_said_before() {
+        let running = running(EACH, Some(a_token()), &[]);
+        running.reached.down.store(true, Ordering::SeqCst);
+        running.record(3);
+        running.wakes.recorded();
+        running.asked_for(1).await;
+
+        at_stop(&running.now, &running.saying()).await;
+
+        assert_eq!(
+            running.said(),
+            [
+                "AniList could not be reached: connection refused; 1 operation waits, tried again \
+                 in 1m",
+                "AniList could not be reached: connection refused; 1 operation waits",
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_interval_the_ticks_after_a_failure_keep_their_place() {
+        let started = Instant::now();
+        let mut running = running(
+            Sending {
+                when: When::Interval,
+                interval: Duration::from_mins(10),
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.down.store(true, Ordering::SeqCst);
+        running.asked_for(4).await;
+        running.reached.down.store(false, Ordering::SeqCst);
+        running.next_event().await;
+
+        tokio::time::sleep(Duration::from_mins(2)).await;
+        running.record(4);
+        running.next_event().await;
+
+        let asked: Vec<Duration> = running
+            .reached
+            .asked()
+            .iter()
+            .map(|at| *at - started)
+            .collect();
+        assert_eq!(asked, [10, 11, 13, 17, 25, 30].map(Duration::from_mins));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_at_stop_is_said_with_no_time_to_try_again() {
+        let running = running(
+            Sending {
+                when: When::Manual,
+                ..EACH
+            },
+            Some(a_token()),
+            &[3],
+        );
+        running.reached.down.store(true, Ordering::SeqCst);
+
+        at_stop(&running.now, &running.saying()).await;
+
+        assert_eq!(
+            running.said(),
+            ["AniList could not be reached: connection refused; 1 operation waits"]
+        );
     }
 }

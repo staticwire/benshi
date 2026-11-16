@@ -588,6 +588,7 @@ impl<W: PlayerWatcher> Detection<W> {
                         store.close(show, episode)
                     })
                     .await?;
+                    self.wakes.closed();
                 }
             }
         }
@@ -1823,6 +1824,40 @@ mod tests {
     /// [`woken`] reads the wake of a name that missed the list.
     async fn woken_to_send(wakes: &Wakes) -> bool {
         tokio::time::timeout(Duration::from_millis(50), wakes.recorded.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_episode_closed_wakes_the_sending_task_and_none_before() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let wakes = Wakes::new();
+        let mut script = watching(&mpv, THIRD, 0..=3);
+        script.push(Ok(a_round_of(&[&mpv], Vec::new())));
+        let mut detection = Detection::new(
+            ScriptedWatcher::of(script),
+            Wiring {
+                recognizer: Current::new(a_list()),
+                wakes: wakes.clone(),
+                ..wired_to(&database)
+            },
+        );
+
+        rounds(&mut detection, 4).await;
+        let before = woken_by_a_close(&wakes).await;
+        rounds(&mut detection, 1).await;
+
+        assert!(!before, "woken before the episode was closed");
+        assert!(
+            woken_by_a_close(&wakes).await,
+            "not woken once it was closed"
+        );
+    }
+
+    /// Whether the sending task was woken by an episode closed.
+    async fn woken_by_a_close(wakes: &Wakes) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), wakes.closed.notified())
             .await
             .is_ok()
     }

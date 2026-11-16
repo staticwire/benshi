@@ -65,6 +65,7 @@ pub struct Wakes {
     pub(crate) missed: Arc<Notify>,
     pub(crate) logged_in: Arc<Notify>,
     pub(crate) recorded: Arc<Notify>,
+    pub(crate) closed: Arc<Notify>,
     pub(crate) resolvable: Arc<Notify>,
     pub(crate) sending_logged_in: Arc<Notify>,
 }
@@ -84,6 +85,11 @@ impl Wakes {
     /// The round recorded an episode, and its operation is in the log.
     pub fn recorded(&self) {
         self.recorded.notify_one();
+    }
+
+    /// The round closed an episode: no player has it open any more.
+    pub fn closed(&self) {
+        self.closed.notify_one();
     }
 
     /// What was set aside may go to an entry now: the list was read, or a
