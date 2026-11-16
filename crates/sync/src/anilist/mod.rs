@@ -7,13 +7,16 @@ use std::collections::HashSet;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use benshi_core::list::{Entry, EntryId, Format, Rating, Status};
+use benshi_core::list::{Dated, Day, Entry, EntryId, Format, Rating, Status, Write};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::{Error, within};
-use query::{Envelope, List, ListData, ListEntry, ListStatus, Title, ViewerData};
+use crate::{Error, ListBackend, within};
+use query::{
+    EntryData, Envelope, FuzzyDate, Held, List, ListData, ListStatus, Media, SaveData, Saved,
+    Standing, Title, ViewerData, Work,
+};
 use transport::{Answer, Request, Transport};
 
 /// How long the service is given to answer one request.
@@ -71,11 +74,59 @@ impl<T: Transport + Sync> AniList<T> {
         })
     }
 
+    /// Send one request in its turn, and read its answer.
+    async fn ask<D: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<D, Error> {
+        read(&self.answer(query, variables).await?)
+    }
+
+    /// Send one request in its turn, and take its answer as it came.
+    ///
+    /// Refusals for too many requests are answered as they came and not
+    /// waited out here, and no request is sent again before the wait and a
+    /// second past it have passed.
+    async fn answer(&self, query: &str, variables: Value) -> Result<Answer, Error> {
+        tokio::time::sleep_until(self.turn()).await;
+        let request = Request {
+            query: query.to_owned(),
+            variables,
+        };
+        let answer = within(DEADLINE, self.transport.send(&request)).await?;
+        if answer.status == 429 {
+            self.hold_off(answer.retry_after.unwrap_or(WAIT) + MARGIN);
+        }
+
+        Ok(answer)
+    }
+
+    /// Send no request before this long has passed.
+    fn hold_off(&self, wait: Duration) {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let until = Instant::now() + wait;
+        *next = Some(next.map_or(until, |next| next.max(until)));
+    }
+
+    /// When the next request may be sent, with the turn after it kept for
+    /// the request after it, so that requests made at once go out in turn.
+    fn turn(&self) -> Instant {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let turn = next.map_or(now, |next| next.max(now));
+        *next = Some(turn + PACE);
+
+        turn
+    }
+}
+
+impl<T: Transport + Sync> ListBackend for AniList<T> {
+    fn name(&self) -> &'static str {
+        "AniList"
+    }
+
     /// Every entry of the account's list of anime.
     ///
     /// The list is asked for the account the token is of, a chunk at a time.
-    /// A work on several of the account's lists is read once, from the list
-    /// of its status where it is on one, and else from a list of the
+    /// Works on several of the account's lists are read once, from the list
+    /// of their status where they are on one, and else from a list of the
     /// account's own making.
     ///
     /// # Errors
@@ -83,7 +134,7 @@ impl<T: Transport + Sync> AniList<T> {
     /// An [`Error`] of the class the failure of the service is, and
     /// [`Error::Unreadable`] for an entry with no title, a score past a
     /// hundred, or a chunk that holds no entry and says more follow.
-    pub async fn list(&self) -> Result<Vec<Entry>, Error> {
+    async fn list(&self) -> Result<Vec<Entry>, Error> {
         let account = self.account().await?;
         let mut entries = Vec::new();
         let mut read = HashSet::new();
@@ -110,7 +161,7 @@ impl<T: Transport + Sync> AniList<T> {
             for list in of_status.into_iter().chain(own) {
                 for entry in list.entries {
                     if read.insert(entry.media_id) {
-                        entries.push(entry_of(entry)?);
+                        entries.push(entry_of(entry.media_id, entry.standing, entry.media)?);
                     }
                 }
             }
@@ -122,42 +173,102 @@ impl<T: Transport + Sync> AniList<T> {
         Ok(entries)
     }
 
-    /// Send one request in its turn, and read its answer.
+    /// The account's entry for one work, asked for by the work alone, with
+    /// the days the account began and completed it.
     ///
-    /// A refusal for too many requests is answered as a wait and not waited
-    /// out here, and no request is sent again before the wait and a second
-    /// past it have passed.
-    async fn ask<D: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<D, Error> {
-        tokio::time::sleep_until(self.turn()).await;
-        let request = Request {
-            query: query.to_owned(),
-            variables,
-        };
-        let answer = within(DEADLINE, self.transport.send(&request)).await?;
-        if answer.status == 429 {
-            self.hold_off(answer.retry_after.unwrap_or(WAIT) + MARGIN);
+    /// The answer that the service has no work under the number is none, as
+    /// a work off the list is.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unreadable`] for an entry with no title or a score past a
+    /// hundred, or for an answer that holds no work and no error, and
+    /// otherwise an [`Error`] of the class the failure of the service is.
+    async fn entry(&self, id: EntryId) -> Result<Option<Dated>, Error> {
+        let answer = self.answer(query::ENTRY, json!({ "id": id.0 })).await?;
+        if has_no_work(&answer) {
+            return Ok(None);
         }
+        let EntryData {
+            media:
+                Work {
+                    id: work,
+                    media,
+                    media_list_entry,
+                },
+        } = read(&answer)?;
+        let Some(Held {
+            standing,
+            started_at,
+            completed_at,
+        }) = media_list_entry
+        else {
+            return Ok(None);
+        };
 
-        read(&answer)
+        Ok(Some(Dated {
+            entry: entry_of(work, standing, media)?,
+            started: day_of(started_at),
+            completed: day_of(completed_at),
+        }))
     }
 
-    /// Send no request before this long has passed.
-    fn hold_off(&self, wait: Duration) {
-        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-        let until = Instant::now() + wait;
-        *next = Some(next.map_or(until, |next| next.max(until)));
-    }
+    /// Write the whole of where the account stands on one work in one
+    /// request, so that the service takes no step of its own: the status, the
+    /// progress, the repeat and both days, a day none as a day with no part.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoWork`] where the service refuses the number of the work, an
+    /// [`Error`] of the class the failure of the service is otherwise, and
+    /// [`Error::Unreadable`] for an answer that saved nothing and says no
+    /// error.
+    async fn write(&self, write: &Write) -> Result<(), Error> {
+        let variables = json!({
+            "mediaId": write.id.0,
+            "status": said(write.status),
+            "progress": write.progress,
+            "repeat": write.rewatches,
+            "startedAt": fuzzy(write.started),
+            "completedAt": fuzzy(write.completed),
+        });
+        let answer = self.answer(query::SAVE, variables).await?;
+        if refuses_the_work(&answer) {
+            return Err(Error::NoWork { id: write.id });
+        }
+        let SaveData { saved: Saved {} } = read(&answer)?;
 
-    /// When the next request may be sent, with the turn after it kept for
-    /// the request after it, so that requests made at once go out in turn.
-    fn turn(&self) -> Instant {
-        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
-        let turn = next.map_or(now, |next| next.max(now));
-        *next = Some(turn + PACE);
-
-        turn
+        Ok(())
     }
+}
+
+/// Whether an answer is the service saying it has no work under the number
+/// asked for: an error of status 404 in what the service answered.
+///
+/// Pages of 404 from anything else are read as any other answer is.
+/// Otherwise `entry` would read every work as off the list behind an address
+/// that answered every request with one.
+fn has_no_work(answer: &Answer) -> bool {
+    serde_json::from_str::<Envelope>(&answer.body).is_ok_and(|envelope| {
+        envelope
+            .errors
+            .iter()
+            .any(|problem| problem.status == Some(404))
+    })
+}
+
+/// Whether an answer refuses a write for the number of its work, as the
+/// service refuses a number it has no work under: `validation` names
+/// `mediaId`.
+fn refuses_the_work(answer: &Answer) -> bool {
+    serde_json::from_str::<Envelope>(&answer.body).is_ok_and(|envelope| {
+        envelope.errors.iter().any(|problem| {
+            problem
+                .validation
+                .as_ref()
+                .is_some_and(|refused| refused.contains_key("mediaId"))
+        })
+    })
 }
 
 /// What an answer holds, or the failure it is.
@@ -196,10 +307,9 @@ fn read<D: DeserializeOwned>(answer: &Answer) -> Result<D, Error> {
 /// romaji, the English and the native; the spellings are the others and the
 /// synonyms, each once. A work is released unless the service says it is
 /// not yet.
-fn entry_of(entry: ListEntry) -> Result<Entry, Error> {
-    let id = EntryId(entry.media_id);
+fn entry_of(work: i64, standing: Standing, media: Media) -> Result<Entry, Error> {
+    let id = EntryId(work);
     let unreadable = |what: String| Error::Unreadable(format!("work {} {what}", id.0).into());
-    let media = entry.media;
     let Title {
         user_preferred,
         romaji,
@@ -221,7 +331,7 @@ fn entry_of(entry: ListEntry) -> Result<Entry, Error> {
             spellings.push(spelling);
         }
     }
-    let score = match entry.score {
+    let score = match standing.score {
         None | Some(0) => None,
         Some(points) => Some(
             Rating::new(points)
@@ -242,11 +352,44 @@ fn entry_of(entry: ListEntry) -> Result<Entry, Error> {
             .season_year
             .or(media.start_date.and_then(|date| date.year)),
         released: media.status.as_deref() != Some("NOT_YET_RELEASED"),
-        status: status_of(entry.status),
-        progress: entry.progress.unwrap_or(0),
-        rewatches: entry.repeat.unwrap_or(0),
+        status: status_of(standing.status),
+        progress: standing.progress.unwrap_or(0),
+        rewatches: standing.repeat.unwrap_or(0),
         score,
     })
+}
+
+/// The day AniList keeps, and none for a day with no year, which AniList
+/// keeps as no day at all.
+fn day_of(kept: Option<FuzzyDate>) -> Option<Day> {
+    let kept = kept?;
+
+    Some(Day {
+        year: kept.year?,
+        month: kept.month,
+        day: kept.day,
+    })
+}
+
+/// The day as `FuzzyDateInput` takes it: every part null for none, which
+/// AniList keeps as no day, and a part null where the day has none.
+fn fuzzy(day: Option<Day>) -> Value {
+    match day {
+        Some(day) => json!({ "year": day.year, "month": day.month, "day": day.day }),
+        None => json!({ "year": null, "month": null, "day": null }),
+    }
+}
+
+/// The status, as AniList names it.
+fn said(status: Status) -> &'static str {
+    match status {
+        Status::Watching => "CURRENT",
+        Status::Planned => "PLANNING",
+        Status::Completed => "COMPLETED",
+        Status::Dropped => "DROPPED",
+        Status::OnHold => "PAUSED",
+        Status::Rewatching => "REPEATING",
+    }
 }
 
 /// The format AniList names, and none for one this build does not know.
@@ -281,14 +424,14 @@ mod tests {
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
-    use benshi_core::list::{Entry, EntryId, Format, Rating, Status};
+    use benshi_core::list::{Dated, Day, Entry, EntryId, Format, Rating, Status, Write};
     use serde_json::{Value, json};
     use tokio::time::Instant;
 
     use super::query::ViewerData;
     use super::transport::{Answer, Request, Transport};
     use super::{Account, AniList, DEADLINE, PACE, WAIT, read};
-    use crate::Error;
+    use crate::{Error, ListBackend};
 
     /// A service that answers what it was given to answer, in order, and
     /// keeps what it was sent and when.
@@ -953,5 +1096,324 @@ mod tests {
 
             assert!(the_one_entry(entry).await.released, "{status}");
         }
+    }
+
+    #[test]
+    fn the_backend_is_named_as_a_person_knows_the_service() {
+        let anilist = AniList::new(Script::default());
+
+        assert_eq!(anilist.name(), "AniList");
+    }
+
+    /// The series as `Media` answers it, with this as the account's entry.
+    fn the_series_with(entry: Value) -> Answer {
+        let mut work = a_series_entry()["media"].clone();
+        work["id"] = json!(16_498);
+        work["mediaListEntry"] = entry;
+        an_answer(200, &json!({ "data": { "Media": work } }))
+    }
+
+    /// The account's entry for the series, begun and completed on these days.
+    fn the_series_entry(started: &Value, completed: &Value) -> Value {
+        json!({
+            "status": "PAUSED", "progress": 3, "repeat": 1, "score": 80,
+            "startedAt": started, "completedAt": completed,
+        })
+    }
+
+    /// No day, as AniList answers a day it does not keep.
+    fn no_day() -> Value {
+        json!({ "year": null, "month": null, "day": null })
+    }
+
+    /// What `entry` reads of the series from this answer, and what it sent.
+    async fn the_entry_of_the_series(
+        answer: Answer,
+    ) -> (Result<Option<Dated>, Error>, Vec<Request>) {
+        let anilist = AniList::new(Script::answering([Some(answer)]));
+
+        let entry = anilist.entry(EntryId(16_498)).await;
+
+        let sent = anilist.transport.sent().into_iter().map(|(_, sent)| sent);
+        (entry, sent.collect())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_is_asked_for_by_its_work_and_read_with_its_days() {
+        let answer = the_series_with(the_series_entry(
+            &json!({ "year": 2026, "month": 9, "day": 2 }),
+            &json!({ "year": 2026, "month": 9, "day": 30 }),
+        ));
+
+        let (entry, sent) = the_entry_of_the_series(answer).await;
+
+        assert_eq!(
+            entry.expect("the entry is read"),
+            Some(Dated {
+                entry: the_series(),
+                started: Some(Day::new(2026, 9, 2)),
+                completed: Some(Day::new(2026, 9, 30)),
+            })
+        );
+        assert_eq!(
+            sent,
+            [Request {
+                query: super::query::ENTRY.to_owned(),
+                variables: json!({ "id": 16_498 }),
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn days_are_read_as_far_as_the_list_keeps_them() {
+        let answer = the_series_with(the_series_entry(
+            &json!({ "year": 2015, "month": null, "day": null }),
+            &json!({ "year": 2016, "month": 5, "day": null }),
+        ));
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        let entry = entry.expect("the entry is read").expect("there is one");
+        assert_eq!(
+            (entry.started, entry.completed),
+            (
+                Some(Day {
+                    year: 2015,
+                    month: None,
+                    day: None
+                }),
+                Some(Day {
+                    year: 2016,
+                    month: Some(5),
+                    day: None
+                })
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_day_with_no_year_is_none() {
+        let answer = the_series_with(the_series_entry(
+            &json!({ "year": null, "month": 5, "day": 3 }),
+            &no_day(),
+        ));
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        let entry = entry.expect("the entry is read").expect("there is one");
+        assert_eq!((entry.started, entry.completed), (None, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_work_off_the_list_has_no_entry() {
+        let (entry, _) = the_entry_of_the_series(the_series_with(Value::Null)).await;
+
+        assert_eq!(entry.expect("the work is read"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_number_the_service_has_no_work_under_has_no_entry() {
+        // The service's answer to a number it has no work under.
+        let answer = an_answer(
+            404,
+            &json!({
+                "errors": [{ "message": "Not Found.", "status": 404,
+                             "locations": [{ "line": 1, "column": 20 }] }],
+                "data": { "Media": null }
+            }),
+        );
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        assert_eq!(entry.expect("the answer is read"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_404_that_is_no_answer_of_the_service_is_unreadable() {
+        let answer = Answer {
+            status: 404,
+            retry_after: None,
+            body: "<html>Not Found</html>".to_owned(),
+        };
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        assert!(matches!(entry, Err(Error::Unreadable(_))), "got {entry:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_404_whose_error_names_no_status_is_a_refusal() {
+        let answer = an_answer(
+            404,
+            &json!({ "errors": [{ "message": "Not Found." }], "data": { "Media": null } }),
+        );
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        assert!(
+            matches!(&entry, Err(Error::Refused(said)) if said == "Not Found."),
+            "got {entry:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_holds_no_work_and_no_error_is_unreadable() {
+        let answer = an_answer(200, &json!({ "data": { "Media": null } }));
+
+        let (entry, _) = the_entry_of_the_series(answer).await;
+
+        assert!(matches!(entry, Err(Error::Unreadable(_))), "got {entry:?}");
+    }
+
+    /// What the service answers a write it took.
+    fn saved() -> Answer {
+        an_answer(
+            200,
+            &json!({ "data": { "SaveMediaListEntry": { "id": 611_099_012 } } }),
+        )
+    }
+
+    /// The write to the series that the tests of writing change: begun on
+    /// 2026-09-02 and not completed.
+    fn a_write() -> Write {
+        Write {
+            id: EntryId(16_498),
+            status: Status::Watching,
+            progress: 4,
+            rewatches: 1,
+            started: Some(Day::new(2026, 9, 2)),
+            completed: None,
+        }
+    }
+
+    /// What `write` answers to this answer, and what it sent.
+    async fn written(write: &Write, answer: Answer) -> (Result<(), Error>, Vec<Request>) {
+        let anilist = AniList::new(Script::answering([Some(answer)]));
+
+        let written = anilist.write(write).await;
+
+        let sent = anilist.transport.sent().into_iter().map(|(_, sent)| sent);
+        (written, sent.collect())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_is_one_request_with_the_status_the_progress_the_repeat_and_both_days() {
+        let (written, sent) = written(&a_write(), saved()).await;
+
+        written.expect("the write is taken");
+        assert_eq!(
+            sent,
+            [Request {
+                query: super::query::SAVE.to_owned(),
+                variables: json!({
+                    "mediaId": 16_498,
+                    "status": "CURRENT",
+                    "progress": 4,
+                    "repeat": 1,
+                    "startedAt": { "year": 2026, "month": 9, "day": 2 },
+                    "completedAt": { "year": null, "month": null, "day": null },
+                }),
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_status_is_written_as_it_is_read() {
+        let every = [
+            ("CURRENT", Status::Watching),
+            ("PLANNING", Status::Planned),
+            ("COMPLETED", Status::Completed),
+            ("DROPPED", Status::Dropped),
+            ("PAUSED", Status::OnHold),
+            ("REPEATING", Status::Rewatching),
+        ];
+
+        for (said, status) in every {
+            let (_, sent) = written(
+                &Write {
+                    status,
+                    ..a_write()
+                },
+                saved(),
+            )
+            .await;
+
+            assert_eq!(sent[0].variables["status"], said, "{status:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_day_kept_without_its_month_is_written_as_it_was_read() {
+        let write = Write {
+            started: Some(Day {
+                year: 2015,
+                month: None,
+                day: None,
+            }),
+            ..a_write()
+        };
+
+        let (_, sent) = written(&write, saved()).await;
+
+        assert_eq!(
+            sent[0].variables["startedAt"],
+            json!({ "year": 2015, "month": null, "day": null })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_to_a_number_with_no_work_is_answered_as_no_work() {
+        // The service's answer to a write to a number it has no work under.
+        let answer = an_answer(
+            400,
+            &json!({
+                "errors": [{ "message": "validation", "status": 400,
+                             "locations": [{ "line": 1, "column": 43 }],
+                             "validation": { "mediaId": ["The selected media id is invalid."] } }],
+                "data": { "SaveMediaListEntry": null }
+            }),
+        );
+        let nowhere = Write {
+            id: EntryId(999_999_999),
+            ..a_write()
+        };
+
+        let (written, _) = written(&nowhere, answer).await;
+
+        assert!(
+            matches!(written, Err(Error::NoWork { id }) if id == EntryId(999_999_999)),
+            "got {written:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_refused_for_another_field_is_a_refusal() {
+        let answer = an_answer(
+            400,
+            &json!({
+                "errors": [{ "message": "validation", "status": 400,
+                             "validation": { "progress": ["The progress must be an integer."] } }],
+                "data": { "SaveMediaListEntry": null }
+            }),
+        );
+
+        let (written, _) = written(&a_write(), answer).await;
+
+        assert!(
+            matches!(&written, Err(Error::Refused(said)) if said == "validation"),
+            "got {written:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_answered_with_nothing_saved_is_unreadable() {
+        let answer = an_answer(200, &json!({ "data": { "SaveMediaListEntry": null } }));
+
+        let (written, _) = written(&a_write(), answer).await;
+
+        assert!(
+            matches!(written, Err(Error::Unreadable(_))),
+            "got {written:?}"
+        );
     }
 }

@@ -103,12 +103,12 @@ impl Drop for Replay {
 }
 
 /// The service over HTTPS, with every exchange kept.
-pub struct Recording<'a> {
-    pub http: &'a Http,
+pub struct Recording {
+    pub http: Arc<Http>,
     pub kept: Arc<Mutex<Vec<Exchange>>>,
 }
 
-impl Transport for Recording<'_> {
+impl Transport for Recording {
     async fn send(&self, request: &Request) -> Result<Answer, Error> {
         let answer = self.http.send(request).await?;
         self.kept

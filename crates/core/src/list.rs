@@ -48,9 +48,26 @@ pub struct Entry {
     pub score: Option<Rating>,
 }
 
+/// One entry of a list with the days the account began and completed the
+/// work.
+///
+/// Readings of one work hold both days, as a write carries them. Readings of
+/// the whole list leave the days out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dated {
+    /// The entry.
+    pub entry: Entry,
+    /// The day the account began the work, where the list holds one.
+    pub started: Option<Day>,
+    /// The day the account completed the work, where the list holds one.
+    pub completed: Option<Day>,
+}
+
 /// Where an account stands on one work, as a write tells a list.
 ///
 /// The score is not in it: a write leaves the score as the list holds it.
+/// Both days are, and a day the write does not carry is none on the list
+/// once it is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Write {
     /// The work.
@@ -61,6 +78,37 @@ pub struct Write {
     pub progress: u32,
     /// How many times the account has seen the work again.
     pub rewatches: u32,
+    /// The day the account began the work.
+    pub started: Option<Day>,
+    /// The day the account completed the work.
+    pub completed: Option<Day>,
+}
+
+/// Calendar day, as lists keep the day an entry was begun or completed.
+///
+/// Lists can keep the year of a day alone, or its year and month, as AniList
+/// keeps a day given so. Days are written back as they were read, so that a
+/// write leaves such a day as the account gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Day {
+    /// The year.
+    pub year: u16,
+    /// The month, from 1 to 12, where the list keeps one.
+    pub month: Option<u8>,
+    /// The day of the month, from 1 to 31, where the list keeps one.
+    pub day: Option<u8>,
+}
+
+impl Day {
+    /// The day named by its year, its month and its day of the month.
+    #[must_use]
+    pub const fn new(year: u16, month: u8, day: u8) -> Self {
+        Self {
+            year,
+            month: Some(month),
+            day: Some(day),
+        }
+    }
 }
 
 /// What kind of release a work is.
@@ -144,7 +192,7 @@ impl<'de> Deserialize<'de> for Rating {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryId, Rating, Status, Write};
+    use super::{Day, EntryId, Rating, Status, Write};
 
     #[test]
     fn a_rating_is_from_one_to_a_hundred() {
@@ -184,17 +232,48 @@ mod tests {
             status: Status::Rewatching,
             progress: 3,
             rewatches: 2,
+            started: Some(Day::new(2026, 9, 2)),
+            completed: None,
         };
 
         let written = serde_json::to_string(&write).expect("serialize");
 
         assert_eq!(
             written,
-            r#"{"id":12345,"status":"rewatching","progress":3,"rewatches":2}"#
+            r#"{"id":12345,"status":"rewatching","progress":3,"rewatches":2,"started":{"year":2026,"month":9,"day":2},"completed":null}"#
         );
         assert_eq!(
             serde_json::from_str::<Write>(&written).expect("deserialize"),
             write
+        );
+    }
+
+    #[test]
+    fn a_day_kept_without_its_month_reads_back_as_it_was() {
+        let year_alone = Day {
+            year: 2015,
+            month: None,
+            day: None,
+        };
+
+        let written = serde_json::to_string(&year_alone).expect("serialize");
+
+        assert_eq!(written, r#"{"year":2015,"month":null,"day":null}"#);
+        assert_eq!(
+            serde_json::from_str::<Day>(&written).expect("deserialize"),
+            year_alone
+        );
+    }
+
+    #[test]
+    fn a_whole_day_names_its_month_and_its_day() {
+        assert_eq!(
+            Day::new(2026, 11, 16),
+            Day {
+                year: 2026,
+                month: Some(11),
+                day: Some(16),
+            }
         );
     }
 }

@@ -27,6 +27,8 @@ use benshi_core::settle::Facts;
 use benshi_core::token::Token;
 use benshi_store::Store;
 #[cfg(target_os = "linux")]
+use benshi_sync::ListBackend;
+#[cfg(target_os = "linux")]
 use benshi_sync::anilist::AniList;
 #[cfg(target_os = "linux")]
 use benshi_sync::anilist::transport::Http;

@@ -9,6 +9,7 @@ mod recorded;
 use std::time::Duration;
 
 use benshi_core::list::{Entry, EntryId, Format, Rating, Status};
+use benshi_sync::ListBackend;
 use benshi_sync::anilist::AniList;
 
 /// An entry with the facts the service gives a work, and no spellings,

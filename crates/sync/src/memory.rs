@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use benshi_core::list::{Entry, EntryId, Write};
+use benshi_core::list::{Dated, Entry, EntryId, Write};
 
 use crate::{Error, ListBackend, within};
 
@@ -40,13 +40,13 @@ pub struct Memory {
 /// What the service has: the works on the list, and the others.
 #[derive(Debug)]
 struct Works {
-    listed: BTreeMap<EntryId, Entry>,
+    listed: BTreeMap<EntryId, Dated>,
     unlisted: BTreeMap<EntryId, Entry>,
 }
 
 impl Memory {
-    /// A backend named `name` whose list holds `listed`, and whose service
-    /// also has `unlisted`.
+    /// The backend named `name`, whose list holds `listed` with no days, and
+    /// whose service also has `unlisted`.
     ///
     /// Where the account stands on a work of `unlisted` is not read: a write
     /// that adds the work says it, and a work added has no score.
@@ -62,7 +62,10 @@ impl Memory {
             deadline,
             fault: None,
             works: Mutex::new(Works {
-                listed: by_work(listed),
+                listed: listed
+                    .into_iter()
+                    .map(|entry| (entry.id, undated(entry)))
+                    .collect(),
                 unlisted: by_work(unlisted),
             }),
         }
@@ -106,36 +109,53 @@ fn by_work(entries: impl IntoIterator<Item = Entry>) -> BTreeMap<EntryId, Entry>
     entries.into_iter().map(|entry| (entry.id, entry)).collect()
 }
 
+/// The entry, with no day the account began or completed the work.
+fn undated(entry: Entry) -> Dated {
+    Dated {
+        entry,
+        started: None,
+        completed: None,
+    }
+}
+
 impl ListBackend for Memory {
     fn name(&self) -> &str {
         &self.name
     }
 
     async fn list(&self) -> Result<Vec<Entry>, Error> {
-        self.answer(|works| Ok(works.listed.values().cloned().collect()))
-            .await
+        self.answer(|works| {
+            Ok(works
+                .listed
+                .values()
+                .map(|dated| dated.entry.clone())
+                .collect())
+        })
+        .await
     }
 
-    async fn entry(&self, id: EntryId) -> Result<Option<Entry>, Error> {
+    async fn entry(&self, id: EntryId) -> Result<Option<Dated>, Error> {
         self.answer(|works| Ok(works.listed.get(&id).cloned()))
             .await
     }
 
     async fn write(&self, write: &Write) -> Result<(), Error> {
         self.answer(|works| {
-            let entry = match works.unlisted.remove(&write.id) {
-                Some(work) => works.listed.entry(write.id).or_insert(Entry {
+            let dated = match works.unlisted.remove(&write.id) {
+                Some(work) => works.listed.entry(write.id).or_insert(undated(Entry {
                     score: None,
                     ..work
-                }),
+                })),
                 None => works
                     .listed
                     .get_mut(&write.id)
                     .ok_or(Error::NoWork { id: write.id })?,
             };
-            entry.status = write.status;
-            entry.progress = write.progress;
-            entry.rewatches = write.rewatches;
+            dated.entry.status = write.status;
+            dated.entry.progress = write.progress;
+            dated.entry.rewatches = write.rewatches;
+            dated.started = write.started;
+            dated.completed = write.completed;
 
             Ok(())
         })
@@ -147,6 +167,8 @@ impl ListBackend for Memory {
 mod tests {
     use std::time::Duration;
 
+    use benshi_core::list::{Dated, Entry, EntryId, Status};
+
     use super::Memory;
     use crate::ListBackend;
 
@@ -155,5 +177,35 @@ mod tests {
         let memory = Memory::new("second", Duration::from_secs(15), [], []);
 
         assert_eq!(memory.name(), "second");
+    }
+
+    #[tokio::test]
+    async fn an_entry_listed_at_the_start_holds_no_days() {
+        let listed = Entry {
+            id: EntryId(21),
+            title: "Show Title".to_owned(),
+            spellings: Vec::new(),
+            format: None,
+            episodes: Some(12),
+            episode_length: None,
+            year: None,
+            released: true,
+            status: Status::OnHold,
+            progress: 3,
+            rewatches: 0,
+            score: None,
+        };
+        let memory = Memory::new("memory", Duration::from_secs(15), [listed.clone()], []);
+
+        let held = memory.entry(EntryId(21)).await;
+
+        assert_eq!(
+            held.expect("the entry is read"),
+            Some(Dated {
+                entry: listed,
+                started: None,
+                completed: None,
+            })
+        );
     }
 }

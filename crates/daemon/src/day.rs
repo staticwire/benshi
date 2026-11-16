@@ -8,7 +8,7 @@
 
 use std::time::SystemTime;
 
-use benshi_sync::plan::Day;
+use benshi_core::list::Day;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
@@ -19,18 +19,18 @@ pub fn day_in(at: SystemTime, zone: &TimeZone) -> Option<Day> {
     let instant = Timestamp::try_from(at).ok()?;
     let date = zone.to_datetime(instant).date();
 
-    Some(Day {
-        year: u16::try_from(date.year()).ok()?,
-        month: u8::try_from(date.month()).ok()?,
-        day: u8::try_from(date.day()).ok()?,
-    })
+    Some(Day::new(
+        u16::try_from(date.year()).ok()?,
+        u8::try_from(date.month()).ok()?,
+        u8::try_from(date.day()).ok()?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use benshi_sync::plan::Day;
+    use benshi_core::list::Day;
     use jiff::tz::{Offset, TimeZone};
 
     use super::day_in;
@@ -44,7 +44,7 @@ mod tests {
     }
 
     fn day(year: u16, month: u8, day: u8) -> Day {
-        Day { year, month, day }
+        Day::new(year, month, day)
     }
 
     /// A zone this many hours east of UTC, with no summer time.

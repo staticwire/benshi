@@ -23,7 +23,7 @@ pub mod resolve;
 use std::time::Duration;
 
 use benshi_core::BoxError;
-use benshi_core::list::{Entry, EntryId, Write};
+use benshi_core::list::{Dated, Entry, EntryId, Write};
 
 /// Why a call to a list was not answered.
 ///
@@ -90,16 +90,16 @@ pub trait ListBackend {
     /// An [`Error`] of the class the failure of the service is.
     fn list(&self) -> impl Future<Output = Result<Vec<Entry>, Error>> + Send;
 
-    /// The account's entry for one work, and none where the work is not on
-    /// its list.
+    /// The account's entry for one work with the days the account began and
+    /// completed it, and none where the work is not on its list.
     ///
     /// # Errors
     ///
     /// An [`Error`] of the class the failure of the service is.
-    fn entry(&self, id: EntryId) -> impl Future<Output = Result<Option<Entry>, Error>> + Send;
+    fn entry(&self, id: EntryId) -> impl Future<Output = Result<Option<Dated>, Error>> + Send;
 
-    /// Write where the account stands on one work, adding the work to the
-    /// list where it is not on it.
+    /// Write where the account stands on one work, both days included,
+    /// adding the work to the list where it is not on it.
     ///
     /// # Errors
     ///
