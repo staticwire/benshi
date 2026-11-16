@@ -294,6 +294,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
+    use benshi_daemon::Ran;
     use benshi_daemon::config;
     use benshi_daemon::listing;
     use benshi_daemon::paths::{DATABASE, Role, directory};
@@ -380,7 +381,7 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
 
     // Given a factory and no watcher: restarts have to reconnect to the
     // session bus, which is the failure they exist to recover from.
-    let running = benshi_daemon::run(
+    let ran = benshi_daemon::run(
         watchers,
         listener,
         recognizer,
@@ -390,29 +391,24 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         Arc::new(accounts),
         list,
         send,
-        // Said as it happens: the socket goes on answering once detection
-        // has stopped, and the process does not end to say so. The
-        // supervisor deals with no task that ended until this returns, so it
-        // hands the line over and does not write it.
+        stops.first(),
+        // Said as it happens, since the socket answers on once detection has
+        // stopped. The supervisor waits for this, so it hands the line over.
         {
             let voice = Arc::clone(voice);
             move |notice| voice.say(format_args!("{notice}"))
         },
-    );
-    let signal = tokio::select! {
-        _records = running => {
-            // Reached only when nothing is left running, which for a daemon
-            // is a failure however tidily each task arrived at it. What
-            // stopped each task was said as it stopped.
-            return FAILED;
-        }
-        signal = stops.first() => signal,
+    )
+    .await;
+    let signal = match ran {
+        // Nothing is left running, which for a daemon is a failure. What
+        // stopped each task was said as it stopped.
+        Ran::TasksStopped(_records) => return FAILED,
+        Ran::Stopped(signal) => signal,
     };
 
-    // The supervisor went with `running`, and its `JoinSet` aborts every
-    // task as it is dropped. A task that is aborted ends at an await: the
-    // one it waits at, or the next it reaches. The runtime waits for that
-    // as it is dropped, and for a call into the store that is under way.
+    // The supervisor went with `run` and aborted every task, and the runtime
+    // waits for each to reach an await and for a call into the store.
     words.last(|| voice.say(format_args!("stopped by {signal}")));
 
     STOPPED

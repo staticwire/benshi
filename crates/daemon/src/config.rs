@@ -76,8 +76,9 @@ pub struct Sending {
     /// `at_start`, which asks for what waits to be sent as the daemon
     /// starts: true where the file does not say.
     pub at_start: bool,
-    /// `at_stop`, which asks for what waits to be sent as the daemon stops:
-    /// false where the file does not say.
+    /// `at_stop`, which asks for what waits to be sent as the daemon stops,
+    /// for [`AT_STOP`](crate::sending::AT_STOP) at the most: false where the
+    /// file does not say.
     pub at_stop: bool,
 }
 
@@ -98,7 +99,7 @@ impl Default for Sending {
 pub enum When {
     /// `"each"`: each viewing, as it is recorded.
     Each,
-    /// `"close"`: the player closing.
+    /// `"close"`: an episode closing, once no player has it open.
     Close,
     /// `"interval"`: the end of each `interval`.
     Interval,

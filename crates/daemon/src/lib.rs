@@ -74,7 +74,17 @@ pub mod supervisor;
 
 pub mod voice;
 
-/// Run the daemon until every one of its tasks has stopped.
+/// What a run of the daemon came to.
+#[derive(Debug)]
+pub enum Ran<S> {
+    /// No task is left running, each with what stopped it.
+    TasksStopped(Vec<TaskRecord>),
+    /// The stop came, with what it came with.
+    Stopped(S),
+}
+
+/// Run the daemon until every one of its tasks has stopped, or until `stop`
+/// comes.
 ///
 /// Built where the socket is, because a daemon with no interface is not one:
 /// nothing could ask it what it had seen. The platform that needs a named
@@ -111,20 +121,26 @@ pub mod voice;
 /// when.
 ///
 /// `tell` is told of a task as the task is started again and as it stops,
-/// whatever the other tasks are doing. A daemon whose detection has stopped
-/// goes on answering its socket, and nothing else says that it records
+/// whatever the other tasks are doing. Daemons whose detection has stopped
+/// go on answering their socket, and nothing else says that they record
 /// nothing. The supervisor deals with no task that ended until `tell` has
 /// returned, so a `tell` that writes hands the line to a
 /// [`Voice`](voice::Voice).
 ///
-/// Returns once no task is left running, which for a daemon means every one of
-/// them stopped permanently. What stopped each is in its [`TaskRecord`], and
-/// `tell` has been told of each by then.
+/// Returns [`Ran::TasksStopped`] once no task is left running, which for a
+/// daemon means every one of them stopped permanently. What stopped each is
+/// in its [`TaskRecord`], and `tell` has been told of each by then.
+///
+/// Returns [`Ran::Stopped`] once `stop` comes, and where `at_stop` of
+/// `[send]` asks, after the last pass of the sending task or
+/// [`AT_STOP`](sending::AT_STOP), whichever ends first. Every task runs on,
+/// supervised, until then, and is aborted as the supervisor goes with this
+/// call.
 #[expect(
     clippy::too_many_arguments,
     reason = "each part is built by the caller, so that a test can give its own"
 )]
-pub async fn run<W, B, F, T, S, A>(
+pub async fn run<W, B, F, T, S, A, P>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
     recognizer: Recognizer,
@@ -134,8 +150,9 @@ pub async fn run<W, B, F, T, S, A>(
     accounts: Arc<dyn Accounts>,
     list: Listing<S>,
     send: Sends<A>,
+    stop: P,
     tell: T,
-) -> Vec<TaskRecord>
+) -> Ran<P::Output>
 where
     B: FnMut() -> F + Send + 'static,
     F: Future<Output = Result<W, WatchError>> + Send + 'static,
@@ -143,6 +160,7 @@ where
     T: FnMut(&Notice) + Send + 'static,
     S: Source + Send + Sync + 'static,
     A: Account + Send + Sync + 'static,
+    P: Future + Send,
 {
     let wiring = Wiring {
         bus: Arc::new(EventBus::new()),
@@ -156,6 +174,10 @@ where
         period,
     };
     let (send_now, asked) = sending::send_now();
+    let at_stop = send
+        .sending
+        .at_stop
+        .then(|| (send_now.clone(), Arc::clone(&send.say)));
     let server = Arc::new(Server::new(
         Arc::clone(&wiring.bus),
         Arc::clone(&wiring.policy),
@@ -226,5 +248,22 @@ where
         async move { sender.run().await }
     });
 
-    supervisor.run().await
+    // Pinned out here because select! drops what it owns before a branch runs:
+    // the supervisor goes on through the pass at stop, and aborts every task after it.
+    let supervised = supervisor.run();
+    tokio::pin!(supervised);
+    tokio::select! {
+        records = &mut supervised => Ran::TasksStopped(records),
+        stopped = stop => {
+            if let Some((send_now, say)) = &at_stop {
+                // The supervisor first, so that a task that stops in the pass is told of.
+                tokio::select! {
+                    biased;
+                    _records = &mut supervised => {}
+                    () = sending::at_stop(send_now, say) => {}
+                }
+            }
+            Ran::Stopped(stopped)
+        }
+    }
 }

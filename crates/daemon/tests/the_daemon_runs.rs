@@ -33,6 +33,7 @@ use benshi_core::token::Token;
 use benshi_core::{
     AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
 };
+use benshi_daemon::Ran;
 use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::config::{Period, Reading, Sending, When};
@@ -397,7 +398,7 @@ fn a_daemon(
     platform: &Platform,
     home: &TempDir,
     socket: &Path,
-) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+) -> tokio::task::JoinHandle<Ran<()>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
 
     tokio::spawn(benshi_daemon::run(
@@ -410,6 +411,7 @@ fn a_daemon(
         Arc::new(NoLogins),
         reading_nothing(),
         sending_nothing(),
+        future::pending(),
         |_notice| {},
     ))
 }
@@ -420,7 +422,7 @@ fn a_daemon_with_a_list(
     platform: &Platform,
     store: &Arc<Mutex<Store>>,
     socket: &Path,
-) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+) -> tokio::task::JoinHandle<Ran<()>> {
     a_daemon_that_tells(platform, store, socket, &Told::default())
 }
 
@@ -430,7 +432,7 @@ fn a_daemon_that_tells(
     store: &Arc<Mutex<Store>>,
     socket: &Path,
     told: &Told,
-) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+) -> tokio::task::JoinHandle<Ran<()>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
     let mut list = Corpus::new();
     list.file(THE_SHOW, "Show", Vec::<&str>::new());
@@ -445,6 +447,7 @@ fn a_daemon_that_tells(
         Arc::new(NoLogins),
         reading_nothing(),
         sending_nothing(),
+        future::pending(),
         told.listener(),
     ))
 }
@@ -626,7 +629,7 @@ fn a_daemon_reading(
     store: &Arc<Mutex<Store>>,
     socket: &Path,
     reading: Reading,
-) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+) -> tokio::task::JoinHandle<Ran<()>> {
     let listener = Arc::new(bind(socket).expect("the socket binds"));
 
     tokio::spawn(benshi_daemon::run(
@@ -643,6 +646,7 @@ fn a_daemon_reading(
             say: Arc::new(|_line: &str| {}),
         },
         sending_nothing(),
+        future::pending(),
         |_notice| {},
     ))
 }
@@ -833,13 +837,20 @@ impl Account for InMemory {
 }
 
 /// The daemon over this platform that reads [`the_entry`] as its list at the
-/// start, and sends each viewing it records to `list` as it is recorded.
-fn a_daemon_sending(
+/// start, sends what it records to `list` at the times `sending` names, and
+/// stops once `stop` comes.
+fn a_daemon_sending<P>(
     platform: &Platform,
     store: &Arc<Mutex<Store>>,
     socket: &Path,
     list: &Shared,
-) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+    sending: Sending,
+    stop: P,
+) -> tokio::task::JoinHandle<Ran<P::Output>>
+where
+    P: Future + Send + 'static,
+    P::Output: Send + 'static,
+{
     let listener = Arc::new(bind(socket).expect("the socket binds"));
 
     tokio::spawn(benshi_daemon::run(
@@ -857,15 +868,165 @@ fn a_daemon_sending(
         },
         Sends {
             account: InMemory(list.clone()),
+            sending,
+            say: Arc::new(|_line: &str| {}),
+        },
+        stop,
+        |_notice| {},
+    ))
+}
+
+/// The list in memory, holding [`the_entry`].
+fn holding_the_entry() -> Shared {
+    Shared(Arc::new(Memory::new(
+        "AniList",
+        Duration::from_secs(15),
+        vec![the_entry()],
+        Vec::new(),
+    )))
+}
+
+/// The progress `list` holds of [`the_entry`].
+async fn progress_held(list: &Shared) -> u32 {
+    list.0
+        .entry(the_entry().id)
+        .await
+        .expect("the entry is read")
+        .expect("the list holds it")
+        .entry
+        .progress
+}
+
+/// Run a daemon that sends nothing before it stops, wait until it recorded
+/// the platform's file, stop it, and answer with the progress the list holds
+/// once it has stopped. `at_stop` is what `[send]` says of the stop.
+async fn stopped_after_a_viewing(at_stop: bool) -> u32 {
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::held();
+    let list = holding_the_entry();
+    let (stop, stopping) = tokio::sync::oneshot::channel::<()>();
+    let running = a_daemon_sending(
+        &platform,
+        &store,
+        &socket,
+        &list,
+        Sending {
+            when: When::Manual,
+            at_start: false,
+            at_stop,
+            ..Sending::default()
+        },
+        stopping,
+    );
+
+    once_decided_by_its_list(&platform, &socket, "the list read at the start").await;
+    once_queued(&store, "the daemon recorded an episode of its list").await;
+    stop.send(()).expect("the daemon waits for its stop");
+    let ran = timeout(PATIENCE, running)
+        .await
+        .expect("the daemon stops")
+        .expect("the daemon ran to its end");
+
+    assert!(matches!(ran, Ran::Stopped(Ok(()))), "{ran:?}");
+    progress_held(&list).await
+}
+
+#[tokio::test]
+async fn a_daemon_that_stops_sends_what_waits_first_where_at_stop_asks() {
+    assert_eq!(stopped_after_a_viewing(true).await, 3);
+}
+
+#[tokio::test]
+async fn a_daemon_that_stops_sends_nothing_where_at_stop_does_not_ask() {
+    assert_eq!(stopped_after_a_viewing(false).await, 2);
+}
+
+/// The list whose every read of an entry panics.
+struct Panicking;
+
+impl ListBackend for Panicking {
+    fn name(&self) -> &'static str {
+        "AniList"
+    }
+
+    async fn list(&self) -> Result<Vec<Entry>, benshi_sync::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn entry(&self, _id: EntryId) -> Result<Option<Dated>, benshi_sync::Error> {
+        panic!("a read of an entry panicked")
+    }
+
+    async fn write(&self, _write: &Write) -> Result<(), benshi_sync::Error> {
+        Ok(())
+    }
+}
+
+/// The account of [`Panicking`], its token always found.
+struct PanickingAccount;
+
+impl Account for PanickingAccount {
+    type Backend = Panicking;
+
+    fn token(&self) -> impl Future<Output = Result<Option<Token>, secrets::Error>> + Send {
+        future::ready(Ok(Some(Token::new("a token"))))
+    }
+
+    fn backend(&self, _token: &Token) -> Result<Panicking, benshi_sync::Error> {
+        Ok(Panicking)
+    }
+}
+
+#[tokio::test]
+async fn a_task_that_stops_in_the_pass_at_stop_is_told_of() {
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::held();
+    let told = Told::default();
+    let (stop, stopping) = tokio::sync::oneshot::channel::<()>();
+    let listener = Arc::new(bind(&socket).expect("the socket binds"));
+    let running = tokio::spawn(benshi_daemon::run(
+        platform.factory(),
+        listener,
+        Recognizer::empty(),
+        Arc::clone(&store),
+        the_time,
+        PERIOD,
+        Arc::new(Taking),
+        Listing {
+            source: Answering(vec![the_entry()]),
+            reading: Reading::default(),
+            say: Arc::new(|_line: &str| {}),
+        },
+        Sends {
+            account: PanickingAccount,
             sending: Sending {
-                when: When::Each,
+                when: When::Manual,
                 at_start: false,
+                at_stop: true,
                 ..Sending::default()
             },
             say: Arc::new(|_line: &str| {}),
         },
-        |_notice| {},
-    ))
+        stopping,
+        told.listener(),
+    ));
+
+    once_decided_by_its_list(&platform, &socket, "the list read at the start").await;
+    once_queued(&store, "the daemon recorded an episode of its list").await;
+    stop.send(()).expect("the daemon waits for its stop");
+    timeout(PATIENCE, running)
+        .await
+        .expect("the daemon stops")
+        .expect("the daemon ran to its end");
+
+    let told = told.all();
+    assert!(
+        told.iter()
+            .any(|notice| matches!(notice, Notice::Restarted { name, .. } if name == "send")),
+        "{told:?}"
+    );
 }
 
 /// The lines of a stream the daemon was asked for with `Watch`.
@@ -894,13 +1055,19 @@ async fn a_running_daemon_sends_what_it_records_and_watch_shows_it() {
     let (home, socket) = a_socket();
     let store = an_empty_store(&home);
     let platform = Platform::held();
-    let list = Shared(Arc::new(Memory::new(
-        "AniList",
-        Duration::from_secs(15),
-        vec![the_entry()],
-        Vec::new(),
-    )));
-    let running = a_daemon_sending(&platform, &store, &socket, &list);
+    let list = holding_the_entry();
+    let running = a_daemon_sending(
+        &platform,
+        &store,
+        &socket,
+        &list,
+        Sending {
+            when: When::Each,
+            at_start: false,
+            ..Sending::default()
+        },
+        future::pending::<()>(),
+    );
     let mut lines = watching(&socket).await;
 
     once_decided_by_its_list(&platform, &socket, "the list read at the start").await;
