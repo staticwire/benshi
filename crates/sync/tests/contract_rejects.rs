@@ -14,7 +14,7 @@ mod fakes;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
-use benshi_core::list::{Entry, EntryId, Rating, Write};
+use benshi_core::list::{Dated, Entry, EntryId, Rating, Write};
 use benshi_sync::memory::Memory;
 use benshi_sync::{Error, ListBackend};
 
@@ -28,6 +28,10 @@ enum Break {
     InventsEntries,
     /// Takes a write and keeps nothing of it.
     ForgetsWrites,
+    /// Keeps the days a work had, whatever a write says of them.
+    ForgetsTheDays,
+    /// Keeps a day a write leaves out.
+    KeepsADayLeftOut,
     /// Takes the score away from a work it writes.
     ClearsTheScore,
     /// Renames a work it writes.
@@ -152,7 +156,7 @@ impl ListBackend for Broken {
         Ok(list.into_iter().map(|entry| self.broken(entry)).collect())
     }
 
-    async fn entry(&self, id: EntryId) -> Result<Option<Entry>, Error> {
+    async fn entry(&self, id: EntryId) -> Result<Option<Dated>, Error> {
         if let Some(error) = self.misanswered().await {
             return Err(error);
         }
@@ -160,24 +164,43 @@ impl ListBackend for Broken {
             return Err(Error::Unreachable("connection refused".into()));
         }
         let entry = match (self.breaking, self.memory.entry(id).await?) {
-            (Break::InventsEntries, None) => Some(a_film(id)),
+            (Break::InventsEntries, None) => Some(Dated {
+                entry: a_film(id),
+                started: None,
+                completed: None,
+            }),
             (_, entry) => entry,
         };
 
-        Ok(entry.map(|entry| self.broken(entry)))
+        Ok(entry.map(|dated| Dated {
+            entry: self.broken(dated.entry),
+            ..dated
+        }))
     }
 
     async fn write(&self, write: &Write) -> Result<(), Error> {
         if let Some(error) = self.misanswered().await {
             return Err(error);
         }
-        match self.breaking {
+        let held = self.memory.entry(write.id).await?;
+        let (started, completed) = held
+            .as_ref()
+            .map_or((None, None), |held| (held.started, held.completed));
+        let write = &match self.breaking {
             Break::ForgetsWrites => return Ok(()),
-            Break::WritesOnlyTheList if self.memory.entry(write.id).await?.is_none() => {
-                return Ok(());
-            }
-            _ => {}
-        }
+            Break::WritesOnlyTheList if held.is_none() => return Ok(()),
+            Break::ForgetsTheDays => Write {
+                started,
+                completed,
+                ..*write
+            },
+            Break::KeepsADayLeftOut => Write {
+                started: write.started.or(started),
+                completed: write.completed.or(completed),
+                ..*write
+            },
+            _ => *write,
+        };
         match self.memory.write(write).await {
             Err(Error::NoWork { .. }) if self.breaking == Break::TakesAWriteToNoWork => {}
             answer => answer?,
@@ -211,6 +234,18 @@ async fn an_entry_invented_for_a_work_off_the_list_fails_the_contract() {
 #[should_panic(expected = "a write is read back as it was written")]
 async fn a_write_forgotten_fails_the_contract() {
     verify_broken(Break::ForgetsWrites).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "a write is read back as it was written")]
+async fn days_a_write_does_not_change_fail_the_contract() {
+    verify_broken(Break::ForgetsTheDays).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "a write is read back as it was written")]
+async fn a_day_kept_where_a_write_leaves_it_out_fails_the_contract() {
+    verify_broken(Break::KeepsADayLeftOut).await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -214,7 +214,7 @@ fn advance(transaction: &Transaction<'_>, backend: &str, operation: i64) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use benshi_core::list::{EntryId, Status, Write};
+    use benshi_core::list::{Day, EntryId, Status, Write};
     use tempfile::TempDir;
 
     use super::Aside;
@@ -300,6 +300,8 @@ mod tests {
             status: Status::Watching,
             progress,
             rewatches: 0,
+            started: Some(Day::new(2026, 11, 2)),
+            completed: None,
         }
     }
 

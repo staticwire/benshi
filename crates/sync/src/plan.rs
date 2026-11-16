@@ -31,20 +31,8 @@
 //! a reason of its own. Progress counts the episodes seen from the first, so
 //! it has no place for episode 0.
 
-use benshi_core::list::Status;
+use benshi_core::list::{Day, Status};
 use serde::{Deserialize, Serialize};
-
-/// A day of the calendar, as a list keeps the day an entry was begun or
-/// completed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Day {
-    /// The year.
-    pub year: u16,
-    /// The month, from 1 to 12.
-    pub month: u8,
-    /// The day of the month, from 1 to 31.
-    pub day: u8,
-}
 
 /// Where the account stands on a work, as its list holds it, or as a write
 /// leaves it.
@@ -182,29 +170,17 @@ const NOWHERE: Standing = Standing {
 
 #[cfg(test)]
 mod tests {
-    use super::{Day, Plan, Standing, Why, plan};
-    use benshi_core::list::Status;
+    use super::{Plan, Standing, Why, plan};
+    use benshi_core::list::{Day, Status};
 
     /// The day of every viewing here.
-    const TODAY: Day = Day {
-        year: 2026,
-        month: 10,
-        day: 14,
-    };
+    const TODAY: Day = Day::new(2026, 10, 14);
 
-    /// A day an entry was begun before.
-    const BEGUN: Day = Day {
-        year: 2026,
-        month: 9,
-        day: 2,
-    };
+    /// The day entries here were begun before.
+    const BEGUN: Day = Day::new(2026, 9, 2);
 
-    /// A day an entry was completed before.
-    const DONE: Day = Day {
-        year: 2026,
-        month: 9,
-        day: 30,
-    };
+    /// The day entries here were completed before.
+    const DONE: Day = Day::new(2026, 9, 30);
 
     /// An entry of this status at this progress, begun on [`BEGUN`] where it
     /// is under way.

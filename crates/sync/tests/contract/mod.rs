@@ -12,12 +12,31 @@
 //! The backend in memory runs the suite on a paused clock, from
 //! `#[tokio::test(start_paused = true)]`, so a deadline of fifteen seconds
 //! passes the moment nothing else is left to run, and costs no real time.
+//!
+//! [`verify_answers`] runs the checks that ask the service and no other,
+//! which is what a recording of a service's answers is made from. The
+//! failures are made by the subject, and on a clock that runs they cannot be
+//! checked: a call to a service that never answers ends a moment past its
+//! deadline, and the check of its deadline is exact.
+
+// The recorder of the AniList fixtures runs the checks that ask the service
+// alone, and leaves the rest of this unused.
+#![allow(dead_code)]
 
 use std::time::Duration;
 
-use benshi_core::list::{Entry, EntryId, Status, Write};
+use benshi_core::list::{Dated, Day, Entry, EntryId, Status, Write};
 use benshi_sync::{Error, ListBackend};
 use tokio::time::{Instant, timeout};
+
+/// The day the writes to the listed work say it was begun.
+const BEGUN: Day = Day::new(2026, 9, 2);
+
+/// The day the first writes to the listed work say it was completed.
+const DONE: Day = Day::new(2026, 9, 30);
+
+/// The day the write that adds a work says it was begun.
+const ADDED: Day = Day::new(2026, 11, 16);
 
 /// How the service behind a backend fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +85,24 @@ pub struct Subject<B> {
 ///
 /// Panics on the first failure, naming the clause that was broken.
 pub async fn verify<B: ListBackend>(subject: Subject<B>) {
+    let write = verify_answers(&subject).await;
+
+    for failure in EVERY_FAILURE {
+        each_failure_is_answered_as_its_class(&subject, failure, &write).await;
+    }
+}
+
+/// Run every check that asks the service behind the backend, and answer with
+/// the first write it made, which the checks of the failures send again.
+///
+/// Panics on the first failure, naming the clause that was broken.
+pub async fn verify_answers<B: ListBackend>(subject: &Subject<B>) -> Write {
     let backend = &subject.backend;
     let deadline = subject.deadline;
 
     let before = answered(bounded(deadline, backend.entry(subject.listed)).await)
-        .expect("subject: the listed work is on its list");
+        .expect("subject: the listed work is on its list")
+        .entry;
     assert!(
         before.score.is_some(),
         "subject: the listed work has a score"
@@ -87,24 +119,26 @@ pub async fn verify<B: ListBackend>(subject: Subject<B>) {
         "subject: the listed work has an episode past the one after its progress"
     );
 
-    a_work_off_the_list_is_answered_as_none(&subject).await;
+    a_work_off_the_list_is_answered_as_none(subject).await;
 
     let write = Write {
         id: subject.listed,
         status: Status::Watching,
         progress: before.progress + 1,
         rewatches: before.rewatches + 1,
+        started: Some(BEGUN),
+        completed: Some(DONE),
     };
     answered(bounded(deadline, backend.write(&write)).await);
     let once = answered(bounded(deadline, backend.entry(subject.listed)).await)
         .expect("contract: a write is read back as it was written");
     a_write_is_read_back(&write, &once);
     assert_eq!(
-        once.score, before.score,
+        once.entry.score, before.score,
         "contract: a write leaves the score as it was"
     );
     assert_eq!(
-        once,
+        once.entry,
         Entry {
             status: write.status,
             progress: write.progress,
@@ -122,23 +156,34 @@ pub async fn verify<B: ListBackend>(subject: Subject<B>) {
         "contract: a write made twice leaves what one left"
     );
 
+    let undated = Write {
+        completed: None,
+        ..write
+    };
+    answered(bounded(deadline, backend.write(&undated)).await);
+    let cleared = answered(bounded(deadline, backend.entry(subject.listed)).await)
+        .expect("contract: a write is read back as it was written");
+    a_write_is_read_back(&undated, &cleared);
+
     let adding = Write {
         id: subject.unlisted,
         status: Status::Watching,
         progress: 1,
         rewatches: 0,
+        started: Some(ADDED),
+        completed: None,
     };
     answered(bounded(deadline, backend.write(&adding)).await);
     let added = answered(bounded(deadline, backend.entry(subject.unlisted)).await)
         .expect("contract: a write adds a work that is off the list");
     a_write_is_read_back(&adding, &added);
     assert_eq!(
-        added.score, None,
+        added.entry.score, None,
         "contract: a work a write adds has no score"
     );
 
     let list = answered(bounded(deadline, backend.list()).await);
-    for written in [&once, &added] {
+    for written in [&cleared.entry, &added.entry] {
         assert!(
             list.contains(written),
             "contract: the list holds what was written, and {written:?} is not in {list:?}"
@@ -153,11 +198,9 @@ pub async fn verify<B: ListBackend>(subject: Subject<B>) {
         "contract: a work is on the list once"
     );
 
-    a_write_to_a_work_the_service_does_not_have_is_refused(&subject, &adding).await;
+    a_write_to_a_work_the_service_does_not_have_is_refused(subject, &adding).await;
 
-    for failure in EVERY_FAILURE {
-        each_failure_is_answered_as_its_class(&subject, failure, &write).await;
-    }
+    write
 }
 
 /// A work the service has and the list does not hold has no entry.
@@ -196,11 +239,27 @@ async fn a_write_to_a_work_the_service_does_not_have_is_refused<B: ListBackend>(
     );
 }
 
-/// What an entry holds of the account's standing is what the write said.
-fn a_write_is_read_back(write: &Write, entry: &Entry) {
+/// What an entry holds of the account's standing, both days included, is
+/// what the write said.
+fn a_write_is_read_back(write: &Write, read: &Dated) {
+    let entry = &read.entry;
     assert_eq!(
-        (entry.id, entry.status, entry.progress, entry.rewatches),
-        (write.id, write.status, write.progress, write.rewatches),
+        (
+            entry.id,
+            entry.status,
+            entry.progress,
+            entry.rewatches,
+            read.started,
+            read.completed
+        ),
+        (
+            write.id,
+            write.status,
+            write.progress,
+            write.rewatches,
+            write.started,
+            write.completed
+        ),
         "contract: a write is read back as it was written"
     );
 }
@@ -212,13 +271,19 @@ async fn each_failure_is_answered_as_its_class<B: ListBackend>(
     failure: Failure,
     write: &Write,
 ) {
-    let failing = (subject.failing)(failure);
     let deadline = subject.deadline;
+    // Each call gets a backend of its own: a backend asked to wait holds its
+    // next request back as long as it was asked, which no deadline bounds.
+    let (list, entry, writing) = (
+        (subject.failing)(failure),
+        (subject.failing)(failure),
+        (subject.failing)(failure),
+    );
 
     let answers = [
-        bounded(deadline, failing.list()).await.err(),
-        bounded(deadline, failing.entry(subject.listed)).await.err(),
-        bounded(deadline, failing.write(write)).await.err(),
+        bounded(deadline, list.list()).await.err(),
+        bounded(deadline, entry.entry(subject.listed)).await.err(),
+        bounded(deadline, writing.write(write)).await.err(),
     ];
 
     for answer in answers {

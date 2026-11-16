@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, UNIX_EPOCH};
 
 use benshi_core::encoding::{Confidence, decode};
-use benshi_core::list::Status;
+use benshi_core::list::{Day, Status};
 use benshi_core::pin::Episodes;
 use benshi_core::policy::Policy;
 use benshi_core::recognize::parse::{Episode, Kind, Parsed};
@@ -24,7 +24,7 @@ use benshi_daemon::delivery::{Action, Destination, DryRun, Rehearsed, Unsent};
 use benshi_daemon::protocol::{
     DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
 };
-use benshi_sync::plan::{Day, Standing, Why};
+use benshi_sync::plan::{Standing, Why};
 use benshi_sync::resolve::{By, Unresolved};
 use humantime::format_rfc3339_seconds;
 
@@ -766,9 +766,14 @@ fn counted_as<T: Copy + std::fmt::Display + PartialEq + From<u8>>(
     format!("{count} {word}")
 }
 
-/// A day as RFC 3339 writes a date.
+/// The day as ISO 8601 writes a date, as far as the list keeps it: the year
+/// and the month, or the year alone where the list keeps no month.
 fn day(of: Day) -> String {
-    format!("{:04}-{:02}-{:02}", of.year, of.month, of.day)
+    match (of.month, of.day) {
+        (Some(month), Some(day)) => format!("{:04}-{month:02}-{day:02}", of.year),
+        (Some(month), None) => format!("{:04}-{month:02}", of.year),
+        (None, _) => format!("{:04}", of.year),
+    }
 }
 
 #[cfg(test)]
@@ -778,7 +783,7 @@ mod tests {
         not_pinned, pinned, removed, state, unpinned, why,
     };
     use benshi_core::clock::Timestamp;
-    use benshi_core::list::{EntryId, Status};
+    use benshi_core::list::{Day, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::pin::Episodes;
     use benshi_core::policy::Policy;
@@ -794,7 +799,7 @@ mod tests {
         DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
     };
     use benshi_daemon::recognition::Recognizer;
-    use benshi_sync::plan::{Day, Standing, Why};
+    use benshi_sync::plan::{Standing, Why};
     use benshi_sync::resolve::{By, Unresolved};
     // The reason a failure carries comes from here in the daemon, so the tests
     // that check how one reads take it from here too rather than writing one.
@@ -1717,11 +1722,23 @@ mod tests {
     }
 
     const fn november(day: u8) -> Day {
-        Day {
-            year: 2026,
-            month: 11,
-            day,
-        }
+        Day::new(2026, 11, day)
+    }
+
+    #[test]
+    fn a_day_is_said_as_far_as_the_list_keeps_it() {
+        let kept = |month, day| {
+            super::day(Day {
+                year: 2015,
+                month,
+                day,
+            })
+        };
+
+        assert_eq!(super::day(november(2)), "2026-11-02");
+        assert_eq!(kept(Some(5), None), "2015-05");
+        assert_eq!(kept(None, None), "2015");
+        assert_eq!(kept(None, Some(3)), "2015");
     }
 
     const fn standing(

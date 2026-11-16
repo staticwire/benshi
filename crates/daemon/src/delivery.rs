@@ -22,12 +22,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use benshi_core::ShowId;
-use benshi_core::list::{Entry, EntryId};
+use benshi_core::list::{Day, Entry, EntryId};
 use benshi_core::pin::Pin;
 use benshi_store::Store;
 use benshi_store::delivery::Pending;
 use benshi_store::queue::Kind;
-use benshi_sync::plan::{Day, Plan, Standing, Why, plan};
+use benshi_sync::plan::{Plan, Standing, Why, plan};
 use benshi_sync::relations::{self, Relations, Service};
 use benshi_sync::resolve::{self, By, Listed, Resolution, Target, Unresolved, resolve};
 use jiff::tz::TimeZone;
@@ -405,13 +405,13 @@ mod tests {
     use std::time::SystemTime;
 
     use benshi_core::ShowId;
-    use benshi_core::list::{Entry, EntryId, Format, Status};
+    use benshi_core::list::{Day, Entry, EntryId, Format, Status};
     use benshi_core::path::RawPath;
     use benshi_core::pin::{Episodes, Pin};
     use benshi_store::delivery::Pending;
     use benshi_store::queue::{Kind, Operation};
     use benshi_store::{Error, Store, Viewing};
-    use benshi_sync::plan::{Day, Standing, Why};
+    use benshi_sync::plan::{Standing, Why};
     use benshi_sync::relations::Relations;
     use benshi_sync::resolve::{By, Unresolved};
     use jiff::tz::{Offset, TimeZone};
@@ -445,11 +445,7 @@ mod tests {
     }
 
     const fn november(day: u8) -> Day {
-        Day {
-            year: 2026,
-            month: 11,
-            day,
-        }
+        Day::new(2026, 11, day)
     }
 
     /// A progress of this episode of [`SHOW`], queued at `at`.
