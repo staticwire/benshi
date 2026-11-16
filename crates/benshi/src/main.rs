@@ -294,13 +294,11 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
-    use benshi_daemon::accounts::OnAniList;
     use benshi_daemon::config;
-    use benshi_daemon::listing::{self, FromAniList, Listing};
+    use benshi_daemon::listing;
     use benshi_daemon::paths::{DATABASE, Role, directory};
     use benshi_detect::mpris::POLL_INTERVAL;
     use benshi_store::Store;
-    use benshi_sync::anilist::transport::ANILIST;
 
     // Taken ahead of the socket and the database, so that a signal sent
     // while one is bound and the other opened stops the daemon once its
@@ -378,8 +376,10 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         voice.say(format_args!("AniList token from {TOKEN}"));
     }
 
-    // A factory rather than a watcher: a restart has to reconnect to the
-    // session bus, which is the failure it exists to recover from.
+    let (accounts, list, send) = on_anilist(given, settings, voice, &words);
+
+    // Given a factory and no watcher: restarts have to reconnect to the
+    // session bus, which is the failure they exist to recover from.
     let running = benshi_daemon::run(
         watchers,
         listener,
@@ -387,12 +387,9 @@ async fn serve(voice: &Arc<Voice>) -> u8 {
         store,
         SystemTime::now,
         POLL_INTERVAL,
-        Arc::new(OnAniList::new(ANILIST)),
-        Listing {
-            source: FromAniList::new(ANILIST, given),
-            reading: settings.list,
-            say: saying(voice, &words),
-        },
+        Arc::new(accounts),
+        list,
+        send,
         // Said as it happens: the socket goes on answering once detection
         // has stopped, and the process does not end to say so. The
         // supervisor deals with no task that ended until this returns, so it
@@ -481,7 +478,46 @@ impl UpToTheLast {
     }
 }
 
-/// A line a task says, said by `voice` up to the last words of `words`.
+/// What logs in to AniList, what the list's task reads from it and what the
+/// sending task sends to it, at the times `settings` names, with `given` as
+/// the token where there is one, each task saying its lines by `voice`.
+///
+/// The requests of all three take one set of turns, so that every request
+/// to AniList is the pace apart.
+#[cfg(target_os = "linux")]
+fn on_anilist(
+    given: Option<benshi_core::token::Token>,
+    settings: benshi_daemon::config::Settings,
+    voice: &Arc<Voice>,
+    words: &Arc<UpToTheLast>,
+) -> (
+    benshi_daemon::accounts::OnAniList,
+    benshi_daemon::listing::Listing<benshi_daemon::listing::FromAniList>,
+    benshi_daemon::sending::Sends<benshi_daemon::sending::ToAniList>,
+) {
+    use benshi_daemon::accounts::OnAniList;
+    use benshi_daemon::listing::{FromAniList, Listing};
+    use benshi_daemon::sending::{Sends, ToAniList};
+    use benshi_sync::anilist::Turns;
+    use benshi_sync::anilist::transport::ANILIST;
+
+    let turns = Turns::new();
+    (
+        OnAniList::new(ANILIST, &turns),
+        Listing {
+            source: FromAniList::new(ANILIST, given.clone(), &turns),
+            reading: settings.list,
+            say: saying(voice, words),
+        },
+        Sends {
+            account: ToAniList::new(ANILIST, given, &turns),
+            sending: settings.send,
+            say: saying(voice, words),
+        },
+    )
+}
+
+/// The lines a task says, said by `voice` up to the last words of `words`.
 #[cfg(target_os = "linux")]
 fn saying(voice: &Arc<Voice>, words: &Arc<UpToTheLast>) -> benshi_daemon::listing::Say {
     let voice = Arc::clone(voice);

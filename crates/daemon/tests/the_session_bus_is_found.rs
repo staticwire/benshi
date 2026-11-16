@@ -22,6 +22,7 @@ use benshi_core::token::Token;
 use benshi_daemon::accounts::{self, Accounts, OnAniList};
 use benshi_daemon::listing::{FromAniList, Source};
 use benshi_daemon::secrets::{Asking, Error, SecretService};
+use benshi_sync::anilist::Turns;
 
 /// Set in a run a test started, and in no other.
 const AGAIN: &str = "BENSHI_TEST_AGAIN";
@@ -87,7 +88,7 @@ fn nowhere() -> (String, tokio::net::TcpSocket) {
 fn accounts() -> (OnAniList, tokio::net::TcpSocket) {
     let (address, held) = nowhere();
 
-    (OnAniList::new(&address), held)
+    (OnAniList::new(&address, &Turns::new()), held)
 }
 
 #[test]
@@ -180,7 +181,7 @@ fn a_logout_in_a_session_with_no_bus_says_the_token_was_not_removed() {
 fn a_token_given_from_the_environment_is_read_without_asking_the_store() {
     if env::var_os(AGAIN).is_some() {
         let (address, _held) = nowhere();
-        let source = FromAniList::new(&address, Some(Token::new("given")));
+        let source = FromAniList::new(&address, Some(Token::new("given")), &Turns::new());
 
         let token = answered(source.token()).expect("a token");
 
@@ -198,7 +199,7 @@ fn a_token_given_from_the_environment_is_read_without_asking_the_store() {
 fn a_token_with_none_given_is_asked_of_the_store() {
     if env::var_os(AGAIN).is_some() {
         let (address, _held) = nowhere();
-        let source = FromAniList::new(&address, None);
+        let source = FromAniList::new(&address, None, &Turns::new());
 
         let token = answered(source.token());
 
@@ -215,7 +216,7 @@ fn a_token_with_none_given_is_asked_of_the_store() {
 #[test]
 fn a_list_is_read_from_the_address_given() {
     let (address, _held) = nowhere();
-    let source = FromAniList::new(&address, None);
+    let source = FromAniList::new(&address, None, &Turns::new());
 
     let list = answered(source.list(&Token::new("a token")));
 

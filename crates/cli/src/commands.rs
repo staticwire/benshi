@@ -27,6 +27,7 @@ use benshi_core::trace::{TraceHeader, header_line, snapshot_line};
 use benshi_core::{AppName, PlayerId, SourceInfo};
 use benshi_daemon::bus::BusEvent;
 use benshi_daemon::protocol::{Request, Response, SourceListing};
+use benshi_daemon::sending::Ending;
 use clap::{ArgGroup, Subcommand, ValueEnum};
 use humantime::format_rfc3339_seconds;
 
@@ -125,7 +126,7 @@ pub enum Command {
         remove: bool,
     },
 
-    /// Show what sending to the list would write.
+    /// Send what was seen to the list, or show what sending would write.
     Sync {
         /// When to send.
         #[command(subcommand)]
@@ -136,14 +137,15 @@ pub enum Command {
 /// When `benshi sync` sends.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Sending {
-    /// Show every viewing that waits to be sent, the episode of the entry it
-    /// goes to, and what sending it would write.
+    /// Send every viewing that waits to the list at once, whatever the
+    /// configuration says of when to send.
     ///
-    /// Uses the list as the daemon last read it. This build does not send, so
-    /// --dry-run is required.
+    /// Each one is shown as it is sent: the episode of the entry it goes to,
+    /// and what was written, why nothing was, or why it was set aside.
     Now {
-        /// Print what sending would write, and send nothing.
-        #[arg(long, required = true)]
+        /// Print what sending would write, and send nothing. Uses the list as
+        /// the daemon last read it.
+        #[arg(long)]
         dry_run: bool,
     },
 }
@@ -338,10 +340,41 @@ async fn carry_out(
         Command::Sync {
             sending: Sending::Now { dry_run: true },
         } => rehearse(&mut daemon, out).await,
-        // The parser refuses it, so only a command built in code reaches this arm.
         Command::Sync {
             sending: Sending::Now { dry_run: false },
-        } => bail!("this build does not send: sync now takes --dry-run"),
+        } => send_at_once(&mut daemon, out).await,
+    }
+}
+
+/// Send every operation that waits at once, printing each as it is done and
+/// then what the pass came to.
+///
+/// Every answer is waited for as long as the daemon takes, since each request
+/// to the service has a deadline of its own and a pass makes several.
+async fn send_at_once(daemon: &mut Daemon, out: &mut impl Write) -> Result<()> {
+    daemon.ask(&Request::SendNow).await?;
+
+    loop {
+        match daemon.expect_outcome().await? {
+            Response::Event(
+                event @ (BusEvent::Sent { .. }
+                | BusEvent::NothingWritten { .. }
+                | BusEvent::SetAside { .. }),
+            ) => {
+                writeln!(out, "{}", render::event(&event))
+                    .context("a send could not be printed")?;
+            }
+            Response::SendEnded(ending) => {
+                write!(out, "{}", render::sent_at_once(&ending))
+                    .context("what was sent could not be printed")?;
+                return match ending {
+                    Ending::Done(_) => Ok(()),
+                    Ending::Stopped { line, .. } | Ending::NoToken(line) => bail!("{line}"),
+                };
+            }
+            Response::Error { message } => bail!("{message}"),
+            unexpected => bail!("daemon answered sync now with {unexpected:?}"),
+        }
     }
 }
 
@@ -723,17 +756,15 @@ async fn record(
                     append(&mut file, &snapshot_line(&reading)?, output)?;
                     readings += 1;
                 }
-                // Not readings. A membership change or a source failing is a
-                // fact about the daemon rather than something a player
-                // reported, and a state is what a replay works out from the
-                // readings rather than reads off the file. Named one by one
-                // rather than caught by a wildcard: an event added later then
-                // falls to the last arm here and stops the recording, rather
-                // than going missing in the same silence a lag would.
+                // Not readings. Named one by one, so that events added later
+                // stop the recording at the last arm instead of going missing.
                 Response::Event(
                     BusEvent::SourcesChanged { .. }
                     | BusEvent::SourceFailed { .. }
-                    | BusEvent::State(_),
+                    | BusEvent::State(_)
+                    | BusEvent::Sent { .. }
+                    | BusEvent::NothingWritten { .. }
+                    | BusEvent::SetAside { .. },
                 ) => {}
                 // The one answer a recorder must not carry on from. A trace
                 // with a hole in it replays a timeline that never happened,
@@ -814,10 +845,11 @@ fn append(file: &mut File, line: &str, output: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, EntryArgument, Ep, run};
+    use super::{Command, EntryArgument, Ep, Sending, run};
     use crate::client::DEADLINE;
     use crate::prompt::Typed;
     use benshi_core::clock::{Clock, TestClock};
+    use benshi_core::list::Day;
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::pin::Episodes;
@@ -831,7 +863,7 @@ mod tests {
     };
     use benshi_daemon::accounts::{self, Accounts, Done, LoggedIn};
     use benshi_daemon::bus::{BusEvent, EventBus};
-    use benshi_daemon::delivery::Delivery;
+    use benshi_daemon::delivery::{Delivery, Unsent, Watched};
     use benshi_daemon::detection::Seen;
     use benshi_daemon::ipc::{Server, bind};
     use benshi_daemon::listing::{BACKEND, Wakes};
@@ -839,8 +871,10 @@ mod tests {
     use benshi_daemon::protocol::{Request, Response};
     use benshi_daemon::recognition::{Current, Decided, Decision, Recognizer};
     use benshi_daemon::secrets;
+    use benshi_daemon::sending::{Asked, Ending, Heard, Tally, send_now};
     use benshi_daemon::supervisor::TaskError;
     use benshi_store::Store;
+    use benshi_sync::resolve::Unresolved;
     use jiff::tz::TimeZone;
     use socket2::{Domain, SockAddr, Socket, Type};
     use std::io::Write;
@@ -1059,6 +1093,9 @@ mod tests {
         decided: Decided,
         accounts: Arc<Logins>,
         store: Arc<Mutex<Store>>,
+        /// The asks for a pass at once, which a test answers as the sending
+        /// task would.
+        asked: Option<Asked>,
         serving: JoinHandle<Result<(), TaskError>>,
     }
 
@@ -1122,6 +1159,7 @@ mod tests {
             let store = Arc::new(Mutex::new(
                 Store::open(&home.path().join("benshi.db")).expect("the database opens"),
             ));
+            let (send_now, asked) = send_now();
             let server = Arc::new(Server::new(
                 Arc::clone(&bus),
                 Arc::clone(&policy),
@@ -1131,6 +1169,7 @@ mod tests {
                 Wakes::new(),
                 Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty())),
                 Delivery::new(Arc::clone(&store), TimeZone::UTC),
+                send_now,
             ));
 
             Self {
@@ -1141,6 +1180,7 @@ mod tests {
                 decided,
                 accounts,
                 store,
+                asked: Some(asked),
                 serving: tokio::spawn(server.listen(Arc::new(listener))),
             }
         }
@@ -1481,6 +1521,92 @@ mod tests {
         } else {
             ""
         }
+    }
+
+    /// Answer the next ask for a pass at once as the sending task would,
+    /// telling `heard` in order.
+    fn sending(asked: Asked, heard: Vec<Heard>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let hearing = asked.next().await.expect("the client asks once");
+            for told in heard {
+                hearing.send(told).expect("the client hears");
+            }
+        })
+    }
+
+    const SYNC_NOW: Command = Command::Sync {
+        sending: Sending::Now { dry_run: false },
+    };
+
+    #[tokio::test]
+    async fn sync_now_prints_each_operation_as_it_is_sent_and_then_a_count() {
+        let mut daemon = Daemon::listening(Vec::new());
+        let asked = daemon.asked.take().expect("the asks are the test's");
+        let task = sending(
+            asked,
+            vec![
+                Heard::Event(BusEvent::SetAside {
+                    list: "AniList".to_owned(),
+                    id: 15,
+                    watched: Some(Watched {
+                        day: Day::new(2026, 11, 16),
+                        title: "Show Title".to_owned(),
+                        episode: Some(14),
+                    }),
+                    to: None,
+                    why: Unsent::Unresolved(Unresolved::Outside { episodes: Some(12) }),
+                }),
+                Heard::Ended(Ending::Done(Tally {
+                    aside: 1,
+                    ..Tally::default()
+                })),
+            ],
+        );
+
+        let (outcome, shown, complained) = go(SYNC_NOW, &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS, "stderr said {complained:?}");
+        assert_eq!(
+            shown,
+            "set aside #15 \"Show Title\" episode 14\n    entry has 12 episodes, no rule takes \
+             episode 14\n\n1 operation: 1 set aside\n"
+        );
+        task.await.expect("the ask was answered");
+    }
+
+    #[tokio::test]
+    async fn sync_now_with_nothing_waiting_says_so() {
+        let mut daemon = Daemon::listening(Vec::new());
+        let asked = daemon.asked.take().expect("the asks are the test's");
+        let task = sending(asked, vec![Heard::Ended(Ending::Done(Tally::default()))]);
+
+        let (outcome, shown, _complained) = go(SYNC_NOW, &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::SUCCESS);
+        assert_eq!(shown, "nothing waits to be sent\n");
+        task.await.expect("the ask was answered");
+    }
+
+    #[tokio::test]
+    async fn sync_now_that_stops_says_why_and_fails() {
+        let line = "AniList could not be reached: connection refused; 1 operation waits, tried \
+                    again in 1m";
+        let mut daemon = Daemon::listening(Vec::new());
+        let asked = daemon.asked.take().expect("the asks are the test's");
+        let task = sending(
+            asked,
+            vec![Heard::Ended(Ending::Stopped {
+                tally: Tally::default(),
+                line: line.to_owned(),
+            })],
+        );
+
+        let (outcome, shown, complained) = go(SYNC_NOW, &daemon.socket).await;
+
+        assert_eq!(outcome, ExitCode::FAILURE);
+        assert_eq!(shown, "");
+        assert_eq!(complained, format!("benshi: {line}\n"));
+        task.await.expect("the ask was answered");
     }
 
     #[tokio::test]

@@ -193,13 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn sync_now_alone_sends() {
+        let asked = Cli::try_parse_from(["benshi", "sync", "now"]).expect("parses");
+
+        assert_eq!(
+            asked.command,
+            Command::Sync {
+                sending: Sending::Now { dry_run: false },
+            }
+        );
+    }
+
+    #[test]
     fn sync_takes_now_and_dry_run_and_nothing_else() {
-        // This build sends nothing, so the one run it takes is the dry run.
         for refused in [
             &["benshi", "sync"][..],
-            &["benshi", "sync", "now"],
             &["benshi", "sync", "--dry-run"],
             &["benshi", "sync", "now", "--dry-run", "anilist"],
+            &["benshi", "sync", "now", "anilist"],
         ] {
             assert!(Cli::try_parse_from(refused).is_err(), "{refused:?}");
         }

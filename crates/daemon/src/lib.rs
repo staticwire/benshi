@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 use benshi_core::policy::PolicyTable;
 use benshi_detect::{PlayerWatcher, WatchError};
 use benshi_store::Store;
+use benshi_sync::relations;
 use jiff::tz::TimeZone;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -31,9 +32,10 @@ use crate::delivery::Delivery;
 use crate::detection::{Detection, Seen, Wiring};
 #[cfg(unix)]
 use crate::ipc::Server;
-use crate::listing::{Listing, Reader, Source, Wakes};
+use crate::listing::{BACKEND, Listing, Reader, Source, Wakes};
 use crate::mapping::Mapping;
 use crate::recognition::{Current, Decided, Recognizer};
+use crate::sending::{Account, SendTask, Sender, Sends};
 #[cfg(unix)]
 use crate::supervisor::{Notice, Supervisor, TaskError, TaskRecord};
 
@@ -66,6 +68,8 @@ pub mod recognition;
 
 pub mod secrets;
 
+pub mod sending;
+
 pub mod supervisor;
 
 pub mod voice;
@@ -76,13 +80,14 @@ pub mod voice;
 /// nothing could ask it what it had seen. The platform that needs a named
 /// pipe instead gains its own.
 ///
-/// Three supervised tasks over state they share: detection, which reads the
+/// Four supervised tasks over state they share: detection, which reads the
 /// platform and publishes what it saw, the socket, which answers clients
-/// from it, and the list's task, which reads the list and puts what it read
-/// in place of what detection decides against. They are separate tasks on
-/// purpose. A session bus that goes away must not take the interface down
-/// with it, because the user whose detection has broken is exactly the user
-/// who needs to ask the daemon what it thinks is happening.
+/// from it, the list's task, which reads the list and puts what it read in
+/// place of what detection decides against, and the sending task, which
+/// sends what was recorded to the list. They are separate tasks on purpose.
+/// Session buses that go away must not take the interface down with them,
+/// because the user whose detection has broken is exactly the user who needs
+/// to ask the daemon what it thinks is happening.
 ///
 /// `start_watcher` builds a watcher rather than being handed one, because the
 /// supervisor calls a task's body again on every restart. A restart that
@@ -101,8 +106,9 @@ pub mod voice;
 /// what a file's name is decided against until the list's task puts a list
 /// in its place, and `now` reads the time of day the store writes beside what
 /// it keeps. `accounts` carries out a login and a
-/// logout the socket is asked for, and `list` says what the list's task reads
-/// from and when.
+/// logout the socket is asked for, `list` says what the list's task reads
+/// from and when, and `send` says what the sending task sends through and
+/// when.
 ///
 /// `tell` is told of a task as the task is started again and as it stops,
 /// whatever the other tasks are doing. A daemon whose detection has stopped
@@ -118,7 +124,7 @@ pub mod voice;
     clippy::too_many_arguments,
     reason = "each part is built by the caller, so that a test can give its own"
 )]
-pub async fn run<W, B, F, T, S>(
+pub async fn run<W, B, F, T, S, A>(
     mut start_watcher: B,
     listener: Arc<UnixListener>,
     recognizer: Recognizer,
@@ -127,6 +133,7 @@ pub async fn run<W, B, F, T, S>(
     period: Duration,
     accounts: Arc<dyn Accounts>,
     list: Listing<S>,
+    send: Sends<A>,
     tell: T,
 ) -> Vec<TaskRecord>
 where
@@ -135,6 +142,7 @@ where
     W: PlayerWatcher + Send + 'static,
     T: FnMut(&Notice) + Send + 'static,
     S: Source + Send + Sync + 'static,
+    A: Account + Send + Sync + 'static,
 {
     let wiring = Wiring {
         bus: Arc::new(EventBus::new()),
@@ -147,6 +155,7 @@ where
         now,
         period,
     };
+    let (send_now, asked) = sending::send_now();
     let server = Arc::new(Server::new(
         Arc::clone(&wiring.bus),
         Arc::clone(&wiring.policy),
@@ -156,6 +165,7 @@ where
         wiring.wakes.clone(),
         Mapping::new(Arc::clone(&wiring.store), wiring.recognizer.clone()),
         Delivery::new(Arc::clone(&wiring.store), TimeZone::system()),
+        send_now,
     ));
     let reader = Arc::new(Reader::new(
         list.source,
@@ -164,6 +174,20 @@ where
         wiring.recognizer.clone(),
         wiring.wakes.clone(),
         list.say,
+    ));
+    let sender = Arc::new(SendTask::new(
+        send.account,
+        Sender::new(
+            BACKEND,
+            Arc::clone(&wiring.store),
+            TimeZone::system(),
+            relations::bundled(),
+        ),
+        send.sending,
+        Arc::clone(&wiring.bus),
+        wiring.wakes.clone(),
+        asked,
+        send.say,
     ));
 
     let mut supervisor = Supervisor::telling(tell);
@@ -194,6 +218,12 @@ where
         let reader = Arc::clone(&reader);
 
         async move { reader.run().await }
+    });
+
+    supervisor.supervise("send", move || {
+        let sender = Arc::clone(&sender);
+
+        async move { sender.run().await }
     });
 
     supervisor.run().await

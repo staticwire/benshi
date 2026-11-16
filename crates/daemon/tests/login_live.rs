@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use benshi_core::token::Token;
 use benshi_daemon::accounts::{Accounts, OnAniList};
 use benshi_daemon::secrets::{ANILIST, Asking, DEADLINE, SecretService, Secrets};
-use benshi_sync::anilist::transport;
+use benshi_sync::anilist::{Turns, transport};
 
 #[tokio::test]
 #[ignore = "speaks to AniList and writes to the secret store of the session it runs in"]
@@ -35,7 +35,7 @@ async fn a_token_is_logged_in_with_and_out_of_on_anilist() {
         store.read(ANILIST).await.expect("a read").is_none(),
         "a token is kept for AniList already, and this test would replace it"
     );
-    let accounts = OnAniList::new(transport::ANILIST);
+    let accounts = OnAniList::new(transport::ANILIST, &Turns::new());
 
     let logged = accounts.login(Token::new(token)).await.expect("a login");
 

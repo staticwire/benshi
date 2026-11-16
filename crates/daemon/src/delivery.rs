@@ -132,6 +132,51 @@ pub enum Unsent {
     /// The row holds no operation delivery reads, and why, as a person reads
     /// it.
     Unread(String),
+    /// The service has no work under the number of the entry it goes to.
+    NoWork,
+}
+
+impl Unsent {
+    /// Why, as a person reads it, with the episode the operation says was
+    /// watched.
+    #[must_use]
+    pub fn reason(&self, episode: Option<u32>) -> String {
+        let number = episode.map_or_else(|| "no episode".to_owned(), |episode| episode.to_string());
+        match self {
+            Self::Unresolved(Unresolved::NotListed) => "not on the list".to_owned(),
+            Self::Unresolved(Unresolved::NoEpisode { episodes }) => format!(
+                "name spells no episode, entry has {}",
+                episodes.map_or_else(|| "no episode count".to_owned(), episodes_of)
+            ),
+            Self::Unresolved(Unresolved::Outside {
+                episodes: Some(episodes),
+            }) => format!(
+                "entry has {}, no rule takes episode {number}",
+                episodes_of(*episodes)
+            ),
+            Self::Unresolved(Unresolved::Outside { episodes: None }) => {
+                format!("no rule takes episode {number}")
+            }
+            Self::Unresolved(Unresolved::LaterSeason { season, episode }) => format!(
+                "{number} reads as season {season} episode {episode}; benshi map can name its entry"
+            ),
+            Self::Unresolved(Unresolved::Unnumbered) => {
+                format!("anime-relations gives no number for episode {number}")
+            }
+            Self::Departed => "no longer on the list, though it was".to_owned(),
+            Self::Unread(why) => why.clone(),
+            Self::NoWork => "the service has no work under that number".to_owned(),
+        }
+    }
+}
+
+/// How many episodes, in words.
+fn episodes_of(episodes: u32) -> String {
+    if episodes == 1 {
+        "1 episode".to_owned()
+    } else {
+        format!("{episodes} episodes")
+    }
 }
 
 /// Why a dry run was not answered.
@@ -176,12 +221,7 @@ impl Delivery {
         let store = Arc::clone(&self.store);
         let read = tokio::task::spawn_blocking(move || {
             let store = store.lock().expect(POISONED_STORE);
-            let kept = Kept {
-                listed: store.listed(BACKEND)?,
-                departed: store.departed(BACKEND)?,
-                pins: store.pins(BACKEND)?,
-            };
-            Ok::<_, benshi_store::Error>((store.pending(BACKEND)?, kept))
+            Ok::<_, benshi_store::Error>((store.pending(BACKEND)?, Kept::of(&store, BACKEND)?))
         });
 
         let (pending, kept) = match read.await {
@@ -198,13 +238,24 @@ impl Delivery {
 
 /// What the store holds of one backend's list.
 #[derive(Debug, Clone, Default)]
-struct Kept {
+pub(crate) struct Kept {
     /// Every show of the list with its entry.
-    listed: Vec<(ShowId, Entry)>,
+    pub(crate) listed: Vec<(ShowId, Entry)>,
     /// Every show whose entry left the list, with that entry.
-    departed: Vec<(ShowId, EntryId)>,
+    pub(crate) departed: Vec<(ShowId, EntryId)>,
     /// Every pin of the backend.
-    pins: Vec<Pin>,
+    pub(crate) pins: Vec<Pin>,
+}
+
+impl Kept {
+    /// What `store` holds of the list of `backend`.
+    pub(crate) fn of(store: &Store, backend: &str) -> Result<Self, benshi_store::Error> {
+        Ok(Self {
+            listed: store.listed(backend)?,
+            departed: store.departed(backend)?,
+            pins: store.pins(backend)?,
+        })
+    }
 }
 
 /// What delivery would do with each operation, by what the store holds of
@@ -220,20 +271,61 @@ fn rehearse(pending: Vec<Pending>, kept: &Kept, rules: &Relations, zone: &TimeZo
     }
 }
 
-/// What the store holds of a list, looked up by number, and each entry as
-/// the operations planned so far leave it.
-struct Rehearsal<'a> {
+/// What an operation of the log says was watched, as delivery reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// The show.
+    pub(crate) show: ShowId,
+    /// What was watched, on the day the time zone names.
+    pub(crate) watched: Watched,
+}
+
+/// Read one operation of the log as a viewing of a show, its day named in
+/// `zone`, or say why its row holds none that delivery reads.
+pub(crate) fn seen(pending: Pending, zone: &TimeZone) -> Result<Seen, String> {
+    let id = pending.id;
+    let operation = pending.operation.map_err(|unread| unread.to_string())?;
+    let episode = match operation.kind {
+        Kind::Progress { episode } => episode,
+        Kind::Rewatch { .. } => {
+            return Err(format!(
+                "queued operation {id} is a rewatch, and only a progress is sent"
+            ));
+        }
+        Kind::Entry { .. } => {
+            return Err(format!(
+                "queued operation {id} is a whole entry, and only a progress is sent"
+            ));
+        }
+    };
+    let day = day_in(operation.at, zone).ok_or_else(|| {
+        format!("queued operation {id} was queued at an instant no day of this time zone holds")
+    })?;
+
+    Ok(Seen {
+        show: operation.show,
+        watched: Watched {
+            day,
+            title: operation.title,
+            episode,
+        },
+    })
+}
+
+/// What the store holds of a list, looked up by number, to resolve an
+/// operation against.
+pub(crate) struct Lookup<'a> {
     entries: HashMap<EntryId, &'a Entry>,
     /// The entry of each show, listed or departed.
     own: HashMap<ShowId, EntryId>,
     departed: HashSet<EntryId>,
     pins: &'a [Pin],
     rules: &'a Relations,
-    left: HashMap<EntryId, Standing>,
 }
 
-impl<'a> Rehearsal<'a> {
-    fn new(kept: &'a Kept, rules: &'a Relations) -> Self {
+impl<'a> Lookup<'a> {
+    /// What `kept` holds, with `rules` to resolve by.
+    pub(crate) fn new(kept: &'a Kept, rules: &'a Relations) -> Self {
         Self {
             entries: kept
                 .listed
@@ -249,65 +341,24 @@ impl<'a> Rehearsal<'a> {
             departed: kept.departed.iter().map(|&(_, entry)| entry).collect(),
             pins: &kept.pins,
             rules,
-            left: HashMap::new(),
         }
     }
 
-    /// What delivery would do with one operation.
-    fn of(&mut self, pending: Pending, zone: &TimeZone) -> Rehearsed {
-        let id = pending.id;
-        let unread = |why: String| Rehearsed {
-            id,
-            watched: None,
-            action: Action::CannotSend {
-                to: None,
-                why: Unsent::Unread(why),
-            },
-        };
-        let operation = match pending.operation {
-            Ok(operation) => operation,
-            Err(unread_as) => return unread(unread_as.to_string()),
-        };
-        let episode = match operation.kind {
-            Kind::Progress { episode } => episode,
-            Kind::Rewatch { .. } => {
-                return unread(format!(
-                    "queued operation {id} is a rewatch, and only a progress is sent"
-                ));
-            }
-            Kind::Entry { .. } => {
-                return unread(format!(
-                    "queued operation {id} is a whole entry, and only a progress is sent"
-                ));
-            }
-        };
-        let Some(day) = day_in(operation.at, zone) else {
-            return unread(format!(
-                "queued operation {id} was queued at an instant no day of this time zone holds"
-            ));
-        };
-
-        Rehearsed {
-            id,
-            action: self.action(operation.show, episode, day),
-            watched: Some(Watched {
-                day,
-                title: operation.title,
-                episode,
-            }),
-        }
-    }
-
-    /// What delivery would do with this episode of `show`, seen on `day`.
-    fn action(&mut self, show: ShowId, episode: Option<u32>, day: Day) -> Action {
-        let own = self.own.get(&show).copied();
+    /// The episode of an entry this episode of `show` goes to, or why it
+    /// cannot be sent, with the episode it goes to where it goes to one.
+    pub(crate) fn destination(
+        &self,
+        show: ShowId,
+        episode: Option<u32>,
+    ) -> Result<Destination, (Option<Destination>, Unsent)> {
+        let own = self.own(show);
         let listed = own.map(|entry| Listed {
             entry,
-            episodes: self.entries.get(&entry).and_then(|listed| listed.episodes),
+            episodes: self.listed(entry).and_then(|listed| listed.episodes),
         });
         let pinned = episode.and_then(|episode| self.pinned(show, episode));
 
-        match resolve(
+        let (to, by) = match resolve(
             show,
             episode,
             listed,
@@ -315,16 +366,47 @@ impl<'a> Rehearsal<'a> {
             self.rules,
             Service::AniList,
         ) {
-            Resolution::Resolved { to, by } => self.write(to, by, own, day),
-            Resolution::Unresolved(why) => Action::CannotSend {
-                to: None,
-                why: if own.is_some_and(|entry| self.departed.contains(&entry)) {
+            Resolution::Resolved { to, by } => (to, by),
+            Resolution::Unresolved(why) => {
+                let why = if own.is_some_and(|entry| self.departed.contains(&entry)) {
                     Unsent::Departed
                 } else {
                     Unsent::Unresolved(why)
-                },
-            },
+                };
+                return Err((None, why));
+            }
+        };
+        let destination = self.to(own, to, by);
+        if !destination.listed && self.departed.contains(&to.entry) {
+            return Err((Some(destination), Unsent::Departed));
         }
+        Ok(destination)
+    }
+
+    /// Episode `to` of its entry, reached by `by` from a show whose own entry
+    /// is `own`, with what the store holds of that entry.
+    pub(crate) fn to(&self, own: Option<EntryId>, to: Target, by: By) -> Destination {
+        let listed = self.listed(to.entry);
+        Destination {
+            entry: to.entry,
+            episode: to.episode,
+            by,
+            title: listed
+                .filter(|_| own != Some(to.entry))
+                .map(|entry| entry.title.clone()),
+            episodes: listed.and_then(|entry| entry.episodes),
+            listed: listed.is_some(),
+        }
+    }
+
+    /// The entry of `show` that its list holds, or held before it left.
+    pub(crate) fn own(&self, show: ShowId) -> Option<EntryId> {
+        self.own.get(&show).copied()
+    }
+
+    /// What the store holds of `entry`, where the list holds it.
+    fn listed(&self, entry: EntryId) -> Option<&'a Entry> {
+        self.entries.get(&entry).copied()
     }
 
     /// The pin of `show` that takes `episode`, as one episode of its entry.
@@ -343,46 +425,70 @@ impl<'a> Rehearsal<'a> {
             })
         })
     }
+}
+
+/// What the store holds of a list, and each entry as the operations planned
+/// so far leave it.
+struct Rehearsal<'a> {
+    lookup: Lookup<'a>,
+    left: HashMap<EntryId, Standing>,
+}
+
+impl<'a> Rehearsal<'a> {
+    fn new(kept: &'a Kept, rules: &'a Relations) -> Self {
+        Self {
+            lookup: Lookup::new(kept, rules),
+            left: HashMap::new(),
+        }
+    }
+
+    /// What delivery would do with one operation.
+    fn of(&mut self, pending: Pending, zone: &TimeZone) -> Rehearsed {
+        let id = pending.id;
+        match seen(pending, zone) {
+            Ok(seen) => Rehearsed {
+                id,
+                action: self.action(seen.show, seen.watched.episode, seen.watched.day),
+                watched: Some(seen.watched),
+            },
+            Err(why) => Rehearsed {
+                id,
+                watched: None,
+                action: Action::CannotSend {
+                    to: None,
+                    why: Unsent::Unread(why),
+                },
+            },
+        }
+    }
+
+    /// What delivery would do with this episode of `show`, seen on `day`.
+    fn action(&mut self, show: ShowId, episode: Option<u32>, day: Day) -> Action {
+        match self.lookup.destination(show, episode) {
+            Ok(to) => self.write(to, day),
+            Err((to, why)) => Action::CannotSend { to, why },
+        }
+    }
 
     /// What seeing episode `to` on `day` writes, from what the operations
     /// planned so far leave of the entry, or what the store holds of it.
-    fn write(&mut self, to: Target, by: By, own: Option<EntryId>, day: Day) -> Action {
-        let listed = self.entries.get(&to.entry).copied();
-        let destination = Destination {
-            entry: to.entry,
-            episode: to.episode,
-            by,
-            title: listed
-                .filter(|_| own != Some(to.entry))
-                .map(|entry| entry.title.clone()),
-            episodes: listed.and_then(|entry| entry.episodes),
-            listed: listed.is_some(),
-        };
-        if listed.is_none() && self.departed.contains(&to.entry) {
-            return Action::CannotSend {
-                to: Some(destination),
-                why: Unsent::Departed,
-            };
-        }
-
+    fn write(&mut self, to: Destination, day: Day) -> Action {
+        let listed = self.lookup.listed(to.entry);
         let (before, undated) = match self.left.get(&to.entry) {
             Some(left) => (Some(*left), false),
             None => (listed.map(held), listed.is_some()),
         };
-        match plan(before.as_ref(), destination.episodes, to.episode, day) {
+        match plan(before.as_ref(), to.episodes, to.episode, day) {
             Plan::Write(after) => {
                 self.left.insert(to.entry, after);
                 Action::Write {
-                    to: destination,
+                    to,
                     before,
                     after,
                     undated,
                 }
             }
-            Plan::Nothing(why) => Action::Nothing {
-                to: destination,
-                why,
-            },
+            Plan::Nothing(why) => Action::Nothing { to, why },
         }
     }
 }

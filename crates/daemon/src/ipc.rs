@@ -32,6 +32,7 @@ use crate::listing::Wakes;
 use crate::mapping::Mapping;
 use crate::protocol::{Explanation, NameListing, PinListing, Request, Response, SourceListing};
 use crate::recognition::Decided;
+use crate::sending::{Heard, SendNow};
 use crate::supervisor::TaskError;
 
 /// The variable a session names its runtime directory in.
@@ -276,14 +277,16 @@ pub struct Server {
     wakes: Wakes,
     mapping: Mapping,
     delivery: Delivery,
+    send_now: SendNow,
 }
 
 impl Server {
-    /// A server over the bus a `Watch` streams, the table a listing reads and a
+    /// The server over the bus a `Watch` streams, the table a listing reads and a
     /// policy is set in, the two records each detection round leaves behind,
     /// what it saw and what it last decided, what a login and a logout are
-    /// carried out by, the list's task, which a login wakes, where the names
-    /// the user gives are kept, and what a dry run of delivery reads.
+    /// carried out by, the tasks a login wakes, where the names the user gives
+    /// are kept, what a dry run of delivery reads, and what asks the sending
+    /// task to send at once.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -298,6 +301,7 @@ impl Server {
         wakes: Wakes,
         mapping: Mapping,
         delivery: Delivery,
+        send_now: SendNow,
     ) -> Self {
         Self {
             bus,
@@ -308,6 +312,7 @@ impl Server {
             wakes,
             mapping,
             delivery,
+            send_now,
         }
     }
 
@@ -436,7 +441,7 @@ impl Server {
                     }
                 }
                 Ok(Request::Map { spelled, anilist }) => answered(
-                    self.mapping.map(spelled, EntryId(anilist)).await,
+                    self.resolving(self.mapping.map(spelled, EntryId(anilist)).await),
                     |mapped| Response::Mapped {
                         spelled: mapped.spelled,
                         anilist: mapped.entry.0,
@@ -444,9 +449,10 @@ impl Server {
                         replaced: mapped.replaced.as_ref().map(NameListing::meant),
                     },
                 ),
-                Ok(Request::Unmap { spelled }) => {
-                    answered(self.mapping.unmap(spelled).await, Response::Unmapped)
-                }
+                Ok(Request::Unmap { spelled }) => answered(
+                    self.resolving(self.mapping.unmap(spelled).await),
+                    Response::Unmapped,
+                ),
                 Ok(Request::Names) => answered(self.mapping.given().await, |given| {
                     Response::Names(given.iter().map(NameListing::of).collect())
                 }),
@@ -456,24 +462,28 @@ impl Server {
                     anilist,
                     entry_episodes,
                 }) => answered(
-                    self.mapping
-                        .pin(show, episodes, EntryId(anilist), entry_episodes)
-                        .await,
+                    self.resolving(
+                        self.mapping
+                            .pin(show, episodes, EntryId(anilist), entry_episodes)
+                            .await,
+                    ),
                     |pinning| Response::Pinned {
                         pinned: PinListing::of(&pinning.made),
                         replaced: pinning.replaced.as_ref().map(PinListing::of),
                     },
                 ),
-                Ok(Request::Unpin { show, episodes }) => {
-                    answered(self.mapping.unpin(show, episodes).await, Response::Unpinned)
-                }
+                Ok(Request::Unpin { show, episodes }) => answered(
+                    self.resolving(self.mapping.unpin(show, episodes).await),
+                    Response::Unpinned,
+                ),
                 Ok(Request::Pins) => answered(self.mapping.pins().await, |pins| {
                     Response::Pins(pins.iter().map(PinListing::of).collect())
                 }),
                 Ok(Request::DryRun) => answered(self.delivery.dry_run().await, Response::DryRun),
-                // A stream rather than an answer, so this connection reads
+                // Streams rather than answers, so this connection reads
                 // nothing further.
                 Ok(Request::Watch) => return self.stream_events(&mut writer).await,
+                Ok(Request::SendNow) => return self.send_at_once(&mut writer).await,
                 Err(malformed) => Response::Error {
                     message: malformed.to_string(),
                 },
@@ -530,6 +540,40 @@ impl Server {
             reply(writer, &response).await?;
         }
     }
+
+    /// What a name or a pin given or taken back came to, the sending task
+    /// woken to try again what was set aside where it went through.
+    fn resolving<T, E>(&self, done: std::result::Result<T, E>) -> std::result::Result<T, E> {
+        if done.is_ok() {
+            self.wakes.resolvable();
+        }
+        done
+    }
+
+    /// Ask the sending task for a pass at once, and stream each event of it,
+    /// what it came to last.
+    async fn send_at_once<W>(&self, writer: &mut W) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(mut hearing) = self.send_now.ask() else {
+            let refused = Response::Error {
+                message: "sending is not running".to_owned(),
+            };
+            return reply(writer, &refused).await;
+        };
+
+        while let Some(heard) = hearing.recv().await {
+            match heard {
+                Heard::Event(event) => reply(writer, &Response::Event(event)).await?,
+                Heard::Ended(ending) => return reply(writer, &Response::SendEnded(ending)).await,
+            }
+        }
+        let stopped = Response::Error {
+            message: "sending stopped before the pass ended".to_owned(),
+        };
+        reply(writer, &stopped).await
+    }
 }
 
 /// The answer to a request carried out, or the error it was refused with.
@@ -573,13 +617,14 @@ mod tests {
     use super::{Fallback, NoRuntimeDirectory, Server, bind, fallback_from, socket_path_from};
     use crate::accounts::{self, Accounts, Done, LoggedIn};
     use crate::bus::{BusEvent, EventBus};
-    use crate::delivery::{Delivery, DryRun};
+    use crate::delivery::{Delivery, DryRun, Unsent};
     use crate::detection::Seen;
     use crate::listing::Wakes;
     use crate::mapping::Mapping;
     use crate::protocol::{NameListing, Outcome, PinListing, Request, Response};
     use crate::recognition::{Current, Decided, Decision, Recognizer};
     use crate::secrets;
+    use crate::sending::{Asked, Ending, Heard, Tally, send_now};
     use benshi_core::clock::Timestamp;
     use benshi_core::list::{Entry, EntryId, Status};
     use benshi_core::path::RawPath;
@@ -742,6 +787,9 @@ mod tests {
         accounts: Arc<Scripted>,
         wakes: Wakes,
         store: Arc<Mutex<Store>>,
+        /// The asks for a pass at once, which a test answers as the sending
+        /// task would.
+        asked: Option<Asked>,
         _home: TempDir,
     }
 
@@ -775,6 +823,7 @@ mod tests {
             ));
             let mapping = Mapping::new(Arc::clone(&store), Current::new(Recognizer::empty()));
             let delivery = Delivery::new(Arc::clone(&store), TimeZone::UTC);
+            let (send_now, asked) = send_now();
             Self {
                 server: Arc::new(Server::new(
                     Arc::clone(&bus),
@@ -785,6 +834,7 @@ mod tests {
                     wakes.clone(),
                     mapping,
                     delivery,
+                    send_now,
                 )),
                 bus,
                 policy,
@@ -792,6 +842,7 @@ mod tests {
                 accounts,
                 wakes,
                 store,
+                asked: Some(asked),
                 _home: home,
             }
         }
@@ -1016,6 +1067,87 @@ mod tests {
         );
     }
 
+    /// Whether the sending task was woken to try again what was set aside,
+    /// a wake given before anyone waits being kept for the first who does.
+    async fn woken_to_try_again(wakes: &Wakes) -> bool {
+        timeout(Duration::from_millis(50), wakes.resolvable.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_name_given_or_taken_back_wakes_the_sending_task_to_try_again() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Map {
+                spelled: "Nisekoi".to_owned(),
+                anilist: 900_002,
+            })
+            .await;
+        client.answer().await;
+        let mapped = woken_to_try_again(&daemon.wakes).await;
+        client
+            .ask(&Request::Unmap {
+                spelled: "Nisekoi".to_owned(),
+            })
+            .await;
+        client.answer().await;
+        let taken = woken_to_try_again(&daemon.wakes).await;
+
+        assert!(mapped, "a name given woke nothing");
+        assert!(taken, "a name taken back woke nothing");
+    }
+
+    #[tokio::test]
+    async fn a_name_refused_wakes_no_sending() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Map {
+                spelled: "Nisekoi".to_owned(),
+                anilist: 999,
+            })
+            .await;
+        client.answer().await;
+
+        assert!(!woken_to_try_again(&daemon.wakes).await);
+    }
+
+    #[tokio::test]
+    async fn episodes_pinned_or_taken_back_wake_the_sending_task_to_try_again() {
+        let daemon = Daemon::with(Vec::new());
+        daemon.has_two_of_one_name();
+        let mut client = Client::to(&daemon, 4096);
+
+        client
+            .ask(&Request::Pin {
+                show: "Nisekoi:".to_owned(),
+                episodes: run(13, 24),
+                anilist: 900_002,
+                entry_episodes: run(1, 12),
+            })
+            .await;
+        let pinned = client.answer().await;
+        let woken = woken_to_try_again(&daemon.wakes).await;
+        client
+            .ask(&Request::Unpin {
+                show: "Nisekoi:".to_owned(),
+                episodes: run(13, 24),
+            })
+            .await;
+        client.answer().await;
+        let taken = woken_to_try_again(&daemon.wakes).await;
+
+        assert!(matches!(pinned, Response::Pinned { .. }), "{pinned:?}");
+        assert!(woken, "a pin made woke nothing");
+        assert!(taken, "a pin taken back woke nothing");
+    }
+
     fn run(first: u32, last: u32) -> Episodes {
         Episodes::new(first, last).expect("a run from its first episode to its last")
     }
@@ -1081,6 +1213,72 @@ mod tests {
                 operations: Vec::new(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_send_now_streams_each_event_of_the_pass_and_what_it_came_to_last() {
+        let mut daemon = Daemon::with(Vec::new());
+        let asked = daemon.asked.take().expect("the asks are the test's");
+        let mut client = Client::to(&daemon, 4096);
+        let event = BusEvent::SetAside {
+            list: "AniList".to_owned(),
+            id: 7,
+            watched: None,
+            to: None,
+            why: Unsent::Unread("queued operation 7 is a rewatch".to_owned()),
+        };
+        let ending = Ending::Done(Tally {
+            aside: 1,
+            ..Tally::default()
+        });
+        let (told, ended) = (event.clone(), ending.clone());
+        let sending = tokio::spawn(async move {
+            let hearing = asked.next().await.expect("the client asks once");
+            hearing.send(Heard::Event(told)).expect("the client hears");
+            hearing.send(Heard::Ended(ended)).expect("the client hears");
+        });
+
+        client.ask(&Request::SendNow).await;
+
+        assert_eq!(client.answer().await, Response::Event(event));
+        assert_eq!(client.answer().await, Response::SendEnded(ending));
+        sending.await.expect("the ask was answered");
+    }
+
+    #[tokio::test]
+    async fn a_send_now_with_no_sending_task_is_refused() {
+        let mut daemon = Daemon::with(Vec::new());
+        drop(daemon.asked.take());
+        let mut client = Client::to(&daemon, 4096);
+
+        client.ask(&Request::SendNow).await;
+
+        assert_eq!(
+            client.answer().await,
+            Response::Error {
+                message: "sending is not running".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_now_whose_task_goes_away_before_the_end_is_answered_with_why() {
+        let mut daemon = Daemon::with(Vec::new());
+        let asked = daemon.asked.take().expect("the asks are the test's");
+        let mut client = Client::to(&daemon, 4096);
+        let sending = tokio::spawn(async move {
+            drop(asked.next().await.expect("the client asks once"));
+        });
+
+        client.ask(&Request::SendNow).await;
+
+        assert_eq!(
+            client.answer().await,
+            Response::Error {
+                message: "sending stopped before the pass ended".to_owned(),
+            }
+        );
+        sending.await.expect("the ask was taken");
     }
 
     #[tokio::test]

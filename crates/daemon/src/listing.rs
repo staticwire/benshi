@@ -29,9 +29,9 @@ use benshi_store::Store;
 #[cfg(target_os = "linux")]
 use benshi_sync::ListBackend;
 #[cfg(target_os = "linux")]
-use benshi_sync::anilist::AniList;
-#[cfg(target_os = "linux")]
 use benshi_sync::anilist::transport::Http;
+#[cfg(target_os = "linux")]
+use benshi_sync::anilist::{AniList, Turns};
 use humantime::format_duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -56,29 +56,46 @@ const NO_TOKEN: &str = "no AniList token, so no list is read: benshi login keeps
 /// The backend a list is filed under in the store.
 pub const BACKEND: &str = ANILIST.backend;
 
-/// What wakes the list's task before its time: a name a round decided the
-/// list does not hold, and a token a login kept. Cloning shares them.
+/// What wakes the list's task and the sending task before their time: a
+/// name a round decided the list does not hold, an episode a round recorded,
+/// what changes where an operation set aside goes, and a token a login kept.
+/// Cloning shares them.
 #[derive(Debug, Clone, Default)]
 pub struct Wakes {
     pub(crate) missed: Arc<Notify>,
     pub(crate) logged_in: Arc<Notify>,
+    pub(crate) recorded: Arc<Notify>,
+    pub(crate) resolvable: Arc<Notify>,
+    pub(crate) sending_logged_in: Arc<Notify>,
 }
 
 impl Wakes {
-    /// Nothing has woken the task yet.
+    /// Nothing has woken a task yet.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A round decided that a name the list does not hold spelled a title.
+    /// The round decided that a name the list does not hold spelled a title.
     pub fn missed(&self) {
         self.missed.notify_one();
     }
 
-    /// A login kept a token.
+    /// The round recorded an episode, and its operation is in the log.
+    pub fn recorded(&self) {
+        self.recorded.notify_one();
+    }
+
+    /// What was set aside may go to an entry now: the list was read, or a
+    /// name or a pin was given or taken back.
+    pub fn resolvable(&self) {
+        self.resolvable.notify_one();
+    }
+
+    /// The login kept a token, which wakes both tasks.
     pub fn logged_in(&self) {
         self.logged_in.notify_one();
+        self.sending_logged_in.notify_one();
     }
 }
 
@@ -96,45 +113,73 @@ pub trait Source {
 
 /// The token and the list from AniList.
 ///
-/// The token is the one given from the environment where there is one, and
-/// else the one the Secret Service of the session keeps, which is never asked
-/// to unlock: the daemon opens no window of its own.
+/// The token is the one [`token_of`] finds. Its requests take turns shared
+/// with the sending task.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct FromAniList {
     address: String,
     given: Option<Token>,
+    turns: Turns,
 }
 
 #[cfg(target_os = "linux")]
 impl FromAniList {
     /// Lists read from the service at `address`, with `given` as the token
-    /// where there is one.
+    /// where there is one, its requests taking `turns`.
     #[must_use]
-    pub fn new(address: &str, given: Option<Token>) -> Self {
+    pub fn new(address: &str, given: Option<Token>, turns: &Turns) -> Self {
         Self {
             address: address.to_owned(),
             given,
+            turns: turns.clone(),
         }
     }
+}
+
+/// The AniList token: the one `given` from the environment where there is
+/// one, and else the one the Secret Service of the session keeps, which is
+/// never asked to unlock, since the daemon opens no window of its own.
+///
+/// # Errors
+///
+/// What the Secret Service fails with.
+#[cfg(target_os = "linux")]
+pub async fn token_of(given: Option<&Token>) -> Result<Option<Token>, secrets::Error> {
+    if let Some(given) = given {
+        return Ok(Some(given.clone()));
+    }
+    let store = SecretService::connect(secrets::DEADLINE, Asking::Never).await?;
+
+    Ok(store.read(ANILIST).await?.map(Token::new))
+}
+
+/// AniList at `address`, asked with `token`, its requests taking `turns`.
+///
+/// # Errors
+///
+/// [`benshi_sync::Error::Unreachable`] where no client for the address can
+/// be built.
+#[cfg(target_os = "linux")]
+pub(crate) fn anilist_at(
+    address: &str,
+    token: &Token,
+    turns: &Turns,
+) -> Result<AniList<Http>, benshi_sync::Error> {
+    let http = Http::new(address, token.secret())
+        .map_err(|unbuilt| benshi_sync::Error::Unreachable(unbuilt.into()))?;
+
+    Ok(AniList::taking(http, turns))
 }
 
 #[cfg(target_os = "linux")]
 impl Source for FromAniList {
     async fn token(&self) -> Result<Option<Token>, secrets::Error> {
-        if let Some(given) = &self.given {
-            return Ok(Some(given.clone()));
-        }
-        let store = SecretService::connect(secrets::DEADLINE, Asking::Never).await?;
-
-        Ok(store.read(ANILIST).await?.map(Token::new))
+        token_of(self.given.as_ref()).await
     }
 
     async fn list(&self, token: &Token) -> Result<Vec<Entry>, benshi_sync::Error> {
-        let http = Http::new(&self.address, token.secret())
-            .map_err(|unbuilt| benshi_sync::Error::Unreachable(unbuilt.into()))?;
-
-        AniList::new(http).list().await
+        anilist_at(&self.address, token, &self.turns)?.list().await
     }
 }
 
@@ -327,6 +372,7 @@ impl<S: Source + Sync> Reader<S> {
                 let count = entries.len();
                 match self.filed(entries).await {
                     Ok(()) => {
+                        self.wakes.resolvable();
                         *said = None;
                         let entries = if count == 1 { "entry" } else { "entries" };
                         (self.say)(&format!("AniList list read: {count} {entries}"));
@@ -412,7 +458,7 @@ enum Outcome {
 }
 
 /// Sleep until `due`, and for ever where nothing is due.
-async fn until(due: Option<Instant>) {
+pub(crate) async fn until(due: Option<Instant>) {
     match due {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -851,6 +897,34 @@ mod tests {
         assert_eq!(running.filed(), ["Show Title", "Another Show"]);
         assert_eq!(running.said(), ["AniList list read: 2 entries"]);
         assert!(recognizes(&running.current.now(), "Show Title"));
+    }
+
+    /// Whether the sending task was woken to try again what was set aside.
+    ///
+    /// Wakes given before anyone waits are kept for the first who does, so a
+    /// short wait is enough for one given already.
+    async fn woken_to_try_again(wakes: &Wakes) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), wakes.resolvable.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_list_read_wakes_the_sending_task_to_try_again_what_was_set_aside() {
+        let running = started(Reading::default(), Scripted::new());
+
+        after(NOW).await;
+
+        assert!(woken_to_try_again(&running.wakes).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_that_failed_wakes_no_sending() {
+        let running = started(Reading::default(), Scripted::new().lists([down()]));
+
+        after(NOW).await;
+
+        assert!(!woken_to_try_again(&running.wakes).await);
     }
 
     #[tokio::test(start_paused = true)]

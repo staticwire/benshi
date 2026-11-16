@@ -25,6 +25,7 @@ use crate::bus::BusEvent;
 use crate::delivery::DryRun;
 use crate::mapping::{Given, Meant, Pinned};
 use crate::recognition::Decision;
+use crate::sending::Ending;
 
 /// One request from a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +133,15 @@ pub enum Request {
     ///
     /// Answered with [`Response::DryRun`] or [`Response::Error`].
     DryRun,
+
+    /// Try again what was set aside and send every operation past the
+    /// cursor, at once.
+    ///
+    /// The last request on a connection: each event of the pass follows as
+    /// a [`Response::Event`] as it happens, and [`Response::SendEnded`] last,
+    /// or [`Response::Error`] where no pass could be asked for or sending
+    /// stopped before the pass ended.
+    SendNow,
 }
 
 /// A name the user gave, and the entry it means.
@@ -324,6 +334,10 @@ pub enum Response {
 
     /// What sending would write, in answer to [`Request::DryRun`].
     DryRun(DryRun),
+
+    /// What the pass [`Request::SendNow`] asked for came to, after its
+    /// events.
+    SendEnded(Ending),
 }
 
 /// The most recent decision, as a client is told it.
@@ -488,8 +502,11 @@ mod tests {
         DecidedBy, Explanation, NameListing, Outcome, PinListing, Request, Response, SourceListing,
     };
     use crate::bus::BusEvent;
+    use crate::delivery::{Destination, DryRun, Unsent, Watched};
     use crate::recognition::{Decision, Recognizer};
+    use crate::sending::{Ending, Tally};
     use benshi_core::clock::Timestamp;
+    use benshi_core::list::{Day, EntryId, Status};
     use benshi_core::path::RawPath;
     use benshi_core::pin::Episodes;
     use benshi_core::policy::Policy;
@@ -502,6 +519,8 @@ mod tests {
         AppName, Capabilities, Known, MediaRef, PlayState, PlayerId, PlayerSnapshot, ShowId,
     };
     use benshi_detect::SourceInfo;
+    use benshi_sync::plan::{Standing, Why};
+    use benshi_sync::resolve::By;
     use std::time::Duration;
 
     /// A filename in Shift-JIS, which is not valid UTF-8.
@@ -724,6 +743,7 @@ mod tests {
             Response::LoggedOut,
         ];
         responses.extend(every_map_response());
+        responses.extend(every_sending_response());
         responses.extend(
             every_recognition()
                 .into_iter()
@@ -797,6 +817,86 @@ mod tests {
                 episodes: run(2, 2),
             },
             Request::Pins,
+            Request::DryRun,
+            Request::SendNow,
+        ]
+    }
+
+    /// What a viewing of episode 3 says was watched.
+    fn a_viewing() -> Watched {
+        Watched {
+            day: Day::new(2026, 11, 16),
+            title: "Show Title".to_owned(),
+            episode: Some(3),
+        }
+    }
+
+    /// Episode 3 of an entry, by a rule, which the list holds.
+    fn an_episode_of_an_entry() -> Destination {
+        Destination {
+            entry: EntryId(12345),
+            episode: 3,
+            by: By::Rule,
+            title: Some("Show Title Season 2".to_owned()),
+            episodes: Some(12),
+            listed: true,
+        }
+    }
+
+    const fn watching(progress: u32) -> Standing {
+        Standing {
+            status: Status::Watching,
+            progress,
+            rewatches: 0,
+            started: Some(Day::new(2026, 11, 2)),
+            completed: None,
+        }
+    }
+
+    /// One of every event of sending and of every end of a pass.
+    fn every_sending_response() -> Vec<Response> {
+        vec![
+            Response::Event(BusEvent::Sent {
+                list: "AniList".to_owned(),
+                id: 1,
+                watched: a_viewing(),
+                to: an_episode_of_an_entry(),
+                before: Some(watching(2)),
+                after: watching(3),
+                again: false,
+            }),
+            Response::Event(BusEvent::NothingWritten {
+                list: "AniList".to_owned(),
+                id: 2,
+                watched: a_viewing(),
+                to: an_episode_of_an_entry(),
+                why: Why::Conflict { progress: 5 },
+            }),
+            Response::Event(BusEvent::SetAside {
+                list: "AniList".to_owned(),
+                id: 3,
+                watched: None,
+                to: None,
+                why: Unsent::NoWork,
+            }),
+            Response::DryRun(DryRun {
+                entries: 0,
+                operations: Vec::new(),
+            }),
+            Response::SendEnded(Ending::Done(Tally {
+                sent: 2,
+                nothing: 1,
+                aside: 1,
+            })),
+            Response::SendEnded(Ending::Stopped {
+                tally: Tally::default(),
+                line: "AniList could not be reached: connection refused; 1 operation waits, \
+                       tried again in 1m"
+                    .to_owned(),
+            }),
+            Response::SendEnded(Ending::NoToken(
+                "no AniList token, so nothing is sent: benshi login keeps one".to_owned(),
+            )),
         ]
     }
 

@@ -92,7 +92,10 @@ async fn replayed(trace: Trace) -> Vec<PlayerSnapshot> {
                 // over in the same silence a dropped reading would be.
                 BusEvent::SourcesChanged { .. }
                 | BusEvent::SourceFailed { .. }
-                | BusEvent::State(_) => {}
+                | BusEvent::State(_)
+                | BusEvent::Sent { .. }
+                | BusEvent::NothingWritten { .. }
+                | BusEvent::SetAside { .. } => {}
             }
         }
 

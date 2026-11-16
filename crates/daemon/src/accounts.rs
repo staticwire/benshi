@@ -13,6 +13,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use benshi_core::token::Token;
 use benshi_sync::anilist::AniList;
 #[cfg(target_os = "linux")]
+use benshi_sync::anilist::Turns;
+#[cfg(target_os = "linux")]
 use benshi_sync::anilist::transport::Http;
 use benshi_sync::anilist::transport::Transport;
 use serde_json::Value;
@@ -67,15 +69,18 @@ pub trait Accounts: fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct OnAniList {
     address: String,
+    turns: Turns,
 }
 
 #[cfg(target_os = "linux")]
 impl OnAniList {
-    /// Logins checked with the service at `address`.
+    /// Logins checked with the service at `address`, their requests taking
+    /// `turns`.
     #[must_use]
-    pub fn new(address: &str) -> Self {
+    pub fn new(address: &str, turns: &Turns) -> Self {
         Self {
             address: address.to_owned(),
+            turns: turns.clone(),
         }
     }
 }
@@ -89,7 +94,7 @@ impl Accounts for OnAniList {
                 Error::Service(benshi_sync::Error::Unreachable(unbuilt.into()))
             })?;
 
-            login(&AniList::new(http), &secrets, &token).await
+            login(&AniList::taking(http, &self.turns), &secrets, &token).await
         })
     }
 

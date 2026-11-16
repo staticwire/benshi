@@ -35,6 +35,7 @@ use benshi_daemon::ipc::{Server, bind};
 use benshi_daemon::listing::{self, BACKEND, Wakes};
 use benshi_daemon::mapping::Mapping;
 use benshi_daemon::recognition::{Current, Decided};
+use benshi_daemon::sending::send_now;
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::{Store, Viewing};
 use jiff::tz::TimeZone;
@@ -211,6 +212,7 @@ impl Daemon {
             Wakes::new(),
             Mapping::new(Arc::clone(&store), recognizer),
             Delivery::new(store, TimeZone::UTC),
+            send_now().0,
         ));
         drop(tokio::spawn(server.listen(Arc::new(listener))));
 
