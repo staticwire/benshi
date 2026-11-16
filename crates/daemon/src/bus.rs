@@ -11,8 +11,11 @@
 //! happened.
 
 use benshi_core::{PlayerId, PlayerSnapshot, SessionState};
+use benshi_sync::plan::{Standing, Why};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+
+use crate::delivery::{Destination, Unsent, Watched};
 
 /// How many events the bus keeps for a subscriber that has fallen behind.
 ///
@@ -55,6 +58,52 @@ pub enum BusEvent {
     },
     /// The session state a sink would render, or its absence.
     State(Option<SessionState>),
+    /// One operation of the log, written to a list.
+    Sent {
+        /// The list, by the name of its service.
+        list: String,
+        /// The operation's number in the log.
+        id: i64,
+        /// What it says was watched.
+        watched: Watched,
+        /// The episode of the entry it went to.
+        to: Destination,
+        /// The entry before the write, and none where no list held it or
+        /// where the write was sent again.
+        before: Option<Standing>,
+        /// The entry as the write left it.
+        after: Standing,
+        /// Whether the write is the one kept for the operation, sent again
+        /// as it was decided because the answer to it was lost.
+        again: bool,
+    },
+    /// One operation of the log that wrote nothing to a list, and why.
+    NothingWritten {
+        /// The list, by the name of its service.
+        list: String,
+        /// The operation's number in the log.
+        id: i64,
+        /// What it says was watched.
+        watched: Watched,
+        /// The episode of the entry it went to.
+        to: Destination,
+        /// Why nothing was written.
+        why: Why,
+    },
+    /// One operation of the log, set aside, and why.
+    SetAside {
+        /// The list, by the name of its service.
+        list: String,
+        /// The operation's number in the log.
+        id: i64,
+        /// What it says was watched, and none where its row holds no
+        /// operation delivery reads.
+        watched: Option<Watched>,
+        /// The episode of the entry it goes to, where it goes to one.
+        to: Option<Destination>,
+        /// Why it was set aside.
+        why: Unsent,
+    },
 }
 
 /// A published sequence of events with many readers.

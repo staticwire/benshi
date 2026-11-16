@@ -581,6 +581,7 @@ impl<W: PlayerWatcher> Detection<W> {
                         at: (self.now)(),
                     };
                     ask(Arc::clone(&self.store), move |store| store.record(&viewing)).await?;
+                    self.wakes.recorded();
                 }
                 Effect::Close { show, episode } => {
                     ask(Arc::clone(&self.store), move |store| {
@@ -1791,6 +1792,39 @@ mod tests {
                 at: the_time(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn an_episode_recorded_wakes_the_sending_task_and_none_before() {
+        let database = Database::new();
+        let mpv = a_source("mpv", "mpv");
+        let wakes = Wakes::new();
+        let mut detection = Detection::new(
+            ScriptedWatcher::of(watching(&mpv, THIRD, 0..=HALF_AT)),
+            Wiring {
+                recognizer: Current::new(a_list()),
+                wakes: wakes.clone(),
+                ..wired_to(&database)
+            },
+        );
+
+        rounds(&mut detection, HALF_AT).await;
+        let before = woken_to_send(&wakes).await;
+        rounds(&mut detection, 1).await;
+
+        assert!(!before, "woken before the episode was recorded");
+        assert!(
+            woken_to_send(&wakes).await,
+            "not woken once it was recorded"
+        );
+    }
+
+    /// Whether the sending task was woken by an episode recorded, as
+    /// [`woken`] reads the wake of a name that missed the list.
+    async fn woken_to_send(wakes: &Wakes) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), wakes.recorded.notified())
+            .await
+            .is_ok()
     }
 
     #[tokio::test]

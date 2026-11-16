@@ -20,12 +20,13 @@ use benshi_core::recognize::parse::{Episode, Kind, Parsed};
 use benshi_core::settle::Fact;
 use benshi_core::{Capabilities, Known, MediaRef, PlayState};
 use benshi_daemon::bus::BusEvent;
-use benshi_daemon::delivery::{Action, Destination, DryRun, Rehearsed, Unsent};
+use benshi_daemon::delivery::{Action, Destination, DryRun, Rehearsed, Watched};
 use benshi_daemon::protocol::{
     DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
 };
+use benshi_daemon::sending::{Ending, Tally};
 use benshi_sync::plan::{Standing, Why};
-use benshi_sync::resolve::{By, Unresolved};
+use benshi_sync::resolve::By;
 use humantime::format_rfc3339_seconds;
 
 /// What is shown for a source that cannot name what it opened.
@@ -380,7 +381,99 @@ pub fn event(of: &BusEvent) -> String {
         BusEvent::SourceFailed { player, reason } => format!("{}  failed: {reason}", player.0),
         BusEvent::State(Some(session)) => format!("state: {}", session.snapshot.player.0),
         BusEvent::State(None) => "state: nothing is playing".to_owned(),
+        BusEvent::Sent {
+            list,
+            id,
+            watched,
+            to,
+            before,
+            after,
+            again,
+        } => format!(
+            "{}\n    {}",
+            done(
+                if *again { "sent again" } else { "sent" },
+                list,
+                *id,
+                Some(watched),
+                Some(to)
+            ),
+            if *again {
+                kept(to, after)
+            } else {
+                written(to, before.as_ref(), after, false)
+            }
+        ),
+        BusEvent::NothingWritten {
+            list,
+            id,
+            watched,
+            to,
+            why,
+        } => format!(
+            "{}\n    {}",
+            done("nothing written", list, *id, Some(watched), Some(to)),
+            nothing(to, *why)
+        ),
+        BusEvent::SetAside {
+            list,
+            id,
+            watched,
+            to,
+            why,
+        } => format!(
+            "{}\n    {}",
+            done("set aside", list, *id, watched.as_ref(), to.as_ref()),
+            why.reason(watched.as_ref().and_then(|watched| watched.episode))
+        ),
     }
+}
+
+/// What was done with an operation of the log, what it says was watched, and
+/// the episode of the entry of `list` it goes to, where it goes to one.
+fn done(
+    what: &str,
+    list: &str,
+    id: i64,
+    watched: Option<&Watched>,
+    to: Option<&Destination>,
+) -> String {
+    let Some(watched) = watched else {
+        return format!("{what} #{id}, which cannot be read");
+    };
+    let mut shown = format!(
+        "{what} #{id} \"{}\" {}",
+        watched.title,
+        episode(watched.episode)
+    );
+    if let Some(to) = to {
+        shown.push_str(&destination(list, to));
+    }
+    shown
+}
+
+/// The episode an operation says was watched, in words.
+fn episode(of: Option<u32>) -> String {
+    of.map_or_else(
+        || "no episode".to_owned(),
+        |episode| format!("episode {episode}"),
+    )
+}
+
+/// The entry as a write sent again leaves it, with the dates and the
+/// rewatches the write holds.
+fn kept(to: &Destination, after: &Standing) -> String {
+    let mut shown = standing(after, to.episodes);
+    if let Some(begun) = after.started {
+        write!(shown, ", started {}", day(begun)).expect("a String accepts every write");
+    }
+    if let Some(ended) = after.completed {
+        write!(shown, ", completed {}", day(ended)).expect("a String accepts every write");
+    }
+    if after.rewatches > 0 {
+        write!(shown, ", rewatches {}", after.rewatches).expect("a String accepts every write");
+    }
+    shown
 }
 
 /// What is shown once the token is removed.
@@ -534,6 +627,45 @@ fn meaning(anilist: Option<i64>, title: &str) -> String {
     }
 }
 
+/// What a pass of `benshi sync now` came to, after the events it told: a
+/// count of each outcome where there was any, and why it stopped where it
+/// stopped.
+#[must_use]
+pub fn sent_at_once(ending: &Ending) -> String {
+    match ending {
+        Ending::Done(tally) | Ending::Stopped { tally, .. } if dealt_with(tally) > 0 => {
+            format!("\n{}\n", sent(tally))
+        }
+        Ending::Done(_) => NOTHING_WAITS.to_owned(),
+        Ending::Stopped { .. } | Ending::NoToken(_) => String::new(),
+    }
+}
+
+/// How many operations a pass dealt with.
+fn dealt_with(tally: &Tally) -> usize {
+    tally.sent + tally.nothing + tally.aside
+}
+
+/// How many operations a pass dealt with, and how many of them it wrote,
+/// wrote nothing for and set aside, each where there are any.
+fn sent(tally: &Tally) -> String {
+    let mut counted = Vec::new();
+    if tally.sent > 0 {
+        counted.push(format!("{} sent", tally.sent));
+    }
+    if tally.nothing > 0 {
+        counted.push(format!("{} nothing written", tally.nothing));
+    }
+    if tally.aside > 0 {
+        counted.push(format!("{} set aside", tally.aside));
+    }
+    format!(
+        "{}: {}",
+        counted_as(dealt_with(tally), "operation", "operations"),
+        counted.join(", ")
+    )
+}
+
 /// What sending every operation that waits would write, under the size of
 /// the list it is decided by and over a count of each outcome.
 ///
@@ -574,30 +706,34 @@ fn rehearsed(of: &Rehearsed) -> String {
         of.id,
         day(watched.day),
         watched.title,
-        watched.episode.map_or_else(
-            || "no episode".to_owned(),
-            |episode| format!("episode {episode}")
-        )
+        episode(watched.episode)
     );
     let (to, off_the_list) = match &of.action {
         Action::Write { to, .. } | Action::Nothing { to, .. } => (Some(to), !to.listed),
         Action::CannotSend { to, .. } => (to.as_ref(), false),
     };
     if let Some(to) = to {
-        write!(shown, " -> AniList {}", to.entry.0).expect("a String accepts every write");
-        if let Some(title) = &to.title {
-            write!(shown, " \"{title}\"").expect("a String accepts every write");
-        }
-        write!(shown, " episode {}", to.episode).expect("a String accepts every write");
-        shown.push_str(match to.by {
-            By::Entry => "",
-            By::Rule => ", by anime-relations",
-            By::Pin => ", by benshi map",
-        });
+        shown.push_str(&destination("AniList", to));
         if off_the_list {
             shown.push_str(", not on the list");
         }
     }
+    shown
+}
+
+/// The episode of the entry of `list` an operation goes to, and what
+/// decided it.
+fn destination(list: &str, to: &Destination) -> String {
+    let mut shown = format!(" -> {list} {}", to.entry.0);
+    if let Some(title) = &to.title {
+        write!(shown, " \"{title}\"").expect("a String accepts every write");
+    }
+    write!(shown, " episode {}", to.episode).expect("a String accepts every write");
+    shown.push_str(match to.by {
+        By::Entry => "",
+        By::Rule => ", by anime-relations",
+        By::Pin => ", by benshi map",
+    });
     shown
 }
 
@@ -614,7 +750,7 @@ fn outcome(of: &Rehearsed) -> String {
         Action::Nothing { to, why } => format!("nothing to write: {}", nothing(to, *why)),
         Action::CannotSend { why, .. } => format!(
             "cannot send: {}",
-            unsent(why, of.watched.as_ref().and_then(|watched| watched.episode))
+            why.reason(of.watched.as_ref().and_then(|watched| watched.episode))
         ),
     }
 }
@@ -662,35 +798,6 @@ fn nothing(to: &Destination, why: Why) -> String {
         Why::Completed => "completed, rewatch begins at episode 1".to_owned(),
         Why::PastCount { episodes } => format!("entry has {}", episodes_of(episodes)),
         Why::EpisodeZero => "progress counts from episode 1".to_owned(),
-    }
-}
-
-/// Why an operation cannot be sent, with the episode it says was watched.
-fn unsent(why: &Unsent, episode: Option<u32>) -> String {
-    let number = episode.map_or_else(|| "no episode".to_owned(), |episode| episode.to_string());
-    match why {
-        Unsent::Unresolved(Unresolved::NotListed) => "not on the list".to_owned(),
-        Unsent::Unresolved(Unresolved::NoEpisode { episodes }) => format!(
-            "name spells no episode, entry has {}",
-            episodes.map_or_else(|| "no episode count".to_owned(), episodes_of)
-        ),
-        Unsent::Unresolved(Unresolved::Outside {
-            episodes: Some(episodes),
-        }) => format!(
-            "entry has {}, no rule takes episode {number}",
-            episodes_of(*episodes)
-        ),
-        Unsent::Unresolved(Unresolved::Outside { episodes: None }) => {
-            format!("no rule takes episode {number}")
-        }
-        Unsent::Unresolved(Unresolved::LaterSeason { season, episode }) => format!(
-            "{number} reads as season {season} episode {episode}; benshi map can name its entry"
-        ),
-        Unsent::Unresolved(Unresolved::Unnumbered) => {
-            format!("anime-relations gives no number for episode {number}")
-        }
-        Unsent::Departed => "no longer on the list, though it was".to_owned(),
-        Unsent::Unread(why) => why.clone(),
     }
 }
 
@@ -780,7 +887,7 @@ fn day(of: Day) -> String {
 mod tests {
     use super::{
         capabilities, dry_run, event, explanation, listing, logged_in, mapped, maps, moment,
-        not_pinned, pinned, removed, state, unpinned, why,
+        not_pinned, pinned, removed, sent_at_once, state, unpinned, why,
     };
     use benshi_core::clock::Timestamp;
     use benshi_core::list::{Day, EntryId, Status};
@@ -799,6 +906,7 @@ mod tests {
         DecidedBy, Explanation, NameListing, Outcome, PinListing, SourceListing,
     };
     use benshi_daemon::recognition::Recognizer;
+    use benshi_daemon::sending::{Ending, Tally};
     use benshi_sync::plan::{Standing, Why};
     use benshi_sync::resolve::{By, Unresolved};
     // The reason a failure carries comes from here in the daemon, so the tests
@@ -1024,6 +1132,197 @@ mod tests {
             "an empty membership printed nothing"
         );
         assert!(shown.contains("no source"), "got {shown:?}");
+    }
+
+    /// What a viewing of this episode of "Show Title" on November 16 says.
+    fn seen_of(episode: u32) -> Watched {
+        Watched {
+            day: Day::new(2026, 11, 16),
+            title: "Show Title".to_owned(),
+            episode: Some(episode),
+        }
+    }
+
+    const fn standing_at(status: Status, progress: u32, started: Option<Day>) -> Standing {
+        Standing {
+            status,
+            progress,
+            rewatches: 0,
+            started,
+            completed: None,
+        }
+    }
+
+    #[test]
+    fn a_write_sent_says_what_was_watched_and_the_entry_before_and_after() {
+        let shown = event(&BusEvent::Sent {
+            list: "AniList".to_owned(),
+            id: 12,
+            watched: seen_of(3),
+            to: of_its_entry(3),
+            before: Some(standing_at(Status::Planned, 0, None)),
+            after: standing_at(Status::Watching, 3, Some(Day::new(2026, 11, 16))),
+            again: false,
+        });
+
+        assert_eq!(
+            shown,
+            "sent #12 \"Show Title\" episode 3 -> AniList 12345 episode 3\n    planned 0/12 -> \
+             watching 3/12, started 2026-11-16"
+        );
+    }
+
+    #[test]
+    fn a_write_that_adds_an_entry_by_a_rule_says_both() {
+        let shown = event(&BusEvent::Sent {
+            list: "AniList".to_owned(),
+            id: 13,
+            watched: seen_of(203),
+            to: Destination {
+                entry: EntryId(900_002),
+                by: By::Rule,
+                title: None,
+                listed: false,
+                ..of_its_entry(3)
+            },
+            before: None,
+            after: standing_at(Status::Watching, 3, Some(Day::new(2026, 11, 16))),
+            again: false,
+        });
+
+        assert_eq!(
+            shown,
+            "sent #13 \"Show Title\" episode 203 -> AniList 900002 episode 3, by anime-relations\n    \
+             adds it: watching 3/12, started 2026-11-16"
+        );
+    }
+
+    #[test]
+    fn a_write_sent_again_says_what_it_holds() {
+        let shown = event(&BusEvent::Sent {
+            list: "AniList".to_owned(),
+            id: 12,
+            watched: seen_of(1),
+            to: of_its_entry(1),
+            before: None,
+            after: Standing {
+                rewatches: 4,
+                completed: Some(Day::new(2026, 11, 16)),
+                ..standing_at(Status::Completed, 1, Some(Day::new(2026, 1, 2)))
+            },
+            again: true,
+        });
+
+        assert_eq!(
+            shown,
+            "sent again #12 \"Show Title\" episode 1 -> AniList 12345 episode 1\n    completed \
+             1/12, started 2026-01-02, completed 2026-11-16, rewatches 4"
+        );
+    }
+
+    #[test]
+    fn nothing_written_says_why() {
+        let shown = event(&BusEvent::NothingWritten {
+            list: "AniList".to_owned(),
+            id: 14,
+            watched: seen_of(2),
+            to: of_its_entry(2),
+            why: Why::Conflict { progress: 3 },
+        });
+
+        assert_eq!(
+            shown,
+            "nothing written #14 \"Show Title\" episode 2 -> AniList 12345 episode 2\n    list \
+             already at 3/12"
+        );
+    }
+
+    #[test]
+    fn an_operation_set_aside_says_why_and_where_it_goes_where_it_goes_somewhere() {
+        let going_nowhere = event(&BusEvent::SetAside {
+            list: "AniList".to_owned(),
+            id: 15,
+            watched: Some(seen_of(14)),
+            to: None,
+            why: Unsent::Unresolved(Unresolved::Outside { episodes: Some(12) }),
+        });
+        let gone = event(&BusEvent::SetAside {
+            list: "AniList".to_owned(),
+            id: 16,
+            watched: Some(seen_of(4)),
+            to: Some(of_its_entry(4)),
+            why: Unsent::Departed,
+        });
+        let unread = event(&BusEvent::SetAside {
+            list: "AniList".to_owned(),
+            id: 17,
+            watched: None,
+            to: None,
+            why: Unsent::Unread("queued operation 17 is a rewatch".to_owned()),
+        });
+
+        assert_eq!(
+            going_nowhere,
+            "set aside #15 \"Show Title\" episode 14\n    entry has 12 episodes, no rule takes \
+             episode 14"
+        );
+        assert_eq!(
+            gone,
+            "set aside #16 \"Show Title\" episode 4 -> AniList 12345 episode 4\n    no longer on \
+             the list, though it was"
+        );
+        assert_eq!(
+            unread,
+            "set aside #17, which cannot be read\n    queued operation 17 is a rewatch"
+        );
+    }
+
+    #[test]
+    fn a_pass_asked_for_says_how_many_of_each_it_dealt_with() {
+        assert_eq!(
+            sent_at_once(&Ending::Done(Tally {
+                sent: 2,
+                nothing: 1,
+                aside: 1,
+            })),
+            "\n4 operations: 2 sent, 1 nothing written, 1 set aside\n"
+        );
+        assert_eq!(
+            sent_at_once(&Ending::Done(Tally {
+                sent: 1,
+                ..Tally::default()
+            })),
+            "\n1 operation: 1 sent\n"
+        );
+        assert_eq!(
+            sent_at_once(&Ending::Done(Tally::default())),
+            "nothing waits to be sent\n"
+        );
+    }
+
+    #[test]
+    fn a_pass_that_stopped_says_what_it_did_before_and_leaves_why_to_the_error() {
+        assert_eq!(
+            sent_at_once(&Ending::Stopped {
+                tally: Tally {
+                    sent: 1,
+                    ..Tally::default()
+                },
+                line: "AniList could not be reached".to_owned(),
+            }),
+            "\n1 operation: 1 sent\n"
+        );
+        assert_eq!(
+            sent_at_once(&Ending::Stopped {
+                tally: Tally::default(),
+                line: "AniList could not be reached".to_owned(),
+            }),
+            ""
+        );
+        assert_eq!(
+            sent_at_once(&Ending::NoToken("no AniList token".to_owned())),
+            ""
+        );
     }
 
     #[test]

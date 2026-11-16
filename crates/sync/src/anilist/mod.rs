@@ -4,7 +4,7 @@ mod query;
 pub mod transport;
 
 use std::collections::HashSet;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use benshi_core::list::{Dated, Day, Entry, EntryId, Format, Rating, Status, Write};
@@ -47,16 +47,38 @@ pub struct Account {
 #[derive(Debug)]
 pub struct AniList<T> {
     transport: T,
-    next: Mutex<Option<Instant>>,
+    turns: Turns,
+}
+
+/// The turns requests to AniList take, [`PACE`] apart. Backends given clones
+/// of one wait their turns together, and a wait the service asks of one
+/// holds back them all.
+#[derive(Debug, Clone, Default)]
+pub struct Turns {
+    next: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Turns {
+    /// Turns that no request has taken yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl<T: Transport + Sync> AniList<T> {
-    /// A backend that sends its requests through `transport`.
+    /// AniList over `transport`, its requests taking turns of their own.
     #[must_use]
     pub fn new(transport: T) -> Self {
+        Self::taking(transport, &Turns::new())
+    }
+
+    /// AniList over `transport`, its requests taking `turns`.
+    #[must_use]
+    pub fn taking(transport: T, turns: &Turns) -> Self {
         Self {
             transport,
-            next: Mutex::new(None),
+            turns: turns.clone(),
         }
     }
 
@@ -100,7 +122,11 @@ impl<T: Transport + Sync> AniList<T> {
 
     /// Send no request before this long has passed.
     fn hold_off(&self, wait: Duration) {
-        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self
+            .turns
+            .next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let until = Instant::now() + wait;
         *next = Some(next.map_or(until, |next| next.max(until)));
     }
@@ -108,7 +134,11 @@ impl<T: Transport + Sync> AniList<T> {
     /// When the next request may be sent, with the turn after it kept for
     /// the request after it, so that requests made at once go out in turn.
     fn turn(&self) -> Instant {
-        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = self
+            .turns
+            .next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let turn = next.map_or(now, |next| next.max(now));
         *next = Some(turn + PACE);
@@ -430,7 +460,7 @@ mod tests {
 
     use super::query::ViewerData;
     use super::transport::{Answer, Request, Transport};
-    use super::{Account, AniList, DEADLINE, PACE, WAIT, read};
+    use super::{Account, AniList, DEADLINE, PACE, Turns, WAIT, read};
     use crate::{Error, ListBackend};
 
     /// A service that answers what it was given to answer, in order, and
@@ -826,6 +856,45 @@ mod tests {
 
         let sent = anilist.transport.sent();
         assert_eq!(sent[1].0 - sent[0].0, Duration::from_secs(31));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backends_that_take_turns_together_send_two_seconds_apart() {
+        let turns = Turns::new();
+        let first = AniList::taking(Script::answering([Some(the_viewer())]), &turns);
+        let second = AniList::taking(Script::answering([Some(the_viewer())]), &turns);
+
+        let (one, two) = tokio::join!(first.account(), second.account());
+
+        one.expect("the first account is read");
+        two.expect("the second account is read");
+        let mut times: Vec<Instant> = first
+            .transport
+            .sent()
+            .into_iter()
+            .chain(second.transport.sent())
+            .map(|(at, _)| at)
+            .collect();
+        times.sort_unstable();
+        assert_eq!(times[1] - times[0], PACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_one_backend_is_asked_for_holds_back_every_backend_it_takes_turns_with() {
+        let turns = Turns::new();
+        let refused = AniList::taking(Script::answering([Some(too_many(30))]), &turns);
+        let other = AniList::taking(Script::answering([Some(the_viewer())]), &turns);
+        refused
+            .account()
+            .await
+            .expect_err("the service asks for a wait");
+
+        other.account().await.expect("the account is read");
+
+        assert_eq!(
+            other.transport.sent()[0].0 - refused.transport.sent()[0].0,
+            Duration::from_secs(31)
+        );
     }
 
     #[tokio::test(start_paused = true)]

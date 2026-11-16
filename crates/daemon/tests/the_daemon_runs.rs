@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use benshi_core::clock::{Clock, TestClock, Timestamp};
-use benshi_core::list::{Entry, EntryId, Status};
+use benshi_core::list::{Dated, Entry, EntryId, Status, Write};
 use benshi_core::path::RawPath;
 use benshi_core::policy::Policy;
 use benshi_core::recognize::altname::Altnames;
@@ -35,17 +35,20 @@ use benshi_core::{
 };
 use benshi_daemon::accounts::{Accounts, Done, LoggedIn};
 use benshi_daemon::bus::BusEvent;
-use benshi_daemon::config::{Period, Reading};
+use benshi_daemon::config::{Period, Reading, Sending, When};
 use benshi_daemon::ipc::bind;
 use benshi_daemon::listing::{Listing, Source};
 use benshi_daemon::protocol::{DecidedBy, Outcome, Request, Response, SourceListing};
 use benshi_daemon::recognition::Recognizer;
 use benshi_daemon::secrets;
+use benshi_daemon::sending::{Account, Sends};
 use benshi_daemon::supervisor::{BACKOFF_BASE, Notice, RESTART_LIMIT, Stopped, TaskRecord};
 use benshi_detect::{PlayerWatcher, PollOutcome, SourceInfo, WatchError};
 use benshi_store::Store;
 use benshi_store::queue::{Kind, Operation};
 use benshi_store::watching::Kept;
+use benshi_sync::ListBackend;
+use benshi_sync::memory::Memory;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -346,7 +349,7 @@ impl Source for Answering {
     }
 }
 
-/// A list's task that never reads: no token, and no time to read at.
+/// The list's task that never reads: no token, and no time to read at.
 fn reading_nothing() -> Listing<Answering> {
     Listing {
         source: Answering(Vec::new()),
@@ -354,6 +357,35 @@ fn reading_nothing() -> Listing<Answering> {
             refresh: Period::Off,
             at_start: false,
             on_miss: Period::Off,
+        },
+        say: Arc::new(|_line: &str| {}),
+    }
+}
+
+/// The account where no token is found.
+struct NoToken;
+
+impl Account for NoToken {
+    type Backend = Memory;
+
+    fn token(&self) -> impl Future<Output = Result<Option<Token>, secrets::Error>> + Send {
+        future::ready(Ok(None))
+    }
+
+    fn backend(&self, _token: &Token) -> Result<Memory, benshi_sync::Error> {
+        Err(benshi_sync::Error::Refused("no token is found".to_owned()))
+    }
+}
+
+/// The sending task that sends nothing: no token, and nothing sent before
+/// `benshi sync now` asks.
+fn sending_nothing() -> Sends<NoToken> {
+    Sends {
+        account: NoToken,
+        sending: Sending {
+            when: When::Manual,
+            at_start: false,
+            ..Sending::default()
         },
         say: Arc::new(|_line: &str| {}),
     }
@@ -377,6 +409,7 @@ fn a_daemon(
         PERIOD,
         Arc::new(NoLogins),
         reading_nothing(),
+        sending_nothing(),
         |_notice| {},
     ))
 }
@@ -411,6 +444,7 @@ fn a_daemon_that_tells(
         PERIOD,
         Arc::new(NoLogins),
         reading_nothing(),
+        sending_nothing(),
         told.listener(),
     ))
 }
@@ -608,6 +642,7 @@ fn a_daemon_reading(
             reading,
             say: Arc::new(|_line: &str| {}),
         },
+        sending_nothing(),
         |_notice| {},
     ))
 }
@@ -758,6 +793,143 @@ async fn a_running_daemon_explains_what_its_own_detection_decided() {
     running.abort();
 
     assert_eq!(explained.player, PlayerId(PLAYER.to_owned()));
+}
+
+/// The list in memory a daemon sends to, shared with the test that reads it.
+#[derive(Clone)]
+struct Shared(Arc<Memory>);
+
+impl ListBackend for Shared {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    async fn list(&self) -> Result<Vec<Entry>, benshi_sync::Error> {
+        self.0.list().await
+    }
+
+    async fn entry(&self, id: EntryId) -> Result<Option<Dated>, benshi_sync::Error> {
+        self.0.entry(id).await
+    }
+
+    async fn write(&self, write: &Write) -> Result<(), benshi_sync::Error> {
+        self.0.write(write).await
+    }
+}
+
+/// The account of a list in memory, its token always found.
+struct InMemory(Shared);
+
+impl Account for InMemory {
+    type Backend = Shared;
+
+    fn token(&self) -> impl Future<Output = Result<Option<Token>, secrets::Error>> + Send {
+        future::ready(Ok(Some(Token::new("a token"))))
+    }
+
+    fn backend(&self, _token: &Token) -> Result<Shared, benshi_sync::Error> {
+        Ok(self.0.clone())
+    }
+}
+
+/// The daemon over this platform that reads [`the_entry`] as its list at the
+/// start, and sends each viewing it records to `list` as it is recorded.
+fn a_daemon_sending(
+    platform: &Platform,
+    store: &Arc<Mutex<Store>>,
+    socket: &Path,
+    list: &Shared,
+) -> tokio::task::JoinHandle<Vec<TaskRecord>> {
+    let listener = Arc::new(bind(socket).expect("the socket binds"));
+
+    tokio::spawn(benshi_daemon::run(
+        platform.factory(),
+        listener,
+        Recognizer::empty(),
+        Arc::clone(store),
+        the_time,
+        PERIOD,
+        Arc::new(Taking),
+        Listing {
+            source: Answering(vec![the_entry()]),
+            reading: Reading::default(),
+            say: Arc::new(|_line: &str| {}),
+        },
+        Sends {
+            account: InMemory(list.clone()),
+            sending: Sending {
+                when: When::Each,
+                at_start: false,
+                ..Sending::default()
+            },
+            say: Arc::new(|_line: &str| {}),
+        },
+        |_notice| {},
+    ))
+}
+
+/// The lines of a stream the daemon was asked for with `Watch`.
+async fn watching(socket: &Path) -> tokio::io::Lines<BufReader<tokio::io::ReadHalf<UnixStream>>> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .expect("the daemon answers");
+    let (reading, mut writing) = tokio::io::split(stream);
+    let mut line = serde_json::to_vec(&Request::Watch).expect("serialize");
+    line.push(b'\n');
+    writing
+        .write_all(&line)
+        .await
+        .expect("the request goes out");
+    writing.flush().await.expect("the request goes out");
+    // The writing half closes nothing the daemon reads by going away here:
+    // a stream reads no request after the one that opened it.
+    drop(writing);
+    BufReader::new(reading).lines()
+}
+
+#[tokio::test]
+async fn a_running_daemon_sends_what_it_records_and_watch_shows_it() {
+    // The episode is recorded by detection, the sending task is woken by it,
+    // and a connection that watches is answered from the bus the task tells.
+    let (home, socket) = a_socket();
+    let store = an_empty_store(&home);
+    let platform = Platform::held();
+    let list = Shared(Arc::new(Memory::new(
+        "AniList",
+        Duration::from_secs(15),
+        vec![the_entry()],
+        Vec::new(),
+    )));
+    let running = a_daemon_sending(&platform, &store, &socket, &list);
+    let mut lines = watching(&socket).await;
+
+    once_decided_by_its_list(&platform, &socket, "the list read at the start").await;
+    let sent = timeout(PATIENCE, async {
+        loop {
+            let said = lines
+                .next_line()
+                .await
+                .expect("the daemon did not drop the connection")
+                .expect("the stream goes on");
+            if let Response::Event(sent @ BusEvent::Sent { .. }) =
+                serde_json::from_str(&said).expect("an event this client can read")
+            {
+                return sent;
+            }
+        }
+    })
+    .await
+    .expect("the viewing recorded was sent and the stream showed it");
+    running.abort();
+
+    assert!(matches!(sent, BusEvent::Sent { id: 1, .. }), "{sent:?}");
+    let written = list
+        .0
+        .entry(the_entry().id)
+        .await
+        .expect("the entry is read")
+        .expect("the list holds it");
+    assert_eq!(written.entry.progress, 3);
 }
 
 #[tokio::test]

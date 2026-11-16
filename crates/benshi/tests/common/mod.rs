@@ -46,8 +46,10 @@ const STARTED: &str = "benshi: recording in ";
 pub const NO_SETTINGS: &str = "benshi: default settings: no configuration directory: no absolute \
                                path in `XDG_CONFIG_HOME` or `HOME`";
 
-/// Settings that read the list at no time.
-const READING_NOTHING: &str = "[list]\nrefresh = \"off\"\nat_start = false\non_miss = \"off\"\n";
+/// Settings that read the list at no time, and send nothing before
+/// `benshi sync now`.
+const READING_NOTHING: &str = "[send]\nwhen = \"manual\"\nat_start = false\n\n[list]\n\
+                               refresh = \"off\"\nat_start = false\non_miss = \"off\"\n";
 
 /// The flag that asks for a daemon without a tray icon.
 pub const NO_TRAY: &str = "--no-tray";
